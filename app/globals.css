@@ -170,6 +170,17 @@ input[type="range"] { width: 100%; height: 36px; margin: 0; accent-color: #dbe8f
 .inspector strong small { color: var(--muted); font-size: 12px; font-weight: 430; }
 .inspector span { color: var(--muted); font-size: 11px; }
 
+.inspection-marker {
+  display: block;
+  width: 9px;
+  height: 9px;
+  border: 2px solid rgba(255, 255, 255, 0.95);
+  border-radius: 50%;
+  background: #17201d;
+  box-shadow: 0 0 0 2px rgba(8, 11, 10, 0.55), 0 2px 8px rgba(0, 0, 0, 0.45);
+  pointer-events: none;
+}
+
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 
 @media (max-width: 580px) {

@@ -24,7 +24,8 @@ import {
 } from "./dataset";
 
 type Projection = "globe" | "mercator";
-type Inspector = { lng: number; lat: number; value: number } | null;
+type InspectionPoint = { lng: number; lat: number };
+type Inspector = InspectionPoint & { value: number | null };
 type TimeRange = { min: number; max: number };
 type FrameSource = "manual" | "playback";
 type Limit = "min" | "max";
@@ -104,6 +105,9 @@ export function ZarrViewer() {
   const preloadPromisesRef = useRef(new Map<string, Promise<void>>());
   const preparedFramesRef = useRef(new Set<string>());
   const legendRef = useRef<HTMLDivElement>(null);
+  const inspectionPointRef = useRef<InspectionPoint | null>(null);
+  const inspectionMarkerRef = useRef<import("maplibre-gl").Marker | null>(null);
+  const inspectionRequestGeneration = useRef(0);
 
   const [variables, setVariables] = useState<VariableConfig[]>([FALLBACK_VARIABLE]);
   const [levelAxis, setLevelAxis] = useState({ label: "level", unit: "" });
@@ -121,7 +125,7 @@ export function ZarrViewer() {
   const [projection, setProjection] = useState<Projection>("globe");
   const [loadState, setLoadState] = useState<LoadState>(() => loadingState());
   const [mapReady, setMapReady] = useState(false);
-  const [inspector, setInspector] = useState<Inspector>(null);
+  const [inspector, setInspector] = useState<Inspector | null>(null);
 
   const level = LEVELS[levelIndex];
   const colormap = useMemo(
@@ -132,6 +136,35 @@ export function ZarrViewer() {
   const singleLevelVariables = useMemo(() => variables.filter((candidate) => !candidate.hasLevel), [variables]);
   const multiLevelVariables = useMemo(() => variables.filter((candidate) => candidate.hasLevel), [variables]);
 
+  const refreshInspection = useCallback(async (
+    point: InspectionPoint,
+    index: number,
+    nextVariable = variableRef.current,
+    nextLevelIndex = levelIndexRef.current,
+  ) => {
+    const layer = layerRef.current;
+    if (!layer) return;
+    const generation = ++inspectionRequestGeneration.current;
+    try {
+      const result = await layer.queryData(
+        { type: "Point", coordinates: toDataCoordinates(point.lng, point.lat) },
+        selectorFor(index, nextVariable, nextLevelIndex),
+        { includeSpatialCoordinates: false },
+      );
+      const value = firstFinite(result[nextVariable.id]);
+      const activePoint = inspectionPointRef.current;
+      if (
+        generation !== inspectionRequestGeneration.current
+        || !activePoint
+        || activePoint.lng !== point.lng
+        || activePoint.lat !== point.lat
+      ) return;
+      setInspector({ ...point, value: value ?? null });
+    } catch (error) {
+      console.debug("Point inspection skipped", error);
+    }
+  }, []);
+
   const applySelector = useCallback(async (nextIndex: number, nextVariable = variableRef.current, nextLevelIndex = levelIndexRef.current) => {
     const layer = layerRef.current;
     if (!layer) return;
@@ -140,14 +173,15 @@ export function ZarrViewer() {
     try {
       await layer.setSelector(selectorFor(nextIndex, nextVariable, nextLevelIndex));
       if (generation === requestGeneration.current) {
-        setInspector(null);
         setLoadState(READY_STATE);
+        const point = inspectionPointRef.current;
+        if (point) void refreshInspection(point, nextIndex, nextVariable, nextLevelIndex);
       }
     } catch (error) {
       if (generation !== requestGeneration.current) return;
       setLoadState(errorState(error));
     }
-  }, []);
+  }, [refreshInspection]);
 
   const preloadFrame = useCallback((index: number, nextVariable: VariableConfig, nextLevelIndex: number) => {
     const layer = layerRef.current;
@@ -324,20 +358,19 @@ export function ZarrViewer() {
       });
 
       map.on("click", async (event) => {
-        const layer = layerRef.current;
-        if (!layer) return;
-        setLoadState(loadingState("Reading value…"));
-        try {
-          const coordinates = toDataCoordinates(event.lngLat.lng, event.lngLat.lat);
-          const result = await layer.queryData({ type: "Point", coordinates });
-          const values = result[variableRef.current.id];
-          const raw = firstFinite(values);
-          if (raw === undefined) throw new Error("No data at this location");
-          setInspector({ lng: event.lngLat.lng, lat: event.lngLat.lat, value: raw });
-          setLoadState(READY_STATE);
-        } catch (error) {
-          setLoadState(errorState(error));
-        }
+        const point = { lng: event.lngLat.lng, lat: event.lngLat.lat };
+        inspectionPointRef.current = point;
+        setInspector({ ...point, value: null });
+
+        inspectionMarkerRef.current?.remove();
+        const markerElement = document.createElement("span");
+        markerElement.className = "inspection-marker";
+        markerElement.setAttribute("aria-hidden", "true");
+        inspectionMarkerRef.current = new maplibregl.Marker({ element: markerElement })
+          .setLngLat([point.lng, point.lat])
+          .addTo(map);
+
+        void refreshInspection(point, frameIndexRef.current);
       });
       map.on("error", (event) => {
         const message = event.error?.message ?? "Map rendering error";
@@ -352,8 +385,9 @@ export function ZarrViewer() {
       mapRef.current?.remove();
       mapRef.current = null;
       layerRef.current = null;
+      inspectionMarkerRef.current = null;
     };
-  }, [range]);
+  }, [range, refreshInspection]);
 
   useEffect(() => {
     if (!mapReady || loadState.phase !== "ready" || !needsRangeEstimateRef.current) return;
@@ -430,7 +464,6 @@ export function ZarrViewer() {
       : levelIndexRef.current;
     levelIndexRef.current = nextLevelIndex;
     setLevelIndex(nextLevelIndex);
-    setInspector(null);
     setLoadState(loadingState());
     try {
       layer.setClim([0, 1]);
@@ -449,7 +482,6 @@ export function ZarrViewer() {
     layerRef.current?.setClim([0, 1]);
     levelIndexRef.current = nextLevelIndex;
     setLevelIndex(nextLevelIndex);
-    setInspector(null);
     void applySelector(frameIndexRef.current, variableRef.current, nextLevelIndex);
   };
 
@@ -494,6 +526,14 @@ export function ZarrViewer() {
 
   const resetView = () => {
     mapRef.current?.flyTo({ center: DEFAULT_CENTER, zoom: DEFAULT_ZOOM, pitch: 0, bearing: 0, duration: 900 });
+  };
+
+  const clearInspection = () => {
+    inspectionPointRef.current = null;
+    inspectionRequestGeneration.current += 1;
+    inspectionMarkerRef.current?.remove();
+    inspectionMarkerRef.current = null;
+    setInspector(null);
   };
 
   const [legendMin, legendMax] = activeDisplayRange;
@@ -593,8 +633,8 @@ export function ZarrViewer() {
 
       {inspector ? (
         <aside className="inspector" data-testid="inspector" aria-live="polite">
-          <button type="button" onClick={() => setInspector(null)} aria-label="Close inspection">×</button>
-          <strong>{inspector.value.toFixed(legendDecimals)} <small>{variable.unit}</small></strong>
+          <button type="button" onClick={clearInspection} aria-label="Close inspection">×</button>
+          <strong>{inspector.value === null ? "—" : inspector.value.toFixed(legendDecimals)} <small>{variable.unit}</small></strong>
           <span>{shortCoordinate(inspector.lat, "N", "S")} · {shortCoordinate(inspector.lng, "E", "W")}</span>
           <span>{variable.label}{variable.hasLevel ? ` · ${level} ${levelAxis.unit}` : ""}</span>
         </aside>

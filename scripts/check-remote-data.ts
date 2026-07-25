@@ -12,6 +12,7 @@ import {
   loadPointTimeSeries,
   loadStoreInfo,
 } from "../app/dataset";
+import { convertPointSeries } from "../app/units";
 
 await initializePcodec(
   await readFile(
@@ -23,8 +24,12 @@ await initializePcodec(
 );
 
 const googleEra5 = getDataset("google-arco-era5");
-if (hasSeriesSource(googleEra5)) {
-  throw new Error("Google ARCO ERA5 must not enable point time-series reads");
+if (!hasSeriesSource(googleEra5)) {
+  throw new Error("Google ARCO ERA5 must enable point time-series reads");
+}
+const googleSeriesInfo = await loadStoreInfo("google-arco-era5", "series");
+if (!googleSeriesInfo.store) {
+  throw new Error("Google ARCO ERA5 did not provide a readable series store");
 }
 const hrrr = getDataset("noaa-hrrr-forecast-48-hour");
 if (
@@ -94,6 +99,15 @@ const gefsDuration = (
 if (gefsDuration > 15 * 24 * 60 * 60 * 1000) {
   throw new Error("Dynamical GEFS exceeded the 15-day comparison window");
 }
+const celsius = { id: "tempC", label: "°C" };
+const era5DisplaySeries = convertPointSeries(era5Series, celsius);
+const gefsDisplaySeries = convertPointSeries(gefsSeries, celsius);
+if (
+  era5DisplaySeries.unit !== "°C"
+  || gefsDisplaySeries.unit !== "°C"
+) {
+  throw new Error("Cross-model temperature series did not share the selected unit");
+}
 
 console.log({
   virtualHrrrTemperature2m: hrrrValue,
@@ -107,11 +121,13 @@ console.log({
     first: era5Series.dates[0].toISOString(),
     last: era5Series.dates.at(-1)?.toISOString(),
     grid: [era5Series.longitude, era5Series.latitude],
+    displayUnit: era5DisplaySeries.unit,
   },
   gefsPointForecast: {
     members: gefsSeries.memberCount,
     steps: gefsSeries.quantiles.length,
     first: gefsSeries.dates[0].toISOString(),
     last: gefsSeries.dates.at(-1)?.toISOString(),
+    displayUnit: gefsDisplaySeries.unit,
   },
 });

@@ -8,20 +8,26 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 3000",
     "build": "vite build",
+    "build:asos-manifest": "tsx scripts/build-asos-manifest.ts",
     "build:coastline": "node scripts/build-coastline.mjs",
     "check:static": "node scripts/check-static-build.mjs",
     "check:data": "tsx scripts/check-remote-data.ts",
+    "check:time": "tsx scripts/check-time-axes.ts",
+    "check:units": "tsx scripts/check-units.ts",
     "preview": "vite preview --host 127.0.0.1 --port 3000",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "test": "npm run lint && npm run typecheck && npm run build && npm run check:static"
+    "test": "npm run lint && npm run typecheck && npm run check:time && npm run check:units && npm run build && npm run check:static"
   },
   "dependencies": {
     "@carbonplan/zarr-layer": "^0.6.1",
     "@fontsource-variable/geist": "^5.2.9",
     "@mattnucc/gribberish": "^1.5.0",
     "@mattnucc/gribberish-wasm32-wasi": "^1.5.0",
+    "hyparquet": "^1.26.2",
+    "hyparquet-compressors": "^1.1.1",
     "icechunk-js": "^0.6.0",
+    "js-quantities": "^1.8.0",
     "maplibre-gl": "^5.15.0",
     "proj4": "^2.20.9",
     "react": "19.2.6",
@@ -30,6 +36,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.39.4",
+    "@types/js-quantities": "^1.6.6",
     "@types/node": "22.19.19",
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",

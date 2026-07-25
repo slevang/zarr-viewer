@@ -11,9 +11,17 @@ const escapedBase = base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 assert.match(index, new RegExp(`(?:src|href)=["']${escapedBase}assets/`));
 assert.ok(scripts.length > 0, "Static build did not emit an application script");
 await access(new URL("coastline.geojson", output));
+await access(new URL("asos-stations.geojson", output));
+await access(new URL("coi-serviceworker.min.js", output));
 await access(new URL(".nojekyll", output));
+assert.match(
+  index,
+  new RegExp(`src=["']${escapedBase}coi-serviceworker\\.min\\.js["']`),
+  "COOP/COEP service worker URL does not honor BASE_PATH",
+);
 
 const bundles = await Promise.all(scripts.map((name) => readFile(new URL(`assets/${name}`, output), "utf8")));
 assert.ok(bundles.some((bundle) => bundle.includes(`${base}coastline.geojson`)), "Coastline URL does not honor BASE_PATH");
+assert.ok(bundles.some((bundle) => bundle.includes(`${base}asos-stations.geojson`)), "ASOS manifest URL does not honor BASE_PATH");
 
 console.log(`Static build verified for base path ${base}`);

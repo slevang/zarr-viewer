@@ -18,6 +18,14 @@ import {
   type ComparisonSeriesEntry,
 } from "./SeriesComparison";
 import {
+  ASOS_MANIFEST_URL,
+  ASOS_SERIES_COLOR,
+  ASOS_SERIES_ID,
+  asosAtTime,
+  type AsosStation,
+  type AsosWindow,
+} from "./asos-types";
+import {
   axisDateInputValue,
   axisIndexForDate,
   axisValueAsDate,
@@ -35,10 +43,25 @@ import {
   type StoreInfo,
   type VariableConfig,
 } from "./dataset";
+import {
+  convertUnitRange,
+  convertUnitValue,
+  nativeUnitOption,
+  unitKind,
+  unitOptions,
+  type UnitOption,
+} from "./units";
 
 type Projection = "globe" | "mercator";
 type InspectionPoint = { lng: number; lat: number };
 type Inspector = InspectionPoint & { value: number | null };
+type StationFeatureLike = {
+  geometry: {
+    type: string;
+    coordinates?: unknown;
+  };
+  properties?: Record<string, unknown> | null;
+};
 type Limit = "min" | "max";
 type LoadState = { phase: "loading" | "ready" | "error"; message: string };
 type PlaybackPrefetchQueue = {
@@ -60,6 +83,9 @@ type PlaybackPrefetchQueue = {
 
 const MAP_STYLE = "https://tiles.openfreemap.org/styles/liberty";
 const ZARR_LAYER_ID = "zarr-data";
+const ASOS_SOURCE_ID = "asos-stations";
+const ASOS_DOT_LAYER_ID = "asos-station-dots";
+const ASOS_HIT_LAYER_ID = "asos-station-hits";
 const PLAYBACK_DATA_HOURS_PER_SECOND = 6;
 const PLAYBACK_FALLBACK_INTERVAL_MS = 250;
 const PLAYBACK_PREFETCH_BASE_AHEAD = 10;
@@ -151,10 +177,10 @@ function formatChunkShape(variable: VariableConfig, shape: number[]) {
 
 function chunkingSummary(variable: VariableConfig | null) {
   if (!variable?.chunkShape) return "Loading chunk metadata…";
-  const outer = formatChunkShape(variable, variable.chunkShape);
-  return variable.innerChunkShape
-    ? `Chunk: ${formatChunkShape(variable, variable.innerChunkShape)} · shard: ${outer}`
-    : `Chunk: ${outer}`;
+  return `Chunk: ${formatChunkShape(
+    variable,
+    variable.innerChunkShape ?? variable.chunkShape,
+  )}`;
 }
 
 function playbackPrefetchProfile(
@@ -280,6 +306,46 @@ function playbackChunkKey(
 
 function shortCoordinate(value: number, positive: string, negative: string) {
   return `${Math.abs(value).toFixed(2)}°${value >= 0 ? positive : negative}`;
+}
+
+function stationFromFeature(
+  feature: StationFeatureLike,
+): AsosStation | null {
+  const coordinates = feature.geometry.type === "Point"
+    && Array.isArray(feature.geometry.coordinates)
+    ? feature.geometry.coordinates
+    : null;
+  if (!coordinates) return null;
+  const longitude = Number(coordinates[0]);
+  const latitude = Number(coordinates[1]);
+  const properties = feature.properties ?? {};
+  const station = String(properties.station ?? "");
+  if (
+    !station
+    || !Number.isFinite(longitude)
+    || !Number.isFinite(latitude)
+  ) return null;
+  return {
+    station,
+    name: String(properties.name ?? station),
+    state: String(properties.state ?? ""),
+    country: String(properties.country ?? ""),
+    elevation: Number(properties.elevation),
+    longitude,
+    latitude,
+  };
+}
+
+function formatAsosTime(date: Date) {
+  return `${date.toISOString().slice(0, 16).replace("T", " ")}Z`;
+}
+
+function formatOptionalValue(
+  value: number | null,
+  unit: string,
+  decimals = 1,
+) {
+  return value === null ? "—" : `${value.toFixed(decimals)} ${unit}`;
 }
 
 function firstFinite(value: unknown): number | undefined {
@@ -519,11 +585,18 @@ export function ZarrViewer() {
   const inspectionRequestGeneration = useRef(0);
   const seriesRequestGeneration = useRef(0);
   const seriesDatasetIdsRef = useRef<string[]>([]);
+  const asosStationRef = useRef<AsosStation | null>(null);
+  const stationsVisibleRef = useRef(false);
   const playbackPrefetchRef = useRef<PlaybackPrefetchQueue | null>(null);
   const playbackPrefetchGenerationRef = useRef(0);
   const playbackViewportMovingRef = useRef(false);
   const resetPlaybackPrefetchRef = useRef<() => void>(() => {});
   const startSeriesComparisonRef = useRef<(point: InspectionPoint) => void>(() => {});
+  const startAsosComparisonRef = useRef<(station: AsosStation) => void>(() => {});
+  const inspectLocationRef = useRef<(
+    point: InspectionPoint,
+    station: AsosStation | null,
+  ) => void>(() => {});
 
   const [datasetId, setDatasetId] = useState(
     () => getDataset(DEFAULT_DATASET_ID).id,
@@ -533,6 +606,7 @@ export function ZarrViewer() {
   const [selections, setSelections] = useState<AxisSelection>({});
   const [opacity, setOpacity] = useState(1);
   const [activeDisplayRange, setActiveDisplayRange] = useState<[number, number]>([0, 1]);
+  const [unitPreferences, setUnitPreferences] = useState<Record<string, string>>({});
   const [colormapId, setColormapId] = useState(DEFAULT_COLORMAP.id);
   const [colormapOpen, setColormapOpen] = useState(false);
   const [editingLimit, setEditingLimit] = useState<Limit | null>(null);
@@ -540,8 +614,20 @@ export function ZarrViewer() {
   const [playingAxis, setPlayingAxis] = useState<string | null>(null);
   const [playbackViewportRevision, setPlaybackViewportRevision] = useState(0);
   const [projection, setProjection] = useState<Projection>("globe");
+  const [mobileControlsCollapsed, setMobileControlsCollapsed] = useState(
+    () => typeof window !== "undefined"
+      && window.matchMedia("(max-width: 580px)").matches,
+  );
   const [loadState, setLoadState] = useState<LoadState>(() => loadingState());
   const [mapReady, setMapReady] = useState(false);
+  const [stationsVisible, setStationsVisible] = useState(false);
+  const [stationsPhase, setStationsPhase] = useState<
+    "idle" | "loading" | "ready" | "error"
+  >("idle");
+  const [stations, setStations] = useState<AsosStation[]>([]);
+  const [stationSearchQuery, setStationSearchQuery] = useState("");
+  const [asosStation, setAsosStation] = useState<AsosStation | null>(null);
+  const [asosWindow, setAsosWindow] = useState<AsosWindow | null>(null);
   const [inspector, setInspector] = useState<Inspector | null>(null);
   const [seriesEntries, setSeriesEntries] = useState<ComparisonSeriesEntry[]>([]);
   const [seriesPickerId, setSeriesPickerId] = useState(
@@ -549,6 +635,56 @@ export function ZarrViewer() {
   );
 
   const dataset = getDataset(datasetId);
+  const variableUnitContext = variable
+    ? `${variable.id} ${variable.label}`
+    : "";
+  const availableUnitOptions = useMemo(
+    () => variable ? unitOptions(variable.unit, variableUnitContext) : [],
+    [variable, variableUnitContext],
+  );
+  const currentUnitKind = variable
+    ? unitKind(variable.unit, variableUnitContext)
+    : undefined;
+  const selectedUnit = useMemo<UnitOption | null>(() => {
+    if (!variable) return null;
+    const preferred = currentUnitKind
+      ? unitPreferences[currentUnitKind]
+      : undefined;
+    return availableUnitOptions.find((option) => option.id === preferred)
+      ?? nativeUnitOption(variable.unit, variableUnitContext)
+      ?? availableUnitOptions[0]
+      ?? null;
+  }, [
+    availableUnitOptions,
+    currentUnitKind,
+    unitPreferences,
+    variable,
+    variableUnitContext,
+  ]);
+  const stationSearchResults = useMemo(() => {
+    const query = stationSearchQuery.trim().toLocaleLowerCase();
+    if (!query) return [];
+    return stations
+      .flatMap((station) => {
+        const code = station.station.toLocaleLowerCase();
+        const name = station.name.toLocaleLowerCase();
+        const location = `${station.state} ${station.country}`.toLocaleLowerCase();
+        const score = code === query ? 0
+          : code.startsWith(query) ? 1
+            : name.startsWith(query) ? 2
+              : code.includes(query) ? 3
+                : name.includes(query) ? 4
+                  : location.includes(query) ? 5
+                    : Number.POSITIVE_INFINITY;
+        return Number.isFinite(score) ? [{ station, score }] : [];
+      })
+      .sort((first, second) =>
+        first.score - second.score
+        || first.station.station.localeCompare(second.station.station)
+      )
+      .slice(0, 7)
+      .map(({ station }) => station);
+  }, [stationSearchQuery, stations]);
   const colormap = useMemo(
     () => COLORMAPS.find((option) => option.id === colormapId) ?? DEFAULT_COLORMAP,
     [colormapId],
@@ -564,6 +700,12 @@ export function ZarrViewer() {
       return axis ? [axis] : [];
     });
   }, [info, variable]);
+  const compactPlaybackAxes = useMemo(
+    () => activeAxes.filter(
+      (axis) => axis.kind === "time" || axis.kind === "timedelta",
+    ),
+    [activeAxes],
+  );
   const selectedMapValidDate = useMemo(
     () => info && variable
       ? selectedValidDate(info, variable, selections)
@@ -879,6 +1021,88 @@ export function ZarrViewer() {
   }, [loadComparisonDataset]);
   startSeriesComparisonRef.current = startSeriesComparison;
 
+  const startAsosComparison = useCallback((station: AsosStation) => {
+    const currentInfo = infoRef.current;
+    const currentVariable = variableRef.current;
+    if (!currentInfo || !currentVariable) return;
+    const generation = seriesRequestGeneration.current;
+    const start = selectedAnchorDate(
+      currentInfo,
+      currentVariable,
+      selectionsRef.current,
+    ) ?? selectedValidDate(
+      currentInfo,
+      currentVariable,
+      selectionsRef.current,
+    );
+    const cursor = selectedValidDate(
+      currentInfo,
+      currentVariable,
+      selectionsRef.current,
+    ) ?? start;
+    asosStationRef.current = station;
+    setAsosStation(station);
+    setAsosWindow(null);
+    setSeriesEntries((current) => {
+      const loading: ComparisonSeriesEntry = {
+        datasetId: ASOS_SERIES_ID,
+        phase: "loading",
+        message: "Loading station observations…",
+        label: `ASOS · ${station.station}`,
+        color: ASOS_SERIES_COLOR,
+        removable: false,
+      };
+      return [
+        ...current.filter((entry) => entry.datasetId !== ASOS_SERIES_ID),
+        loading,
+      ];
+    });
+
+    if (!start || !cursor) {
+      setSeriesEntries((current) => current.map((entry) =>
+        entry.datasetId === ASOS_SERIES_ID
+          ? { ...entry, phase: "error", message: "Map has no selected time" }
+          : entry
+      ));
+      return;
+    }
+
+    void import("./asos").then(({ loadAsosWindow }) =>
+      loadAsosWindow(station, start, currentVariable)
+    ).then((window) => {
+      if (
+        generation !== seriesRequestGeneration.current
+        || asosStationRef.current?.station !== station.station
+      ) return;
+      setAsosWindow(window);
+      setSeriesEntries((current) => current.map((entry) =>
+        entry.datasetId !== ASOS_SERIES_ID
+          ? entry
+          : {
+            ...entry,
+            phase: window.series ? "ready" : "error",
+            message: window.message,
+            series: window.series ?? undefined,
+          }
+      ));
+    }).catch((error) => {
+      if (
+        generation !== seriesRequestGeneration.current
+        || asosStationRef.current?.station !== station.station
+      ) return;
+      setSeriesEntries((current) => current.map((entry) =>
+        entry.datasetId === ASOS_SERIES_ID
+          ? {
+            ...entry,
+            phase: "error",
+            message: error instanceof Error ? error.message : String(error),
+          }
+          : entry
+      ));
+    });
+  }, []);
+  startAsosComparisonRef.current = startAsosComparison;
+
   useEffect(() => {
     const selected = new Set(seriesEntries.map((entry) => entry.datasetId));
     if (
@@ -1025,6 +1249,23 @@ export function ZarrViewer() {
         "bottom-right",
       );
       map.addControl(new maplibregl.AttributionControl({ compact: true }), "bottom-left");
+      inspectLocationRef.current = (point, station) => {
+        asosStationRef.current = station;
+        setAsosStation(station);
+        setAsosWindow(null);
+        inspectionPointRef.current = point;
+        setInspector({ ...point, value: null });
+        inspectionMarkerRef.current?.remove();
+        const markerElement = document.createElement("span");
+        markerElement.className = "inspection-marker";
+        markerElement.setAttribute("aria-hidden", "true");
+        inspectionMarkerRef.current = new maplibregl.Marker({ element: markerElement })
+          .setLngLat([point.lng, point.lat])
+          .addTo(map);
+        void refreshInspection(point);
+        startSeriesComparisonRef.current(point);
+        if (station) startAsosComparisonRef.current(station);
+      };
 
       map.on("load", () => {
         if (disposed) return;
@@ -1050,18 +1291,21 @@ export function ZarrViewer() {
       });
 
       map.on("click", (event) => {
-        const point = { lng: event.lngLat.lng, lat: event.lngLat.lat };
-        inspectionPointRef.current = point;
-        setInspector({ ...point, value: null });
-        inspectionMarkerRef.current?.remove();
-        const markerElement = document.createElement("span");
-        markerElement.className = "inspection-marker";
-        markerElement.setAttribute("aria-hidden", "true");
-        inspectionMarkerRef.current = new maplibregl.Marker({ element: markerElement })
-          .setLngLat([point.lng, point.lat])
-          .addTo(map);
-        void refreshInspection(point);
-        startSeriesComparisonRef.current(point);
+        const stationFeature = (
+          stationsVisibleRef.current
+          && map.getLayer(ASOS_HIT_LAYER_ID)
+        )
+          ? map.queryRenderedFeatures(event.point, {
+            layers: [ASOS_HIT_LAYER_ID],
+          })[0]
+          : undefined;
+        const station = stationFeature
+          ? stationFromFeature(stationFeature)
+          : null;
+        const point = station
+          ? { lng: station.longitude, lat: station.latitude }
+          : { lng: event.lngLat.lng, lat: event.lngLat.lat };
+        inspectLocationRef.current(point, station);
       });
       map.on("movestart", () => {
         playbackViewportMovingRef.current = true;
@@ -1087,6 +1331,109 @@ export function ZarrViewer() {
       layerRef.current = null;
     };
   }, [refreshInspection]);
+
+  useEffect(() => {
+    stationsVisibleRef.current = stationsVisible;
+    const map = mapRef.current;
+    if (!mapReady || !map) return;
+    let cancelled = false;
+    let pointerHandlersInstalled = false;
+    const showPointer = () => {
+      map.getCanvas().style.cursor = "pointer";
+    };
+    const restorePointer = () => {
+      map.getCanvas().style.cursor = "";
+    };
+    const setVisibility = (visibility: "visible" | "none") => {
+      for (const layerId of [ASOS_DOT_LAYER_ID, ASOS_HIT_LAYER_ID]) {
+        if (map.getLayer(layerId)) {
+          map.setLayoutProperty(layerId, "visibility", visibility);
+        }
+      }
+    };
+    const installPointerHandlers = () => {
+      if (pointerHandlersInstalled) return;
+      map.on("mouseenter", ASOS_HIT_LAYER_ID, showPointer);
+      map.on("mouseleave", ASOS_HIT_LAYER_ID, restorePointer);
+      pointerHandlersInstalled = true;
+    };
+
+    if (!stationsVisible) {
+      setVisibility("none");
+      return;
+    }
+    const installStations = async () => {
+      if (!map.getSource(ASOS_SOURCE_ID)) {
+        setStationsPhase("loading");
+        const response = await fetch(ASOS_MANIFEST_URL);
+        if (!response.ok) {
+          throw new Error(`Station manifest request failed (${response.status})`);
+        }
+        const data = await response.json();
+        if (cancelled) return;
+        setStations((data.features ?? []).flatMap(
+          (feature: StationFeatureLike) => {
+            const station = stationFromFeature(feature);
+            return station ? [station] : [];
+          },
+        ));
+        map.addSource(ASOS_SOURCE_ID, {
+          type: "geojson",
+          data,
+          promoteId: "station",
+          attribution: "ASOS/AWOS observations © Iowa Environmental Mesonet",
+        });
+        map.addLayer({
+          id: ASOS_DOT_LAYER_ID,
+          type: "circle",
+          source: ASOS_SOURCE_ID,
+          paint: {
+            "circle-radius": [
+              "interpolate",
+              ["linear"],
+              ["zoom"],
+              0,
+              1.4,
+              3,
+              2.3,
+              7,
+              4,
+            ],
+            "circle-color": "#c9cecb",
+            "circle-opacity": 0.94,
+            "circle-stroke-color": "#111412",
+            "circle-stroke-width": 1.15,
+          },
+        });
+        map.addLayer({
+          id: ASOS_HIT_LAYER_ID,
+          type: "circle",
+          source: ASOS_SOURCE_ID,
+          paint: {
+            "circle-radius": 9,
+            "circle-color": "rgba(255, 255, 255, 0.01)",
+          },
+        });
+      }
+      if (cancelled) return;
+      setVisibility("visible");
+      installPointerHandlers();
+      setStationsPhase("ready");
+    };
+    void installStations().catch((error) => {
+      if (cancelled) return;
+      console.debug("Station overlay unavailable", error);
+      setStationsPhase("error");
+    });
+    return () => {
+      cancelled = true;
+      if (pointerHandlersInstalled) {
+        map.off("mouseenter", ASOS_HIT_LAYER_ID, showPointer);
+        map.off("mouseleave", ASOS_HIT_LAYER_ID, restorePointer);
+        restorePointer();
+      }
+    };
+  }, [mapReady, stationsVisible]);
 
   useEffect(() => {
     if (!mapReady) return;
@@ -1152,7 +1499,11 @@ export function ZarrViewer() {
         beforeLayer,
       );
       const point = inspectionPointRef.current;
-      if (point) startSeriesComparisonRef.current(point);
+      if (point) {
+        startSeriesComparisonRef.current(point);
+        const station = asosStationRef.current;
+        if (station) startAsosComparisonRef.current(station);
+      }
     };
     void installDataset().catch((error) => {
       if (!cancelled) setLoadState(errorState(error));
@@ -1265,7 +1616,11 @@ export function ZarrViewer() {
       await layer.setVariable(nextVariable.id);
       await applySelector(nextVariable, nextSelections);
       const point = inspectionPointRef.current;
-      if (point) startSeriesComparisonRef.current(point);
+      if (point) {
+        startSeriesComparisonRef.current(point);
+        const station = asosStationRef.current;
+        if (station) startAsosComparisonRef.current(station);
+      }
     } catch (error) {
       setLoadState(errorState(error));
     }
@@ -1285,6 +1640,8 @@ export function ZarrViewer() {
       const point = inspectionPointRef.current;
       if (manual && axis.kind === "time" && point) {
         startSeriesComparisonRef.current(point);
+        const station = asosStationRef.current;
+        if (station) startAsosComparisonRef.current(station);
       }
     });
   };
@@ -1321,6 +1678,28 @@ export function ZarrViewer() {
     layerRef.current?.setOpacity(next);
   };
 
+  const chooseStation = (station: AsosStation) => {
+    const map = mapRef.current;
+    if (!map) return;
+    const point = { lng: station.longitude, lat: station.latitude };
+    setStationSearchQuery("");
+    map.flyTo({
+      center: [station.longitude, station.latitude],
+      zoom: Math.max(map.getZoom(), 5),
+      duration: 700,
+    });
+    inspectLocationRef.current(point, station);
+  };
+
+  const changeDisplayUnit = (next: string) => {
+    if (!currentUnitKind) return;
+    setUnitPreferences((current) => ({
+      ...current,
+      [currentUnitKind]: next,
+    }));
+    setEditingLimit(null);
+  };
+
   const changeColormap = (id: string) => {
     const next = COLORMAPS.find((option) => option.id === id);
     if (!next) return;
@@ -1332,25 +1711,28 @@ export function ZarrViewer() {
   const beginLimitEdit = (limit: Limit) => {
     setColormapOpen(false);
     setEditingLimit(limit);
-    setLimitDraft(String(limit === "min" ? activeDisplayRange[0] : activeDisplayRange[1]));
+    setLimitDraft(String(limit === "min" ? legendMin : legendMax));
   };
 
   const commitLimitEdit = () => {
     if (!editingLimit) return;
     const next = Number(limitDraft);
-    if (Number.isFinite(next)) {
-      const updated: [number, number] = [...activeDisplayRange];
+    if (Number.isFinite(next) && variable) {
+      const updated: [number, number] = [legendMin, legendMax];
       updated[editingLimit === "min" ? 0 : 1] = next;
       if (updated[0] < updated[1]) {
+        const rawUpdated = selectedUnit
+          ? convertUnitRange(updated, selectedUnit.id, variable.unit)
+          : updated;
         if (info && variable) {
           displayRangesRef.current.set(
             displayRangeKey(info.dataset.id, variable.id),
-            updated,
+            rawUpdated,
           );
         }
         needsRangeEstimateRef.current = false;
-        setActiveDisplayRange(updated);
-        layerRef.current?.setClim(updated);
+        setActiveDisplayRange(rawUpdated);
+        layerRef.current?.setClim(rawUpdated);
       }
     }
     setEditingLimit(null);
@@ -1358,10 +1740,13 @@ export function ZarrViewer() {
 
   const clearInspection = () => {
     inspectionPointRef.current = null;
+    asosStationRef.current = null;
     inspectionRequestGeneration.current += 1;
     inspectionMarkerRef.current?.remove();
     inspectionMarkerRef.current = null;
     setInspector(null);
+    setAsosStation(null);
+    setAsosWindow(null);
     seriesRequestGeneration.current += 1;
     seriesDatasetIdsRef.current = [];
     setSeriesEntries([]);
@@ -1392,9 +1777,35 @@ export function ZarrViewer() {
     ));
   };
 
-  const [legendMin, legendMax] = activeDisplayRange;
+  const [legendMin, legendMax] = variable && selectedUnit
+    ? convertUnitRange(activeDisplayRange, variable.unit, selectedUnit.id)
+    : activeDisplayRange;
   const legendMid = (legendMin + legendMax) / 2;
-  const legendDecimals = decimalsForRange(activeDisplayRange);
+  const legendDecimals = decimalsForRange([legendMin, legendMax]);
+  const displayUnitLabel = selectedUnit?.label ?? variable?.unit ?? "";
+  const inspectorDisplayValue = (
+    inspector?.value !== null
+    && inspector?.value !== undefined
+    && variable
+    && selectedUnit
+  )
+    ? convertUnitValue(inspector.value, variable.unit, selectedUnit.id)
+    : inspector?.value;
+  const currentAsos = asosAtTime(asosWindow, selectedMapValidDate);
+  const asosDisplayValue = (
+    currentAsos.value !== null
+    && asosWindow?.unit
+    && selectedUnit
+  )
+    ? convertUnitValue(currentAsos.value, asosWindow.unit, selectedUnit.id)
+    : currentAsos.value;
+  const gridStationBias = (
+    typeof inspectorDisplayValue === "number"
+    && typeof asosDisplayValue === "number"
+  )
+    ? inspectorDisplayValue - asosDisplayValue
+    : null;
+  const asosDisplayUnit = selectedUnit?.label ?? asosWindow?.unit ?? "";
 
   return (
     <main className="viewer-shell">
@@ -1405,10 +1816,133 @@ export function ZarrViewer() {
           <button className={projection === "globe" ? "active" : ""} onClick={() => changeProjection("globe")} type="button">Globe</button>
           <button className={projection === "mercator" ? "active" : ""} onClick={() => changeProjection("mercator")} type="button">Map</button>
         </div>
+        <button
+          className={`station-toggle ${stationsVisible ? "active" : ""} ${stationsPhase}`}
+          type="button"
+          aria-pressed={stationsVisible}
+          title={stationsPhase === "error"
+            ? "Station overlay could not be loaded"
+            : "Show ASOS/AWOS observation stations"}
+          onClick={() => setStationsVisible((current) => !current)}
+        >
+          <i aria-hidden="true" />
+          Stations
+        </button>
+        {stationsVisible ? (
+          <div className="station-search">
+            <input
+              type="search"
+              value={stationSearchQuery}
+              placeholder={stationsPhase === "loading"
+                ? "Loading stations…"
+                : "Find station…"}
+              aria-label="Find ASOS or AWOS station"
+              disabled={stationsPhase !== "ready"}
+              onChange={(event) => setStationSearchQuery(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Escape") setStationSearchQuery("");
+                if (event.key === "Enter" && stationSearchResults[0]) {
+                  chooseStation(stationSearchResults[0]);
+                }
+              }}
+            />
+            {stationSearchQuery.trim() && stationsPhase === "ready" ? (
+              <div className="station-search-results" role="listbox" aria-label="Station results">
+                {stationSearchResults.length ? stationSearchResults.map((station) => (
+                  <button
+                    key={station.station}
+                    type="button"
+                    role="option"
+                    aria-selected="false"
+                    onClick={() => chooseStation(station)}
+                  >
+                    <strong>{station.station}</strong>
+                    <span>{station.name}</span>
+                    <small>
+                      {[station.state, station.country].filter(Boolean).join(", ")}
+                    </small>
+                  </button>
+                )) : (
+                  <small className="station-search-empty">No matching stations</small>
+                )}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
         <button className="reset-button" onClick={() => mapRef.current?.flyTo({ center: DEFAULT_CENTER, zoom: DEFAULT_ZOOM, pitch: 0, bearing: 0, duration: 900 })} type="button">Reset</button>
       </div>
 
-      <section className="control-panel" aria-label="Viewer controls">
+      <section
+        className={`control-panel ${mobileControlsCollapsed ? "mobile-compact" : ""}`}
+        aria-label="Viewer controls"
+      >
+        <button
+          className="mobile-panel-toggle"
+          type="button"
+          aria-expanded={!mobileControlsCollapsed}
+          aria-label={mobileControlsCollapsed
+            ? "Show full viewer controls"
+            : "Minimize viewer controls"}
+          title={mobileControlsCollapsed
+            ? "Show full controls"
+            : "Minimize controls"}
+          onClick={() => setMobileControlsCollapsed((current) => !current)}
+        >
+          {mobileControlsCollapsed ? "Full" : "Hide"}
+        </button>
+        <div className="mobile-time-controls" aria-label="Compact time controls">
+          {compactPlaybackAxes.length ? compactPlaybackAxes.map((axis) => {
+            const selected = selections[axis.id] ?? 0;
+            return (
+              <div className="mobile-axis-control" key={axis.id}>
+                <div className="mobile-axis-heading">
+                  <span>{axis.label}</span>
+                  <strong>{formatAxisValue(dataset, axis, selected)}</strong>
+                </div>
+                <div className="mobile-axis-inputs">
+                  <button
+                    type="button"
+                    disabled={selected <= 0}
+                    onClick={() => changeAxis(axis, selected - 1)}
+                    aria-label={`Previous ${axis.label}`}
+                  >
+                    ←
+                  </button>
+                  <input
+                    aria-label={`Compact ${axis.label}`}
+                    type="range"
+                    min="0"
+                    max={Math.max(0, axis.values.length - 1)}
+                    step="1"
+                    value={selected}
+                    onChange={(event) => changeAxis(axis, Number(event.target.value))}
+                  />
+                  <button
+                    type="button"
+                    disabled={selected >= axis.values.length - 1}
+                    onClick={() => changeAxis(axis, selected + 1)}
+                    aria-label={`Next ${axis.label}`}
+                  >
+                    →
+                  </button>
+                  <button
+                    className="play-button"
+                    type="button"
+                    disabled={selected >= axis.values.length - 1}
+                    onClick={() => togglePlayback(axis)}
+                    aria-label={playingAxis === axis.id
+                      ? `Pause ${axis.label}`
+                      : `Play ${axis.label}`}
+                  >
+                    {playingAxis === axis.id ? "Ⅱ" : "▶"}
+                  </button>
+                </div>
+              </div>
+            );
+          }) : (
+            <span className="mobile-axis-empty">No time coordinate for this variable</span>
+          )}
+        </div>
         <div className={`status-indicator ${loadState.phase}`} role="status" title={loadState.message}>
           <span className="status-spinner" aria-hidden="true" />
           <span className="sr-only">{loadState.message}</span>
@@ -1438,9 +1972,26 @@ export function ZarrViewer() {
             <small className="dataset-chunking">{chunkingSummary(variable)}</small>
           </label>
 
-          <label className="field">
-            <span>Variable</span>
+          <div className="field">
+            <div className="field-heading">
+              <label htmlFor="variable-select">Variable</label>
+              {availableUnitOptions.length > 1 && selectedUnit ? (
+                <select
+                  className="unit-select"
+                  aria-label="Display unit"
+                  value={selectedUnit.id}
+                  onChange={(event) => changeDisplayUnit(event.target.value)}
+                >
+                  {availableUnitOptions.map((option) => (
+                    <option key={option.id} value={option.id}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              ) : null}
+            </div>
             <select
+              id="variable-select"
               data-testid="variable-select"
               value={variable?.id ?? ""}
               disabled={!info || !variable}
@@ -1457,7 +2008,7 @@ export function ZarrViewer() {
                 </option>
               ))}
             </select>
-          </label>
+          </div>
 
           {activeAxes.map((axis) => {
             const selected = selections[axis.id] ?? 0;
@@ -1540,7 +2091,7 @@ export function ZarrViewer() {
                 if (event.key === "Escape") setEditingLimit(null);
               }} />
             ) : (
-              <button className="legend-limit" type="button" onClick={() => beginLimitEdit("min")}>{legendMin.toFixed(legendDecimals)} {variable?.unit}</button>
+              <button className="legend-limit" type="button" onClick={() => beginLimitEdit("min")}>{legendMin.toFixed(legendDecimals)} {displayUnitLabel}</button>
             )}
             <span>{legendMid.toFixed(legendDecimals)}</span>
             {editingLimit === "max" ? (
@@ -1549,7 +2100,7 @@ export function ZarrViewer() {
                 if (event.key === "Escape") setEditingLimit(null);
               }} />
             ) : (
-              <button className="legend-limit" type="button" onClick={() => beginLimitEdit("max")}>{legendMax.toFixed(legendDecimals)} {variable?.unit}</button>
+              <button className="legend-limit" type="button" onClick={() => beginLimitEdit("max")}>{legendMax.toFixed(legendDecimals)} {displayUnitLabel}</button>
             )}
           </div>
         </div>
@@ -1560,10 +2111,81 @@ export function ZarrViewer() {
       {inspector && info && variable ? (
         <aside className="inspector" data-testid="inspector" aria-live="polite">
           <button className="inspector-close" type="button" onClick={clearInspection} aria-label="Close inspection">×</button>
-          <strong>{inspector.value === null ? "—" : inspector.value.toFixed(legendDecimals)} <small>{variable.unit}</small></strong>
+          <strong>{inspectorDisplayValue === null || inspectorDisplayValue === undefined ? "—" : inspectorDisplayValue.toFixed(legendDecimals)} <small>{displayUnitLabel}</small></strong>
           <span>{shortCoordinate(inspector.lat, "N", "S")} · {shortCoordinate(inspector.lng, "E", "W")}</span>
           <span>{variable.label}</span>
           <span className="inspector-axes">{axisSummary(info, variable, selections)}</span>
+          {asosStation ? (
+            <section className="station-observation" aria-label={`${asosStation.station} station observation`}>
+              <header>
+                <span>
+                  <strong>{asosStation.station}</strong>
+                  <small>{asosStation.name}</small>
+                </span>
+                <em>
+                  {[asosStation.state, asosStation.country].filter(Boolean).join(", ")}
+                  {Number.isFinite(asosStation.elevation)
+                    ? ` · ${asosStation.elevation.toFixed(0)} m`
+                    : ""}
+                </em>
+              </header>
+              {currentAsos.record ? (
+                <>
+                  <div className="station-match">
+                    <span>
+                      Nearest report · {formatAsosTime(currentAsos.record.valid)}
+                    </span>
+                    {asosDisplayValue === null ? null : (
+                      <strong>
+                        {formatOptionalValue(
+                          asosDisplayValue,
+                          asosDisplayUnit,
+                          legendDecimals,
+                        )}
+                        {gridStationBias === null ? null : (
+                          <small>
+                            Grid − station {gridStationBias >= 0 ? "+" : ""}
+                            {gridStationBias.toFixed(legendDecimals)} {asosDisplayUnit}
+                          </small>
+                        )}
+                      </strong>
+                    )}
+                  </div>
+                  <dl>
+                    <div>
+                      <dt>Temperature</dt>
+                      <dd>{formatOptionalValue(currentAsos.record.tmpc, "°C")}</dd>
+                    </div>
+                    <div>
+                      <dt>Dew point</dt>
+                      <dd>{formatOptionalValue(currentAsos.record.dwpc, "°C")}</dd>
+                    </div>
+                    <div>
+                      <dt>Wind</dt>
+                      <dd>
+                        {currentAsos.record.sknt === null
+                          ? "—"
+                          : `${currentAsos.record.sknt.toFixed(0)} kt`
+                            + (currentAsos.record.drct === null
+                              ? ""
+                              : ` · ${currentAsos.record.drct.toFixed(0)}°`)}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>MSLP</dt>
+                      <dd>{formatOptionalValue(currentAsos.record.mslp, "hPa")}</dd>
+                    </div>
+                  </dl>
+                </>
+              ) : (
+                <small className="station-no-match">
+                  {asosWindow
+                    ? "No station report within 90 minutes of the map time."
+                    : "Loading observations…"}
+                </small>
+              )}
+            </section>
+          ) : null}
           <SeriesComparison
             entries={seriesEntries}
             availableDatasets={TIME_SERIES_DATASETS}
@@ -1572,6 +2194,7 @@ export function ZarrViewer() {
             onPickerChange={setSeriesPickerId}
             onAdd={addComparisonDataset}
             onRemove={removeComparisonDataset}
+            displayUnit={selectedUnit}
           />
         </aside>
       ) : null}

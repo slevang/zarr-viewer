@@ -1,12 +1,19 @@
 import { useEffect, useMemo, useRef } from "react";
 import type { DatasetConfig } from "./catalog";
 import type { PointSeries } from "./dataset";
+import {
+  convertPointSeries,
+  type UnitOption,
+} from "./units";
 
 export type ComparisonSeriesEntry = {
   datasetId: string;
   phase: "loading" | "ready" | "error";
   message: string;
   series?: PointSeries;
+  label?: string;
+  color?: string;
+  removable?: boolean;
 };
 
 type SeriesComparisonProps = {
@@ -17,25 +24,51 @@ type SeriesComparisonProps = {
   onPickerChange: (datasetId: string) => void;
   onAdd: () => void;
   onRemove: (datasetId: string) => void;
+  displayUnit: UnitOption | null;
 };
 
 const SERIES_COLORS = [
-  "#dbe8ff",
-  "#f6b26b",
-  "#77d9b2",
-  "#d69cff",
-  "#ff8fa3",
-  "#8ed8ff",
-  "#f2dc70",
-  "#a7e36f",
+  "#56b4e9",
+  "#e69f00",
+  "#009e73",
+  "#cc79a7",
+  "#f0e442",
+  "#d55e00",
+  "#7fdbff",
+  "#b8e186",
+  "#a78bfa",
+  "#ff7f9f",
+  "#00c2d1",
+  "#f4a261",
+  "#8ec5ff",
+  "#e879f9",
+  "#facc15",
+  "#34d399",
 ];
 
-function seriesColor(datasetId: string) {
+function seriesColor(
+  datasetId: string,
+  availableDatasets: DatasetConfig[],
+) {
+  const catalogIndex = availableDatasets.findIndex(
+    (dataset) => dataset.id === datasetId,
+  );
+  if (catalogIndex >= 0) {
+    return SERIES_COLORS[catalogIndex % SERIES_COLORS.length];
+  }
+
   const hash = Array.from(datasetId).reduce(
     (value, character) => ((value * 31) + character.charCodeAt(0)) >>> 0,
     0,
   );
   return SERIES_COLORS[hash % SERIES_COLORS.length];
+}
+
+function entryColor(
+  entry: Pick<ComparisonSeriesEntry, "color" | "datasetId">,
+  availableDatasets: DatasetConfig[],
+) {
+  return entry.color ?? seriesColor(entry.datasetId, availableDatasets);
 }
 
 function rgba(hex: string, alpha: number) {
@@ -116,14 +149,19 @@ export function SeriesComparison({
   onPickerChange,
   onAdd,
   onRemove,
+  displayUnit,
 }: SeriesComparisonProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const plottedEntries = useMemo(
-    () => entries.filter(
-      (entry): entry is ComparisonSeriesEntry & { series: PointSeries } =>
-        Boolean(entry.series),
-    ),
-    [entries],
+    () => entries.flatMap((entry) =>
+      entry.series
+        ? [{
+          ...entry,
+          series: convertPointSeries(entry.series, displayUnit),
+        }]
+        : []
+    ) as Array<ComparisonSeriesEntry & { series: PointSeries }>,
+    [displayUnit, entries],
   );
   const chartBounds = useMemo(() => {
     const dates = plottedEntries.flatMap((entry) =>
@@ -279,7 +317,10 @@ export function SeriesComparison({
         context.lineTo(x, y);
       }
       context.closePath();
-      context.fillStyle = rgba(seriesColor(entry.datasetId), alpha);
+      context.fillStyle = rgba(
+        entryColor(entry, availableDatasets),
+        alpha,
+      );
       context.fill();
     };
 
@@ -290,7 +331,7 @@ export function SeriesComparison({
       }
     });
     plottedEntries.forEach((entry) => {
-      const color = seriesColor(entry.datasetId);
+      const color = entryColor(entry, availableDatasets);
       if (entry.series.kind === "history") {
         drawLine(entry.series.dates, entry.series.values, color);
       } else {
@@ -322,7 +363,7 @@ export function SeriesComparison({
         const [, y] = point(new Date(cursorTimestamp), value);
         context.beginPath();
         context.arc(x, y, 4, 0, Math.PI * 2);
-        context.fillStyle = seriesColor(entry.datasetId);
+        context.fillStyle = entryColor(entry, availableDatasets);
         context.fill();
         context.strokeStyle = "rgba(255,255,255,0.95)";
         context.lineWidth = 1.5;
@@ -331,6 +372,7 @@ export function SeriesComparison({
     }
     context.restore();
   }, [
+    availableDatasets,
     chartBounds,
     cursorInRange,
     cursorTimestamp,
@@ -412,18 +454,26 @@ export function SeriesComparison({
             : entry.message;
           return (
             <div className={`series-list-item ${entry.phase}`} key={entry.datasetId}>
-              <i style={{ background: seriesColor(entry.datasetId) }} />
+              <i
+                style={{
+                  background: entryColor(entry, availableDatasets),
+                }}
+              />
               <span>
-                <strong>{dataset?.label ?? entry.datasetId}</strong>
+                <strong>{entry.label ?? dataset?.label ?? entry.datasetId}</strong>
                 <small>{detail}</small>
               </span>
-              <button
-                type="button"
-                onClick={() => onRemove(entry.datasetId)}
-                aria-label={`Remove ${dataset?.label ?? entry.datasetId}`}
-              >
-                ×
-              </button>
+              {entry.removable === false ? null : (
+                <button
+                  type="button"
+                  onClick={() => onRemove(entry.datasetId)}
+                  aria-label={`Remove ${
+                    entry.label ?? dataset?.label ?? entry.datasetId
+                  }`}
+                >
+                  ×
+                </button>
+              )}
             </div>
           );
         })}

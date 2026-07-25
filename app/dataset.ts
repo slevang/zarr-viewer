@@ -459,6 +459,15 @@ async function loadGoogleStoreInfo(
     a.label.localeCompare(b.label, undefined, { sensitivity: "base" }),
   );
 
+  const store = role === "series"
+    ? new zarr.FetchStore(source.url, {
+      fetch: (request) => {
+        const transformed = transformGoogleRequest(request.url);
+        return fetch(new Request(transformed.url, request));
+      },
+    })
+    : undefined;
+
   return {
     dataset,
     source,
@@ -483,6 +492,7 @@ async function loadGoogleStoreInfo(
         values: GOOGLE_LEVELS,
       },
     },
+    store,
     layerOptions: {
       ...defaultLayerOptions(source),
       transformRequest: transformGoogleRequest,
@@ -566,19 +576,36 @@ export function selectorFor(
   return selector;
 }
 
+function cfTimeOriginMilliseconds(origin: string) {
+  const trimmed = origin.trim();
+  const normalized = trimmed
+    .replace(/\s+(UTC|GMT)$/i, "Z")
+    .replace(/^(\d{4}-\d{2}-\d{2})\s+/, "$1T");
+  if (/^\d{4}-\d{2}-\d{2}$/.test(normalized)) {
+    return Date.parse(`${normalized}T00:00:00Z`);
+  }
+  const hasTimezone = (
+    /Z$/i.test(normalized)
+    || /[+-]\d{2}(?::?\d{2})?$/.test(normalized)
+  );
+  return Date.parse(hasTimezone ? normalized : `${normalized}Z`);
+}
+
 export function axisValueAsDate(dataset: DatasetConfig, axis: AxisConfig, index: number) {
   const value = Number(axis.values[index]);
   if (dataset.id === "google-arco-era5") {
     return new Date(GOOGLE_TIME_ORIGIN_MS + value * HOUR_MS);
   }
   const unit = axis.unit.toLowerCase();
-  const multiplier = unit.startsWith("millisecond") ? 1
-    : unit.startsWith("minute") ? 60_000
-      : unit.startsWith("hour") ? HOUR_MS
-        : unit.startsWith("day") ? 24 * HOUR_MS
-          : 1_000;
+  const multiplier = unit.startsWith("nanosecond") ? 1 / 1_000_000
+    : unit.startsWith("microsecond") ? 1 / 1_000
+      : unit.startsWith("millisecond") ? 1
+        : unit.startsWith("minute") ? 60_000
+          : unit.startsWith("hour") ? HOUR_MS
+            : unit.startsWith("day") ? 24 * HOUR_MS
+              : 1_000;
   const sinceMatch = axis.unit.match(/since\s+(.+)$/i);
-  const origin = sinceMatch ? Date.parse(sinceMatch[1]) : 0;
+  const origin = sinceMatch ? cfTimeOriginMilliseconds(sinceMatch[1]) : 0;
   return new Date(origin + value * multiplier);
 }
 

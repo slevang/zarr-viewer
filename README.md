@@ -24,9 +24,12 @@ compatibility.
 - One GiB compressed-chunk cache for direct Icechunk playback reuse
 - Cadence-aware playback targeting six data-hours per real-time second
 - Full-frame per-variable color limits, selectable colormaps, and opacity control
+- Metadata-driven unit conversion with shared units across model comparisons
 - Click-to-inspect values
 - Click-to-plot 15-day windows from Earthmover's temporal ERA5 layout
 - Independent comparison-dataset selector with arbitrary overlaid model series
+- Toggleable ASOS/AWOS station overlay with decoded observations at map time
+- Fifteen-day station traces and live grid-minus-station bias for compatible fields
 - Ensemble forecast envelopes with min/10/25/50/75/90/max quantiles by default
 - Explicit per-dataset opt-in for point time-series extraction
 - Browser Gribberish codec support for virtual HRRR chunks
@@ -61,10 +64,14 @@ npm test
 - `app/ZarrViewer.tsx` — map, layer, interaction, and playback state
 - `app/catalog.ts` — pinned public dataset endpoints and compatibility flags
 - `app/dataset.ts` — generic metadata, coordinate, and selector adapter
+- `app/asos.ts` — lazy browser Parquet queries for point observations
+- `app/asos-types.ts` — station, observation, and map-overlay types
+- `app/units.ts` — CF-unit normalization and JS-Quantities conversion layer
 - `app/codecs/gribberish.ts` — read-only Zarrita codec for virtual GRIB chunks
 - `app/colormaps.ts` — palettes and lightweight default-palette rules
 - `packages/zarrita-pcodec` — Rust/WASM PCodec decoder for Earthmover ERA5
 - `scripts/build-coastline.mjs` — generates the bundled Natural Earth coastline
+- `scripts/build-asos-manifest.ts` — refreshes the checked-in active-station GeoJSON
 
 This remains a prototype rather than a universal Zarr reader. Regular
 latitude/longitude Icechunk stores are the most complete path. HRRR has an
@@ -82,3 +89,9 @@ GRIB-backed spatial source with its materialized temporal source; Earthmover
 ERA5 pairs `single/spatial` with `single/temporal`. Current Dynamical datasets
 without a dedicated spatial source reuse their existing store for maps and
 point series until a better map source is published.
+
+The optional station overlay reads a compact checked-in manifest derived from
+the current ASOS partition. Clicking a station lazily loads Hyparquet and reads
+only the matching station row group and requested columns from the relevant
+year-partitioned GeoParquet file. Refresh the manifest with
+`npm run build:asos-manifest`.

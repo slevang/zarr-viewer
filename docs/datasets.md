@@ -35,6 +35,30 @@ GRIB-backed repository and its series role resolves to the materialized
 repository. HRRR analysis remains cataloged separately and uses its currently
 available time-oriented store for maps until a spatial counterpart exists.
 
+## dynamical.org ASOS/AWOS observations
+
+Catalog: `https://dynamical.org/catalog/asos-parquet/`
+
+Annual partitions:
+
+- HTTPS:
+  `https://s3.us-west-2.amazonaws.com/us-west-2.opendata.source.coop/dynamical/asos-parquet/year%3D{YYYY}/data.parquet`
+- S3:
+  `s3://us-west-2.opendata.source.coop/dynamical/asos-parquet/year={YYYY}/data.parquet`
+- Format: GeoParquet with Zstandard-compressed columns
+- Access: anonymous, CORS-enabled HTTP byte ranges
+
+Files are sorted by station and expose station and timestamp statistics for
+each row group. The viewer uses Hyparquet row-group pruning, column projection,
+and HTTP range reads, so selecting one station does not download the complete
+annual file. Temperature, dew point, relative humidity, wind speed, mean
+sea-level pressure, and precipitation are mapped to corresponding station
+fields when the selected grid variable has a direct observational equivalent.
+
+`public/asos-stations.geojson` is a compact active-station manifest generated
+from the current-year partition. Run `npm run build:asos-manifest` to refresh
+it as the reporting network changes.
+
 ## Earthmover open ERA5
 
 Repository:
@@ -76,6 +100,16 @@ Each read is limited to a 15-day window; ensemble stores are reduced to
 min/10/25/50/75/90/max quantiles. Projected sources use their configured spatial
 dimension names and projection definition to convert the clicked WGS84 point
 before selecting the nearest grid cell.
+
+## Display units
+
+Variable unit attributes are normalized from common CF spellings and parsed by
+JS-Quantities. Recognized quantities expose a short list of compatible display
+units, currently including temperature, pressure, speed, and length. Color
+limits remain stored in each array's native units while legend edits,
+inspection values, and overlaid point series are converted for display. The
+selected unit is remembered by physical quantity, so every compatible model in
+one comparison uses the same scale.
 
 ## Browser compatibility
 

@@ -12,12 +12,14 @@
     "build:coastline": "node scripts/build-coastline.mjs",
     "check:static": "node scripts/check-static-build.mjs",
     "check:data": "tsx scripts/check-remote-data.ts",
+    "check:queue": "tsx scripts/check-async-queue.ts",
+    "check:variables": "tsx scripts/check-common-variables.ts",
     "check:time": "tsx scripts/check-time-axes.ts",
     "check:units": "tsx scripts/check-units.ts",
     "preview": "vite preview --host 127.0.0.1 --port 3000",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "test": "npm run lint && npm run typecheck && npm run check:time && npm run check:units && npm run build && npm run check:static"
+    "test": "npm run lint && npm run typecheck && npm run check:queue && npm run check:variables && npm run check:time && npm run check:units && npm run build && npm run check:static"
   },
   "dependencies": {
     "@carbonplan/zarr-layer": "^0.6.1",

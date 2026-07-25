@@ -2,7 +2,6 @@ import {
   asyncBufferFromUrl,
   parquetMetadataAsync,
   parquetReadObjects,
-  type AsyncBuffer,
   type FileMetaData,
 } from "hyparquet";
 import { compressors } from "hyparquet-compressors";
@@ -19,6 +18,7 @@ const ASOS_BASE_URL = [
   "dynamical/asos-parquet",
 ].join("/");
 const ASOS_WINDOW_MS = 15 * 24 * 60 * 60 * 1000;
+const ASOS_FETCH_TIMEOUT_MS = 15_000;
 const ASOS_COLUMNS = [
   "station",
   "valid",
@@ -43,7 +43,9 @@ type AsosVariable = {
 };
 
 type YearFile = {
-  file: AsyncBuffer;
+  url: string;
+  byteLength: number;
+  etag: string | null;
   metadata: FileMetaData;
 };
 
@@ -58,17 +60,23 @@ async function retryingFetch(
 ) {
   let lastError: unknown;
   for (let attempt = 0; attempt < 4; attempt += 1) {
+    const timeoutSignal = AbortSignal.timeout(ASOS_FETCH_TIMEOUT_MS);
+    const signal = init?.signal
+      ? AbortSignal.any([init.signal, timeoutSignal])
+      : timeoutSignal;
     try {
-      const response = await fetch(input, init);
-      if (response.ok || response.status < 500) return response;
+      const response = await fetch(input, { ...init, signal });
+      if (
+        response.ok
+        || (response.status < 500 && response.status !== 429)
+      ) return response;
       await response.body?.cancel();
       lastError = new Error(`ASOS request failed (${response.status})`);
     } catch (error) {
+      if (init?.signal?.aborted) throw error;
       lastError = error;
     }
-    await new Promise((resolve) =>
-      window.setTimeout(resolve, 250 * (attempt + 1))
-    );
+    await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
   }
   throw lastError;
 }
@@ -113,7 +121,9 @@ async function openYear(year: number): Promise<YearFile> {
         : undefined,
     });
     return {
-      file,
+      url,
+      byteLength: remote.byteLength,
+      etag: remote.etag,
       metadata: await parquetMetadataAsync(file),
     };
   })();
@@ -195,9 +205,29 @@ async function readYear(
   station: string,
   start: Date,
   stop: Date,
+  signal?: AbortSignal,
 ) {
   const read = async () => {
-    const { file, metadata } = await openYear(year);
+    const {
+      url,
+      byteLength,
+      etag,
+      metadata,
+    } = await openYear(year);
+    signal?.throwIfAborted();
+    const file = await asyncBufferFromUrl({
+      url,
+      byteLength,
+      fetch: (input, init) => retryingFetch(input, {
+        ...init,
+        signal: init?.signal && signal
+          ? AbortSignal.any([init.signal, signal])
+          : init?.signal ?? signal,
+      }),
+      requestInit: etag
+        ? { headers: { "If-Match": etag } }
+        : undefined,
+    });
     return parquetReadObjects({
       file,
       metadata,
@@ -231,6 +261,7 @@ export async function loadAsosWindow(
   station: AsosStation,
   start: Date,
   variable: VariableConfig,
+  options: { signal?: AbortSignal } = {},
 ): Promise<AsosWindow> {
   const observedVariable = observationVariable(variable);
   if (!observedVariable) {
@@ -252,7 +283,13 @@ export async function loadAsosWindow(
   const rows = (await Promise.all(
     years.map(async (year) => {
       try {
-        return await readYear(year, station.station, start, stop);
+        return await readYear(
+          year,
+          station.station,
+          start,
+          stop,
+          options.signal,
+        );
       } catch (error) {
         if (
           error instanceof Error

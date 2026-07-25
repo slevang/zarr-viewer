@@ -5,6 +5,7 @@ import {
   DEFAULT_COLORMAP,
   defaultColormap,
 } from "./colormaps";
+import { commonVariableMatches } from "./common-variables";
 import {
   DATASETS,
   DEFAULT_DATASET_ID,
@@ -584,6 +585,7 @@ export function ZarrViewer() {
   const inspectionMarkerRef = useRef<import("maplibre-gl").Marker | null>(null);
   const inspectionRequestGeneration = useRef(0);
   const seriesRequestGeneration = useRef(0);
+  const seriesRequestControllerRef = useRef<AbortController | null>(null);
   const seriesDatasetIdsRef = useRef<string[]>([]);
   const asosStationRef = useRef<AsosStation | null>(null);
   const stationsVisibleRef = useRef(false);
@@ -888,6 +890,7 @@ export function ZarrViewer() {
     comparisonDatasetId: string,
     point: InspectionPoint,
     generation: number,
+    signal: AbortSignal,
   ) => {
     const sourceInfo = infoRef.current;
     const sourceVariable = variableRef.current;
@@ -917,7 +920,7 @@ export function ZarrViewer() {
 
     try {
       const comparisonInfo = await loadStoreInfo(comparisonDatasetId, "series");
-      if (generation !== seriesRequestGeneration.current) return;
+      if (signal.aborted || generation !== seriesRequestGeneration.current) return;
       const comparisonVariable = matchingVariable(comparisonInfo, sourceVariable);
       if (!comparisonVariable) {
         throw new Error("No compatible variable was found");
@@ -954,8 +957,9 @@ export function ZarrViewer() {
         comparisonSelections,
         point.lng,
         point.lat,
+        { signal },
       );
-      if (generation !== seriesRequestGeneration.current) return;
+      if (signal.aborted || generation !== seriesRequestGeneration.current) return;
       setSeriesEntries((current) => current.map((entry) =>
         entry.datasetId !== comparisonDatasetId
           ? entry
@@ -967,17 +971,17 @@ export function ZarrViewer() {
               series,
             }
             : {
-              datasetId: comparisonDatasetId,
+              ...entry,
               phase: "error",
               message: "No compatible time-series layout",
             }
       ));
     } catch (error) {
-      if (generation !== seriesRequestGeneration.current) return;
+      if (signal.aborted || generation !== seriesRequestGeneration.current) return;
       setSeriesEntries((current) => current.map((entry) =>
         entry.datasetId === comparisonDatasetId
           ? {
-            datasetId: comparisonDatasetId,
+            ...entry,
             phase: "error",
             message: error instanceof Error ? error.message : String(error),
           }
@@ -987,6 +991,9 @@ export function ZarrViewer() {
   }, []);
 
   const startSeriesComparison = useCallback((point: InspectionPoint) => {
+    seriesRequestControllerRef.current?.abort();
+    const controller = new AbortController();
+    seriesRequestControllerRef.current = controller;
     const generation = ++seriesRequestGeneration.current;
     const currentInfo = infoRef.current;
     const currentVariable = variableRef.current;
@@ -1001,21 +1008,26 @@ export function ZarrViewer() {
           : []
       );
     seriesDatasetIdsRef.current = [...comparisonDatasetIds];
-    setSeriesEntries((current) => comparisonDatasetIds.map(
-      (comparisonDatasetId) => ({
+    setSeriesEntries((current) => {
+      const comparisons = comparisonDatasetIds.map((comparisonDatasetId) => ({
         datasetId: comparisonDatasetId,
         phase: "loading",
         message: "Loading new location…",
         series: current.find(
           (entry) => entry.datasetId === comparisonDatasetId,
         )?.series,
-      }),
-    ));
+      }) satisfies ComparisonSeriesEntry);
+      const previousAsos = asosStationRef.current
+        ? current.find((entry) => entry.datasetId === ASOS_SERIES_ID)
+        : undefined;
+      return previousAsos ? [...comparisons, previousAsos] : comparisons;
+    });
     for (const comparisonDatasetId of comparisonDatasetIds) {
       void loadComparisonDataset(
         comparisonDatasetId,
         point,
         generation,
+        controller.signal,
       );
     }
   }, [loadComparisonDataset]);
@@ -1026,6 +1038,7 @@ export function ZarrViewer() {
     const currentVariable = variableRef.current;
     if (!currentInfo || !currentVariable) return;
     const generation = seriesRequestGeneration.current;
+    const signal = seriesRequestControllerRef.current?.signal;
     const start = selectedAnchorDate(
       currentInfo,
       currentVariable,
@@ -1040,10 +1053,14 @@ export function ZarrViewer() {
       currentVariable,
       selectionsRef.current,
     ) ?? start;
+    const stationChanged = asosStationRef.current?.station !== station.station;
     asosStationRef.current = station;
     setAsosStation(station);
-    setAsosWindow(null);
+    if (stationChanged) setAsosWindow(null);
     setSeriesEntries((current) => {
+      const previous = current.find(
+        (entry) => entry.datasetId === ASOS_SERIES_ID,
+      );
       const loading: ComparisonSeriesEntry = {
         datasetId: ASOS_SERIES_ID,
         phase: "loading",
@@ -1051,6 +1068,7 @@ export function ZarrViewer() {
         label: `ASOS · ${station.station}`,
         color: ASOS_SERIES_COLOR,
         removable: false,
+        series: stationChanged ? undefined : previous?.series,
       };
       return [
         ...current.filter((entry) => entry.datasetId !== ASOS_SERIES_ID),
@@ -1068,9 +1086,11 @@ export function ZarrViewer() {
     }
 
     void import("./asos").then(({ loadAsosWindow }) =>
-      loadAsosWindow(station, start, currentVariable)
+      loadAsosWindow(station, start, currentVariable, { signal })
     ).then((window) => {
       if (
+        signal?.aborted
+        ||
         generation !== seriesRequestGeneration.current
         || asosStationRef.current?.station !== station.station
       ) return;
@@ -1087,6 +1107,8 @@ export function ZarrViewer() {
       ));
     }).catch((error) => {
       if (
+        signal?.aborted
+        ||
         generation !== seriesRequestGeneration.current
         || asosStationRef.current?.station !== station.station
       ) return;
@@ -1250,9 +1272,11 @@ export function ZarrViewer() {
       );
       map.addControl(new maplibregl.AttributionControl({ compact: true }), "bottom-left");
       inspectLocationRef.current = (point, station) => {
-        asosStationRef.current = station;
-        setAsosStation(station);
-        setAsosWindow(null);
+        if (!station) {
+          asosStationRef.current = null;
+          setAsosStation(null);
+          setAsosWindow(null);
+        }
         inspectionPointRef.current = point;
         setInspector({ ...point, value: null });
         inspectionMarkerRef.current?.remove();
@@ -1325,6 +1349,7 @@ export function ZarrViewer() {
     void initialize().catch((error) => setLoadState(errorState(error)));
     return () => {
       disposed = true;
+      seriesRequestControllerRef.current?.abort();
       playbackPrefetchRef.current?.controller.abort();
       mapRef.current?.remove();
       mapRef.current = null;
@@ -1441,6 +1466,7 @@ export function ZarrViewer() {
     const installDataset = async () => {
       setPlayingAxis(null);
       resetPlaybackPrefetchRef.current();
+      seriesRequestControllerRef.current?.abort();
       seriesRequestGeneration.current += 1;
       setLoadState(loadingState("Opening dataset…"));
       setInfo(null);
@@ -1601,6 +1627,7 @@ export function ZarrViewer() {
     selectionsRef.current = nextSelections;
     setVariable(nextVariable);
     resetPlaybackPrefetch();
+    seriesRequestControllerRef.current?.abort();
     seriesRequestGeneration.current += 1;
     setSelections(nextSelections);
     setPlayingAxis(null);
@@ -1748,6 +1775,7 @@ export function ZarrViewer() {
     setAsosStation(null);
     setAsosWindow(null);
     seriesRequestGeneration.current += 1;
+    seriesRequestControllerRef.current?.abort();
     seriesDatasetIdsRef.current = [];
     setSeriesEntries([]);
   };
@@ -1761,10 +1789,16 @@ export function ZarrViewer() {
         seriesPickerId,
       ];
     }
+    let controller = seriesRequestControllerRef.current;
+    if (!controller || controller.signal.aborted) {
+      controller = new AbortController();
+      seriesRequestControllerRef.current = controller;
+    }
     void loadComparisonDataset(
       seriesPickerId,
       point,
       seriesRequestGeneration.current,
+      controller.signal,
     );
   };
 
@@ -1792,6 +1826,7 @@ export function ZarrViewer() {
     ? convertUnitValue(inspector.value, variable.unit, selectedUnit.id)
     : inspector?.value;
   const currentAsos = asosAtTime(asosWindow, selectedMapValidDate);
+  const commonVariables = commonVariableMatches(info?.variables ?? []);
   const asosDisplayValue = (
     currentAsos.value !== null
     && asosWindow?.unit
@@ -1998,15 +2033,30 @@ export function ZarrViewer() {
               title={variable?.label || variable?.id}
               onChange={(event) => void changeVariable(event.target.value)}
             >
-              {(info?.variables ?? []).map((candidate) => (
-                <option
-                  key={candidate.id}
-                  value={candidate.id}
-                  title={candidate.label || candidate.id}
-                >
-                  {candidate.id}
-                </option>
-              ))}
+              {commonVariables.length ? (
+                <optgroup label="Common variables">
+                  {commonVariables.map(({ key, variable: candidate }) => (
+                    <option
+                      key={`common-${key}`}
+                      value={candidate.id}
+                      title={candidate.label || candidate.id}
+                    >
+                      {key === candidate.id ? candidate.id : `${key} · ${candidate.id}`}
+                    </option>
+                  ))}
+                </optgroup>
+              ) : null}
+              <optgroup label="All variables">
+                {(info?.variables ?? []).map((candidate) => (
+                  <option
+                    key={candidate.id}
+                    value={candidate.id}
+                    title={candidate.label || candidate.id}
+                  >
+                    {candidate.id}
+                  </option>
+                ))}
+              </optgroup>
             </select>
           </div>
 

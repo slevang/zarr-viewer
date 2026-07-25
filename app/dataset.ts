@@ -10,6 +10,7 @@ import {
   type DatasetSourceConfig,
   type DatasetSourceRole,
 } from "./catalog";
+import { createBoundedAsyncQueue } from "./async-queue";
 import { registerGribberishCodec } from "./codecs/gribberish";
 import { registerPcodec } from "./codecs/pcodec";
 
@@ -120,6 +121,8 @@ const GOOGLE_TIME_ORIGIN_MS = Date.UTC(1900, 0, 1);
 const HOUR_MS = 60 * 60 * 1000;
 const STORE_READ_CONCURRENCY = 32;
 const STORE_READ_CACHE_BYTES = 1024 * 1024 * 1024;
+const SERIES_CHUNK_CONCURRENCY = 6;
+const GOOGLE_FETCH_ATTEMPTS = 3;
 export const SERIES_LOOKAHEAD_MS = 15 * 24 * HOUR_MS;
 export const SERIES_LOOKAHEAD_HOURS = SERIES_LOOKAHEAD_MS / HOUR_MS;
 const GOOGLE_LEVELS = [
@@ -398,6 +401,47 @@ function transformGoogleRequest(url: string) {
   };
 }
 
+function abortableDelay(milliseconds: number, signal?: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timeout);
+      reject(signal?.reason ?? new DOMException("Aborted", "AbortError"));
+    };
+    const timeout = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, milliseconds);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+async function fetchGoogleObject(request: Request) {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < GOOGLE_FETCH_ATTEMPTS; attempt += 1) {
+    request.signal.throwIfAborted();
+    try {
+      const transformed = transformGoogleRequest(request.url);
+      const response = await fetch(new Request(transformed.url, request));
+      if (
+        response.ok
+        || (response.status < 500 && response.status !== 429)
+        || attempt === GOOGLE_FETCH_ATTEMPTS - 1
+      ) return response;
+      await response.body?.cancel();
+      lastError = new Error(`Google ERA5 request failed (${response.status})`);
+    } catch (error) {
+      if (request.signal.aborted) throw error;
+      lastError = error;
+    }
+    await abortableDelay(250 * 2 ** attempt, request.signal);
+  }
+  throw lastError;
+}
+
 async function loadGoogleStoreInfo(
   dataset: DatasetConfig,
   source: DatasetSourceConfig,
@@ -461,10 +505,7 @@ async function loadGoogleStoreInfo(
 
   const store = role === "series"
     ? new zarr.FetchStore(source.url, {
-      fetch: (request) => {
-        const transformed = transformGoogleRequest(request.url);
-        return fetch(new Request(transformed.url, request));
-      },
+      fetch: fetchGoogleObject,
     })
     : undefined;
 
@@ -741,6 +782,7 @@ async function pointSpatialSelection(
   variable: VariableConfig,
   longitude: number,
   latitude: number,
+  options: PointSeriesLoadOptions = {},
 ) {
   if (!info.store) return null;
   const latitudeDimension = spatialDimension(info, variable, "lat");
@@ -753,8 +795,8 @@ async function pointSpatialSelection(
     zarr.open(root.resolve(longitudeDimension), { kind: "array" }),
   ]);
   const [latitudeData, longitudeData] = await Promise.all([
-    zarr.get(latitudeArray),
-    zarr.get(longitudeArray),
+    zarr.get(latitudeArray, null, zarrReadOptions(options)),
+    zarr.get(longitudeArray, null, zarrReadOptions(options)),
   ]);
   const latitudeValues = Array.from(
     latitudeData.data as ArrayLike<number | bigint>,
@@ -778,12 +820,27 @@ async function pointSpatialSelection(
   };
 }
 
+export type PointSeriesLoadOptions = {
+  signal?: AbortSignal;
+  concurrency?: number;
+};
+
+function zarrReadOptions(options: PointSeriesLoadOptions) {
+  return {
+    signal: options.signal,
+    createQueue: () => createBoundedAsyncQueue(
+      options.concurrency ?? SERIES_CHUNK_CONCURRENCY,
+    ),
+  };
+}
+
 export async function loadPointTimeSeries(
   info: StoreInfo,
   variable: VariableConfig,
   selections: AxisSelection,
   longitude: number,
   latitude: number,
+  options: PointSeriesLoadOptions = {},
 ): Promise<PointTimeSeries | null> {
   if (info.role !== "series" || !info.store) return null;
   const timeDimension = variable.dimensions.find(
@@ -795,6 +852,7 @@ export async function loadPointTimeSeries(
     variable,
     longitude,
     latitude,
+    options,
   );
   if (!spatial) return null;
   const {
@@ -816,7 +874,7 @@ export async function loadPointTimeSeries(
     if (dimension === longitudeDimension) return longitudeIndex;
     return selections[dimension] ?? 0;
   });
-  const result = await zarr.get(dataArray, request);
+  const result = await zarr.get(dataArray, request, zarrReadOptions(options));
   const values = Array.from(result.data as ArrayLike<number | bigint>, Number);
   return {
     kind: "history",
@@ -860,6 +918,7 @@ export async function loadPointForecast(
   selections: AxisSelection,
   longitude: number,
   latitude: number,
+  options: PointSeriesLoadOptions = {},
 ): Promise<PointForecastSeries | null> {
   if (info.role !== "series" || !info.store) return null;
   const initDimension = variable.dimensions.find(
@@ -884,6 +943,7 @@ export async function loadPointForecast(
     variable,
     longitude,
     latitude,
+    options,
   );
   if (!spatial) return null;
   const {
@@ -914,7 +974,7 @@ export async function loadPointForecast(
     if (dimension === longitudeDimension) return longitudeIndex;
     return selections[dimension] ?? 0;
   });
-  const result = await zarr.get(dataArray, request);
+  const result = await zarr.get(dataArray, request, zarrReadOptions(options));
   const remainingDimensions = variable.dimensions.filter(
     (dimension) => dimension === leadDimension || dimension === memberDimension,
   );
@@ -979,10 +1039,11 @@ export function loadPointSeries(
   selections: AxisSelection,
   longitude: number,
   latitude: number,
+  options: PointSeriesLoadOptions = {},
 ) {
   return isForecastSeries(info, variable)
-    ? loadPointForecast(info, variable, selections, longitude, latitude)
-    : loadPointTimeSeries(info, variable, selections, longitude, latitude);
+    ? loadPointForecast(info, variable, selections, longitude, latitude, options)
+    : loadPointTimeSeries(info, variable, selections, longitude, latitude, options);
 }
 
 export { transformGoogleRequest };

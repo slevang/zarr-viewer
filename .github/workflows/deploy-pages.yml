@@ -27,7 +27,7 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - run: npm ci
+      - run: npm ci --force
       - name: Build for the repository subpath
         run: npm run build
         env:

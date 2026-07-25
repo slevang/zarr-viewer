@@ -1,0 +1,16 @@
+{
+  "name": "pcodec-wasm",
+  "type": "module",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "files": [
+    "pcodec_wasm_bg.wasm",
+    "pcodec_wasm.js",
+    "pcodec_wasm.d.ts"
+  ],
+  "main": "pcodec_wasm.js",
+  "types": "pcodec_wasm.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

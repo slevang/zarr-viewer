@@ -8,7 +8,9 @@ import {
 import { commonVariableMatches } from "./common-variables";
 import {
   DATASETS,
+  DATASET_CATEGORY_GROUPS,
   DEFAULT_DATASET_ID,
+  datasetOptionLabel,
   getDataset,
   hasMapSource,
   hasSeriesSource,
@@ -28,6 +30,7 @@ import {
 } from "./asos-types";
 import {
   axisDateInputValue,
+  axisDateMatch,
   axisIndexForDate,
   axisValueAsDate,
   defaultSelections,
@@ -36,14 +39,19 @@ import {
   loadPointSeries,
   loadStoreInfo,
   reconcileSelections,
+  selectionsAfterAxisChange,
+  selectionsForValidDate,
   selectorFor,
+  selectedValidDate,
   timedeltaMilliseconds,
   toDataCoordinates,
   type AxisConfig,
   type AxisSelection,
+  type PointSeries,
   type StoreInfo,
   type VariableConfig,
 } from "./dataset";
+import { temporalNeighborIndices } from "./temporal-prefetch";
 import {
   convertUnitRange,
   convertUnitValue,
@@ -69,6 +77,7 @@ type PlaybackPrefetchQueue = {
   generation: number;
   axisId: string;
   ahead: number;
+  behind: number;
   concurrency: number;
   directChunkReads: boolean;
   rampUp: boolean;
@@ -90,7 +99,7 @@ const ASOS_HIT_LAYER_ID = "asos-station-hits";
 const PLAYBACK_DATA_HOURS_PER_SECOND = 6;
 const PLAYBACK_FALLBACK_INTERVAL_MS = 250;
 const PLAYBACK_PREFETCH_BASE_AHEAD = 10;
-const PLAYBACK_PREFETCH_MAX_AHEAD = 120;
+const PLAYBACK_PREFETCH_BASE_BEHIND = 3;
 const PLAYBACK_PREFETCH_FALLBACK_CONCURRENCY = 2;
 const PLAYBACK_PREFETCH_MAX_CONCURRENCY = 32;
 const PLAYBACK_PREFETCH_MEMORY_BUDGET_BYTES = 1024 * 1024 * 1024;
@@ -158,26 +167,14 @@ function dataTypeByteWidth(dataType?: string) {
   return 4;
 }
 
-function formatDecodedBytes(bytes: number) {
-  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
-  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
-  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
-  return `${bytes} B`;
-}
-
 function formatChunkShape(variable: VariableConfig, shape: number[]) {
-  const dimensions = shape.map(
+  return shape.map(
     (length, index) => `${variable.dimensions[index] ?? `dim ${index + 1}`} ${length}`,
   ).join(" × ");
-  const bytes = shape.reduce(
-    (total, length) => total * Math.max(1, length),
-    dataTypeByteWidth(variable.dataType),
-  );
-  return `${dimensions} · ${formatDecodedBytes(bytes)} decoded`;
 }
 
 function chunkingSummary(variable: VariableConfig | null) {
-  if (!variable?.chunkShape) return "Loading chunk metadata…";
+  if (!variable?.chunkShape) return "Opening dataset…";
   return `Chunk: ${formatChunkShape(
     variable,
     variable.innerChunkShape ?? variable.chunkShape,
@@ -198,6 +195,7 @@ function playbackPrefetchProfile(
   ) {
     return {
       ahead: PLAYBACK_PREFETCH_BASE_AHEAD,
+      behind: PLAYBACK_PREFETCH_BASE_BEHIND,
       concurrency: PLAYBACK_PREFETCH_FALLBACK_CONCURRENCY,
       directChunkReads: false,
     };
@@ -245,11 +243,7 @@ function playbackPrefetchProfile(
     source.id === "earthmover-era5-single-spatial"
     && spatialChunksPerFrame === 1
   );
-  const ahead = directChunkReads
-    ? PLAYBACK_PREFETCH_BASE_AHEAD
-    : spatialChunksPerFrame === 1
-    ? Math.min(PLAYBACK_PREFETCH_MAX_AHEAD, memoryFrameCap)
-    : Math.min(PLAYBACK_PREFETCH_BASE_AHEAD, memoryFrameCap);
+  const ahead = Math.min(PLAYBACK_PREFETCH_BASE_AHEAD, memoryFrameCap);
   const temporalChunkCount = Math.max(
     1,
     Math.ceil(ahead / axisChunkLength),
@@ -260,6 +254,7 @@ function playbackPrefetchProfile(
 
   return {
     ahead,
+    behind: Math.min(PLAYBACK_PREFETCH_BASE_BEHIND, memoryFrameCap),
     concurrency: Math.max(
       1,
       Math.min(
@@ -514,58 +509,69 @@ function matchingVariable(info: StoreInfo, source: VariableConfig) {
   return ranked[0]?.score > 0 ? ranked[0].candidate : undefined;
 }
 
-function selectedAnchorDate(
+function seriesCoversDate(series: PointSeries | undefined, date?: Date) {
+  if (!series || !date || !series.dates.length) return false;
+  const target = date.getTime();
+  const first = series.dates[0].getTime();
+  const last = series.dates.at(-1)?.getTime() ?? first;
+  return target >= Math.min(first, last) && target <= Math.max(first, last);
+}
+
+function utcHour(date: Date) {
+  return Number.isFinite(date.getTime())
+    ? `${date.toISOString().slice(0, 13).replace("T", " ")}Z`
+    : "unknown";
+}
+
+function forecastInitTolerance(
   info: StoreInfo,
-  variable: VariableConfig,
-  selections: AxisSelection,
+  axis: AxisConfig,
+  index: number,
 ) {
-  const timeDimension = variable.dimensions.find(
-    (dimension) => info.axes[dimension]?.kind === "time",
-  );
-  if (!timeDimension) return undefined;
-  return axisValueAsDate(
-    info.dataset,
-    info.axes[timeDimension],
-    selections[timeDimension] ?? 0,
+  const matched = axisValueAsDate(info.dataset, axis, index).getTime();
+  const neighborDistances = [index - 1, index + 1].flatMap((neighbor) => {
+    if (neighbor < 0 || neighbor >= axis.values.length) return [];
+    const distance = Math.abs(
+      axisValueAsDate(info.dataset, axis, neighbor).getTime() - matched,
+    );
+    return distance > 0 && Number.isFinite(distance) ? [distance] : [];
+  });
+  const cadence = neighborDistances.length
+    ? Math.min(...neighborDistances)
+    : 24 * 60 * 60 * 1000;
+  return Math.min(
+    24 * 60 * 60 * 1000,
+    Math.max(6 * 60 * 60 * 1000, cadence * 1.5),
   );
 }
 
-function selectedValidDate(
+function comparisonTimeIndex(
   info: StoreInfo,
   variable: VariableConfig,
-  selections: AxisSelection,
+  axis: AxisConfig,
+  anchorDate: Date,
 ) {
-  const timeDimensions = variable.dimensions.filter(
-    (dimension) => info.axes[dimension]?.kind === "time",
-  );
-  const validDimension = timeDimensions.find((dimension) =>
-    dimension.toLowerCase().includes("valid"),
-  );
-  const timeDimension = validDimension
-    ?? timeDimensions.find((dimension) =>
-      ["init_time", "forecast_reference_time"].includes(dimension.toLowerCase()),
-    )
-    ?? timeDimensions[0];
-  if (!timeDimension) return undefined;
-
-  const base = axisValueAsDate(
-    info.dataset,
-    info.axes[timeDimension],
-    selections[timeDimension] ?? 0,
-  );
-  if (validDimension) return base;
-
-  const leadDimension = variable.dimensions.find(
-    (dimension) => info.axes[dimension]?.kind === "timedelta",
-  );
-  if (!leadDimension) return base;
-  return new Date(
-    base.getTime()
-    + timedeltaMilliseconds(
-      info.axes[leadDimension],
-      selections[leadDimension] ?? 0,
-    ),
-  );
+  const match = axisDateMatch(info.dataset, axis, anchorDate);
+  const forecast = isForecastSeries(info, variable);
+  const tolerance = forecast
+    ? forecastInitTolerance(info, axis, match.index)
+    : 0;
+  const first = Math.min(match.first.getTime(), match.last.getTime());
+  const last = Math.max(match.first.getTime(), match.last.getTime());
+  const target = anchorDate.getTime();
+  const outsideRange = target < first - tolerance || target > last + tolerance;
+  if (
+    !Number.isFinite(match.date.getTime())
+    || outsideRange
+    || (forecast && match.distanceMilliseconds > tolerance)
+  ) {
+    const seriesKind = forecast ? "Forecast archive" : "Dataset";
+    throw new Error(
+      `${seriesKind} unavailable at ${utcHour(anchorDate)}`
+      + ` · available ${utcHour(match.first)}–${utcHour(match.last)}`,
+    );
+  }
+  return match.index;
 }
 
 export function ZarrViewer() {
@@ -592,6 +598,7 @@ export function ZarrViewer() {
   const playbackPrefetchRef = useRef<PlaybackPrefetchQueue | null>(null);
   const playbackPrefetchGenerationRef = useRef(0);
   const playbackViewportMovingRef = useRef(false);
+  const rememberedValidDateRef = useRef<Date | undefined>(undefined);
   const resetPlaybackPrefetchRef = useRef<() => void>(() => {});
   const startSeriesComparisonRef = useRef<(point: InspectionPoint) => void>(() => {});
   const startAsosComparisonRef = useRef<(station: AsosStation) => void>(() => {});
@@ -708,6 +715,11 @@ export function ZarrViewer() {
     ),
     [activeAxes],
   );
+  const backgroundPrefetchAxis = useMemo(
+    () => compactPlaybackAxes.find((axis) => axis.kind === "timedelta")
+      ?? compactPlaybackAxes.find((axis) => axis.kind === "time"),
+    [compactPlaybackAxes],
+  );
   const selectedMapValidDate = useMemo(
     () => info && variable
       ? selectedValidDate(info, variable, selections)
@@ -717,6 +729,8 @@ export function ZarrViewer() {
 
   const resetPlaybackPrefetch = useCallback(() => {
     const queue = playbackPrefetchRef.current;
+    for (const resolve of queue?.resolve.values() ?? []) resolve();
+    queue?.resolve.clear();
     queue?.controller.abort();
     playbackPrefetchGenerationRef.current += 1;
     playbackPrefetchRef.current = null;
@@ -751,6 +765,7 @@ export function ZarrViewer() {
         generation: ++playbackPrefetchGenerationRef.current,
         axisId: axis.id,
         ahead: profile.ahead,
+        behind: profile.behind,
         concurrency: profile.concurrency,
         directChunkReads: profile.directChunkReads,
         rampUp: true,
@@ -766,17 +781,28 @@ export function ZarrViewer() {
       playbackPrefetchRef.current = queue;
     }
 
+    const targetIndices = temporalNeighborIndices(
+      currentIndex,
+      axis.values.length,
+      queue.ahead,
+      queue.behind,
+    );
+    const targetSet = new Set(targetIndices);
     for (const index of queue.ready) {
-      if (index <= currentIndex) {
+      if (!targetSet.has(index)) {
         queue.ready.delete(index);
         queue.promises.delete(index);
       }
     }
-    const stop = Math.min(
-      axis.values.length - 1,
-      currentIndex + queue.ahead,
-    );
-    for (let index = currentIndex + 1; index <= stop; index += 1) {
+    queue.queued = queue.queued.filter((index) => {
+      if (targetSet.has(index)) return true;
+      queue.queuedSet.delete(index);
+      queue.resolve.get(index)?.();
+      queue.resolve.delete(index);
+      queue.promises.delete(index);
+      return false;
+    });
+    for (const index of targetIndices) {
       if (
         !queue.ready.has(index)
         && !queue.queuedSet.has(index)
@@ -794,7 +820,12 @@ export function ZarrViewer() {
         queue.queuedSet.add(index);
       }
     }
-    queue.queued.sort((a, b) => a - b);
+    const priority = new Map(
+      targetIndices.map((index, order) => [index, order]),
+    );
+    queue.queued.sort(
+      (a, b) => (priority.get(a) ?? Infinity) - (priority.get(b) ?? Infinity),
+    );
 
     const pump = () => {
       const activeQueue = playbackPrefetchRef.current;
@@ -814,10 +845,13 @@ export function ZarrViewer() {
         const generation = queue.generation;
         const attempt = (queue.attempts.get(index) ?? 0) + 1;
         queue.attempts.set(index, attempt);
-        const nextSelections = {
-          ...selectionsRef.current,
-          [axis.id]: index,
-        };
+        const nextSelections = selectionsAfterAxisChange(
+          currentInfo,
+          currentVariable,
+          selectionsRef.current,
+          axis,
+          index,
+        );
         const center = map.getCenter();
         const chunkKey = queue.directChunkReads
           ? playbackChunkKey(currentVariable, nextSelections)
@@ -865,7 +899,7 @@ export function ZarrViewer() {
           } else if (
             !(error instanceof DOMException && error.name === "AbortError")
           ) {
-            console.debug("Playback prefetch skipped", error);
+            console.debug("Temporal prefetch skipped", error);
           }
         }).finally(() => {
           if (
@@ -895,7 +929,7 @@ export function ZarrViewer() {
     const sourceInfo = infoRef.current;
     const sourceVariable = variableRef.current;
     if (!sourceInfo || !sourceVariable) return;
-    const anchorDate = selectedAnchorDate(
+    const anchorDate = selectedValidDate(
       sourceInfo,
       sourceVariable,
       selectionsRef.current,
@@ -908,7 +942,9 @@ export function ZarrViewer() {
         datasetId: comparisonDatasetId,
         phase: "loading",
         message: "Opening dataset…",
-        series: previous?.series,
+        series: seriesCoversDate(previous?.series, anchorDate)
+          ? previous?.series
+          : undefined,
       };
       const existing = current.findIndex(
         (entry) => entry.datasetId === comparisonDatasetId,
@@ -933,8 +969,9 @@ export function ZarrViewer() {
         for (const dimension of comparisonVariable.dimensions) {
           const axis = comparisonInfo.axes[dimension];
           if (axis?.kind === "time") {
-            comparisonSelections[dimension] = axisIndexForDate(
-              comparisonInfo.dataset,
+            comparisonSelections[dimension] = comparisonTimeIndex(
+              comparisonInfo,
+              comparisonVariable,
               axis,
               anchorDate,
             );
@@ -997,6 +1034,13 @@ export function ZarrViewer() {
     const generation = ++seriesRequestGeneration.current;
     const currentInfo = infoRef.current;
     const currentVariable = variableRef.current;
+    const anchorDate = currentInfo && currentVariable
+      ? selectedValidDate(
+        currentInfo,
+        currentVariable,
+        selectionsRef.current,
+      )
+      : undefined;
     const selectedDatasetIds = seriesDatasetIdsRef.current;
     const comparisonDatasetIds = selectedDatasetIds.length
       ? selectedDatasetIds
@@ -1013,9 +1057,12 @@ export function ZarrViewer() {
         datasetId: comparisonDatasetId,
         phase: "loading",
         message: "Loading new location…",
-        series: current.find(
-          (entry) => entry.datasetId === comparisonDatasetId,
-        )?.series,
+        series: (() => {
+          const previous = current.find(
+            (entry) => entry.datasetId === comparisonDatasetId,
+          )?.series;
+          return seriesCoversDate(previous, anchorDate) ? previous : undefined;
+        })(),
       }) satisfies ComparisonSeriesEntry);
       const previousAsos = asosStationRef.current
         ? current.find((entry) => entry.datasetId === ASOS_SERIES_ID)
@@ -1039,11 +1086,7 @@ export function ZarrViewer() {
     if (!currentInfo || !currentVariable) return;
     const generation = seriesRequestGeneration.current;
     const signal = seriesRequestControllerRef.current?.signal;
-    const start = selectedAnchorDate(
-      currentInfo,
-      currentVariable,
-      selectionsRef.current,
-    ) ?? selectedValidDate(
+    const start = selectedValidDate(
       currentInfo,
       currentVariable,
       selectionsRef.current,
@@ -1068,7 +1111,9 @@ export function ZarrViewer() {
         label: `ASOS · ${station.station}`,
         color: ASOS_SERIES_COLOR,
         removable: false,
-        series: stationChanged ? undefined : previous?.series,
+        series: !stationChanged && seriesCoversDate(previous?.series, start)
+          ? previous?.series
+          : undefined,
       };
       return [
         ...current.filter((entry) => entry.datasetId !== ASOS_SERIES_ID),
@@ -1476,7 +1521,13 @@ export function ZarrViewer() {
       const nextVariable = nextInfo.variables.find(
         (candidate) => candidate.id === nextInfo.dataset.defaultVariable,
       ) ?? nextInfo.variables[0];
-      const nextSelections = defaultSelections(nextInfo, nextVariable);
+      const nextSelections = rememberedValidDateRef.current
+        ? selectionsForValidDate(
+          nextInfo,
+          nextVariable,
+          rememberedValidDateRef.current,
+        )
+        : defaultSelections(nextInfo, nextVariable);
       const nextColormap = defaultColormap(nextVariable);
       const rangeKey = displayRangeKey(nextInfo.dataset.id, nextVariable.id);
       const cachedDisplayRange = displayRangesRef.current.get(rangeKey);
@@ -1507,6 +1558,11 @@ export function ZarrViewer() {
       infoRef.current = nextInfo;
       variableRef.current = nextVariable;
       selectionsRef.current = nextSelections;
+      rememberedValidDateRef.current = selectedValidDate(
+        nextInfo,
+        nextVariable,
+        nextSelections,
+      ) ?? rememberedValidDateRef.current;
       layerRef.current = zarrLayer;
       setInfo(nextInfo);
       setVariable(nextVariable);
@@ -1549,6 +1605,30 @@ export function ZarrViewer() {
 
   useEffect(() => {
     if (
+      playingAxis
+      || !info
+      || !variable
+      || !backgroundPrefetchAxis
+      || loadState.phase !== "ready"
+      || playbackViewportMovingRef.current
+    ) return;
+    void ensurePlaybackPrefetch(
+      backgroundPrefetchAxis,
+      selections[backgroundPrefetchAxis.id] ?? 0,
+    );
+  }, [
+    backgroundPrefetchAxis,
+    ensurePlaybackPrefetch,
+    info,
+    loadState.phase,
+    playbackViewportRevision,
+    playingAxis,
+    selections,
+    variable,
+  ]);
+
+  useEffect(() => {
+    if (
       !playingAxis
       || !info
       || !variable
@@ -1580,11 +1660,19 @@ export function ZarrViewer() {
         || playbackViewportMovingRef.current
         || selectionsRef.current[playingAxis] !== currentIndex
       ) return;
-      const nextSelections = {
-        ...selectionsRef.current,
-        [playingAxis]: nextIndex,
-      };
+      const nextSelections = selectionsAfterAxisChange(
+        info,
+        variable,
+        selectionsRef.current,
+        axis,
+        nextIndex,
+      );
       selectionsRef.current = nextSelections;
+      rememberedValidDateRef.current = selectedValidDate(
+        info,
+        variable,
+        nextSelections,
+      ) ?? rememberedValidDateRef.current;
       setSelections(nextSelections);
       if (nextIndex >= axis.values.length - 1) {
         setPlayingAxis(null);
@@ -1607,16 +1695,29 @@ export function ZarrViewer() {
     variable,
   ]);
 
-  useEffect(() => {
-    if (!playingAxis) resetPlaybackPrefetch();
-  }, [playingAxis, resetPlaybackPrefetch]);
-
   const changeVariable = async (id: string) => {
     const layer = layerRef.current;
-    if (!info || !layer) return;
+    if (!info || !variable || !layer) return;
     const nextVariable = info.variables.find((candidate) => candidate.id === id);
     if (!nextVariable) return;
-    const nextSelections = reconcileSelections(info, nextVariable, selectionsRef.current);
+    const currentValidDate = selectedValidDate(
+      info,
+      variable,
+      selectionsRef.current,
+    );
+    const reconciledSelections = reconcileSelections(
+      info,
+      nextVariable,
+      selectionsRef.current,
+    );
+    const nextSelections = currentValidDate
+      ? selectionsForValidDate(
+        info,
+        nextVariable,
+        currentValidDate,
+        reconciledSelections,
+      )
+      : reconciledSelections;
     const nextColormap = defaultColormap(nextVariable);
     const rangeKey = displayRangeKey(info.dataset.id, nextVariable.id);
     const cachedDisplayRange = displayRangesRef.current.get(rangeKey);
@@ -1625,6 +1726,11 @@ export function ZarrViewer() {
       : initialDisplayRange(nextVariable);
     variableRef.current = nextVariable;
     selectionsRef.current = nextSelections;
+    rememberedValidDateRef.current = selectedValidDate(
+      info,
+      nextVariable,
+      nextSelections,
+    ) ?? rememberedValidDateRef.current;
     setVariable(nextVariable);
     resetPlaybackPrefetch();
     seriesRequestControllerRef.current?.abort();
@@ -1654,10 +1760,18 @@ export function ZarrViewer() {
   };
 
   const changeAxis = (axis: AxisConfig, nextIndex: number, manual = true) => {
-    if (!variable) return;
+    if (!info || !variable) return;
     const clamped = Math.max(0, Math.min(axis.values.length - 1, nextIndex));
-    const next = { ...selectionsRef.current, [axis.id]: clamped };
+    const next = selectionsAfterAxisChange(
+      info,
+      variable,
+      selectionsRef.current,
+      axis,
+      clamped,
+    );
     selectionsRef.current = next;
+    rememberedValidDateRef.current = selectedValidDate(info, variable, next)
+      ?? rememberedValidDateRef.current;
     setSelections(next);
     if (manual) {
       resetPlaybackPrefetch();
@@ -1694,9 +1808,28 @@ export function ZarrViewer() {
     mapRef.current?.setProjection({ type: next });
   };
 
+  const changeDataset = (nextDatasetId: string) => {
+    const currentInfo = infoRef.current;
+    const currentVariable = variableRef.current;
+    if (currentInfo && currentVariable) {
+      rememberedValidDateRef.current = selectedValidDate(
+        currentInfo,
+        currentVariable,
+        selectionsRef.current,
+      ) ?? rememberedValidDateRef.current;
+    }
+    setDatasetId(nextDatasetId);
+  };
+
   const togglePlayback = (axis: AxisConfig) => {
-    resetPlaybackPrefetch();
-    setPlayingAxis((current) => current === axis.id ? null : axis.id);
+    if (playingAxis === axis.id) {
+      setPlayingAxis(null);
+      return;
+    }
+    if (playbackPrefetchRef.current?.axisId !== axis.id) {
+      resetPlaybackPrefetch();
+    }
+    setPlayingAxis(axis.id);
   };
 
   const changeOpacity = (next: number) => {
@@ -1989,16 +2122,18 @@ export function ZarrViewer() {
             <select
               data-testid="dataset-select"
               value={datasetId}
-              onChange={(event) => setDatasetId(event.target.value)}
+              onChange={(event) => changeDataset(event.target.value)}
             >
-              {["Google", "dynamical.org", "Earthmover"].map((provider) => (
-                <optgroup key={provider} label={provider}>
-                  {MAP_DATASETS.filter((candidate) => candidate.provider === provider).map((candidate) => (
+              {DATASET_CATEGORY_GROUPS.map((group) => (
+                <optgroup key={group.id} label={group.label}>
+                  {MAP_DATASETS.filter(
+                    (candidate) => candidate.category === group.id,
+                  ).map((candidate) => (
                     <option
                       key={candidate.id}
                       value={candidate.id}
                     >
-                      {candidate.label}
+                      {datasetOptionLabel(candidate)}
                     </option>
                   ))}
                 </optgroup>

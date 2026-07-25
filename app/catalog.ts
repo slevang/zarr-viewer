@@ -1,5 +1,6 @@
 export type DatasetSupport = "ready" | "experimental" | "blocked";
 export type DatasetSourceRole = "map" | "series";
+export type DatasetCategory = "forecast" | "analysis";
 
 export type DatasetSourceConfig = {
   id: string;
@@ -19,6 +20,7 @@ export type DatasetConfig = {
   id: string;
   label: string;
   provider: "Google" | "dynamical.org" | "Earthmover";
+  category: DatasetCategory;
   description: string;
   sources: {
     map?: DatasetSourceConfig;
@@ -49,6 +51,7 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
     id: "noaa-gfs-analysis",
     label: "NOAA GFS analysis",
     provider: "dynamical.org",
+    category: "analysis",
     description: "Global, 0.25°, hourly analysis; time-optimized.",
     sources: {
       map: {
@@ -66,6 +69,7 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
     id: "noaa-gfs-forecast",
     label: "NOAA GFS forecast",
     provider: "dynamical.org",
+    category: "forecast",
     description: "Global, 0.25°, 16-day deterministic forecast.",
     sources: sharedSource({
       id: "noaa-gfs-forecast",
@@ -81,6 +85,7 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
     id: "noaa-gefs-forecast-35-day",
     label: "NOAA GEFS forecast · 35 day",
     provider: "dynamical.org",
+    category: "forecast",
     description: "Global ensemble forecast through 35 days.",
     sources: sharedSource({
       id: "noaa-gefs-forecast-35-day",
@@ -96,6 +101,7 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
     id: "noaa-gefs-analysis",
     label: "NOAA GEFS analysis",
     provider: "dynamical.org",
+    category: "analysis",
     description: "Global, 0.25°, three-hourly ensemble analysis.",
     sources: {
       map: {
@@ -113,6 +119,7 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
     id: "noaa-hrrr-forecast-48-hour",
     label: "NOAA HRRR forecast",
     provider: "dynamical.org",
+    category: "forecast",
     description: "CONUS, 3 km forecast with role-optimized map and point-series stores.",
     sources: {
       map: {
@@ -140,6 +147,7 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
     id: "noaa-hrrr-analysis",
     label: "NOAA HRRR analysis",
     provider: "dynamical.org",
+    category: "analysis",
     description: "CONUS, 3 km, hourly analysis.",
     sources: {
       map: {
@@ -159,6 +167,7 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
     id: "ecmwf-aifs-single-forecast",
     label: "ECMWF AIFS Single forecast",
     provider: "dynamical.org",
+    category: "forecast",
     description: "Global deterministic AI forecast through 15 days.",
     sources: sharedSource({
       id: "ecmwf-aifs-single-forecast",
@@ -174,6 +183,7 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
     id: "ecmwf-aifs-ens-forecast",
     label: "ECMWF AIFS ENS forecast",
     provider: "dynamical.org",
+    category: "forecast",
     description: "Global AI ensemble forecast through 15 days.",
     sources: sharedSource({
       id: "ecmwf-aifs-ens-forecast",
@@ -189,6 +199,7 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
     id: "ecmwf-ifs-ens-forecast-15-day-0-25-degree",
     label: "ECMWF IFS ENS forecast",
     provider: "dynamical.org",
+    category: "forecast",
     description: "Global, 0.25° ensemble forecast through 15 days.",
     sources: sharedSource({
       id: "ecmwf-ifs-ens-forecast-15-day-0-25-degree",
@@ -204,6 +215,7 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
     id: "dwd-icon-eu-forecast-5-day",
     label: "DWD ICON-EU forecast",
     provider: "dynamical.org",
+    category: "forecast",
     description: "European forecast, 0.0625°, through five days.",
     sources: sharedSource({
       id: "dwd-icon-eu-forecast-5-day",
@@ -223,6 +235,7 @@ export const DATASETS: DatasetConfig[] = [
     id: "google-arco-era5",
     label: "ECMWF ERA5 reanalysis",
     provider: "Google",
+    category: "analysis",
     description: "Global hourly ERA5, spatially chunked for map reads.",
     sources: sharedSource({
       id: "google-arco-era5-spatial",
@@ -242,6 +255,7 @@ export const DATASETS: DatasetConfig[] = [
     id: "earthmover-era5",
     label: "ECMWF ERA5 reanalysis",
     provider: "Earthmover",
+    category: "analysis",
     description: "Open ERA5 single-level map and temporal layouts, 1940–2025.",
     sources: {
       map: {
@@ -274,6 +288,15 @@ const DATASET_ALIASES: Record<string, string> = {
 
 export const DEFAULT_DATASET_ID =
   import.meta.env?.VITE_DATASET_ID || "google-arco-era5";
+
+export const DATASET_CATEGORY_GROUPS = [
+  { id: "forecast", label: "Forecast" },
+  { id: "analysis", label: "Analysis/Reanalysis" },
+] as const satisfies Array<{ id: DatasetCategory; label: string }>;
+
+export function datasetOptionLabel(dataset: DatasetConfig) {
+  return `${dataset.label} — ${dataset.provider}`;
+}
 
 export function getDataset(id: string) {
   const resolvedId = DATASET_ALIASES[id] ?? id;

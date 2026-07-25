@@ -1,4 +1,5 @@
 import { createBoundedAsyncQueue } from "../app/async-queue";
+import { temporalNeighborIndices } from "../app/temporal-prefetch";
 
 let active = 0;
 let maximumActive = 0;
@@ -41,6 +42,15 @@ try {
 }
 if (startedBeforeFailure > 2) {
   throw new Error(`Failing queue started ${startedBeforeFailure} tasks`);
+}
+
+const neighbors = temporalNeighborIndices(4, 10, 3, 2);
+if (neighbors.join(",") !== "5,3,6,2,7") {
+  throw new Error(`Unexpected temporal prefetch order: ${neighbors.join(",")}`);
+}
+const startNeighbors = temporalNeighborIndices(0, 4, 2, 3);
+if (startNeighbors.join(",") !== "1,2") {
+  throw new Error(`Unexpected start-of-axis prefetch: ${startNeighbors.join(",")}`);
 }
 
 console.log("Async queue checks passed");

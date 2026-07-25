@@ -604,6 +604,121 @@ export function reconcileSelections(
   return next;
 }
 
+function temporalDimensions(info: StoreInfo, variable: VariableConfig) {
+  const time = variable.dimensions.filter(
+    (dimension) => info.axes[dimension]?.kind === "time",
+  );
+  const valid = time.find((dimension) =>
+    dimension.toLowerCase().includes("valid"),
+  );
+  const initialization = valid
+    ?? time.find((dimension) =>
+      ["init_time", "forecast_reference_time"].includes(dimension.toLowerCase()),
+    )
+    ?? time[0];
+  const lead = variable.dimensions.find(
+    (dimension) => info.axes[dimension]?.kind === "timedelta",
+  );
+  return { valid, initialization, lead };
+}
+
+export function selectedValidDate(
+  info: StoreInfo,
+  variable: VariableConfig,
+  selections: AxisSelection,
+) {
+  const { valid, initialization, lead } = temporalDimensions(info, variable);
+  if (!initialization) return undefined;
+  const base = axisValueAsDate(
+    info.dataset,
+    info.axes[initialization],
+    selections[initialization] ?? 0,
+  );
+  if (valid || !lead) return base;
+  return new Date(
+    base.getTime()
+    + timedeltaMilliseconds(info.axes[lead], selections[lead] ?? 0),
+  );
+}
+
+function latestTimeIndexAtOrBefore(
+  info: StoreInfo,
+  axis: AxisConfig,
+  date: Date,
+) {
+  const match = axisDateMatch(info.dataset, axis, date);
+  let index = match.index;
+  if (match.date.getTime() > date.getTime()) {
+    const ascending = match.first.getTime() <= match.last.getTime();
+    index += ascending ? -1 : 1;
+  }
+  return Math.max(0, Math.min(axis.values.length - 1, index));
+}
+
+function nearestTimedeltaIndex(axis: AxisConfig, milliseconds: number) {
+  let nearest = 0;
+  let distance = Number.POSITIVE_INFINITY;
+  for (let index = 0; index < axis.values.length; index += 1) {
+    const candidate = Math.abs(timedeltaMilliseconds(axis, index) - milliseconds);
+    if (candidate < distance) {
+      nearest = index;
+      distance = candidate;
+    }
+  }
+  return nearest;
+}
+
+function matchLeadToValidDate(
+  info: StoreInfo,
+  variable: VariableConfig,
+  selections: AxisSelection,
+  validDate: Date,
+) {
+  const { valid, initialization, lead } = temporalDimensions(info, variable);
+  if (valid || !initialization || !lead) return selections;
+  const initializationDate = axisValueAsDate(
+    info.dataset,
+    info.axes[initialization],
+    selections[initialization] ?? 0,
+  );
+  return {
+    ...selections,
+    [lead]: nearestTimedeltaIndex(
+      info.axes[lead],
+      validDate.getTime() - initializationDate.getTime(),
+    ),
+  };
+}
+
+export function selectionsForValidDate(
+  info: StoreInfo,
+  variable: VariableConfig,
+  validDate: Date,
+  initial = defaultSelections(info, variable),
+) {
+  const next = { ...initial };
+  const { valid, initialization } = temporalDimensions(info, variable);
+  if (!initialization || !Number.isFinite(validDate.getTime())) return next;
+  next[initialization] = valid
+    ? axisIndexForDate(info.dataset, info.axes[initialization], validDate)
+    : latestTimeIndexAtOrBefore(info, info.axes[initialization], validDate);
+  return matchLeadToValidDate(info, variable, next, validDate);
+}
+
+export function selectionsAfterAxisChange(
+  info: StoreInfo,
+  variable: VariableConfig,
+  current: AxisSelection,
+  axis: AxisConfig,
+  nextIndex: number,
+) {
+  const validDate = selectedValidDate(info, variable, current);
+  const next = { ...current, [axis.id]: nextIndex };
+  return axis.kind === "time" && validDate
+    ? matchLeadToValidDate(info, variable, next, validDate)
+    : next;
+}
+
 export function selectorFor(
   variable: VariableConfig,
   selections: AxisSelection,
@@ -664,13 +779,38 @@ export function axisIndexForDate(
   axis: AxisConfig,
   date: Date,
 ) {
+  return axisDateMatch(dataset, axis, date).index;
+}
+
+export type AxisDateMatch = {
+  index: number;
+  date: Date;
+  first: Date;
+  last: Date;
+  distanceMilliseconds: number;
+};
+
+export function axisDateMatch(
+  dataset: DatasetConfig,
+  axis: AxisConfig,
+  date: Date,
+): AxisDateMatch {
   const target = date.getTime();
-  if (!Number.isFinite(target) || axis.values.length === 0) return 0;
+  if (!Number.isFinite(target) || axis.values.length === 0) {
+    const invalid = new Date(NaN);
+    return {
+      index: 0,
+      date: invalid,
+      first: invalid,
+      last: invalid,
+      distanceMilliseconds: Number.POSITIVE_INFINITY,
+    };
+  }
   let low = 0;
   let high = axis.values.length - 1;
-  const first = axisValueAsDate(dataset, axis, low).getTime();
-  const last = axisValueAsDate(dataset, axis, high).getTime();
-  const ascending = first <= last;
+  const first = axisValueAsDate(dataset, axis, low);
+  const last = axisValueAsDate(dataset, axis, high);
+  const ascending = first.getTime() <= last.getTime();
 
   while (low < high) {
     const middle = Math.floor((low + high) / 2);
@@ -680,15 +820,25 @@ export function axisIndexForDate(
     else high = middle;
   }
 
-  if (low === 0) return 0;
-  const previous = low - 1;
-  const currentDistance = Math.abs(
-    axisValueAsDate(dataset, axis, low).getTime() - target,
-  );
-  const previousDistance = Math.abs(
-    axisValueAsDate(dataset, axis, previous).getTime() - target,
-  );
-  return currentDistance < previousDistance ? low : previous;
+  let index = low;
+  if (low > 0) {
+    const previous = low - 1;
+    const currentDistance = Math.abs(
+      axisValueAsDate(dataset, axis, low).getTime() - target,
+    );
+    const previousDistance = Math.abs(
+      axisValueAsDate(dataset, axis, previous).getTime() - target,
+    );
+    index = currentDistance < previousDistance ? low : previous;
+  }
+  const matchedDate = axisValueAsDate(dataset, axis, index);
+  return {
+    index,
+    date: matchedDate,
+    first,
+    last,
+    distanceMilliseconds: Math.abs(matchedDate.getTime() - target),
+  };
 }
 
 export function formatAxisValue(

@@ -1,5 +1,9 @@
 import { useEffect, useMemo, useRef } from "react";
-import type { DatasetConfig } from "./catalog";
+import {
+  DATASET_CATEGORY_GROUPS,
+  datasetOptionLabel,
+  type DatasetConfig,
+} from "./catalog";
 import type { PointSeries } from "./dataset";
 import {
   convertPointSeries,
@@ -396,11 +400,20 @@ export function SeriesComparison({
             disabled={!addableDatasets.length}
             onChange={(event) => onPickerChange(event.target.value)}
           >
-            {addableDatasets.map((dataset) => (
-              <option key={dataset.id} value={dataset.id}>
-                {dataset.label}
-              </option>
-            ))}
+            {DATASET_CATEGORY_GROUPS.map((group) => {
+              const datasets = addableDatasets.filter(
+                (dataset) => dataset.category === group.id,
+              );
+              return datasets.length ? (
+                <optgroup key={group.id} label={group.label}>
+                  {datasets.map((dataset) => (
+                    <option key={dataset.id} value={dataset.id}>
+                      {datasetOptionLabel(dataset)}
+                    </option>
+                  ))}
+                </optgroup>
+              ) : null;
+            })}
           </select>
         </label>
         <button

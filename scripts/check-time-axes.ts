@@ -9,7 +9,9 @@ import {
   selectionsForValidDate,
   selectorFor,
   selectedValidDate,
+  seriesStartDate,
   toDataCoordinates,
+  validDateRange,
   weatherNextStoreUrl,
   type AxisConfig,
   type StoreInfo,
@@ -163,6 +165,17 @@ const forecastVariable = {
   unit: "K",
   dimensions: ["init_time", "lead_time", "latitude", "longitude"],
 } satisfies VariableConfig;
+assert.deepEqual(
+  Object.fromEntries(
+    Object.entries(validDateRange(forecastInfo, forecastVariable) ?? {}).map(
+      ([key, value]) => [key, value.toISOString()],
+    ),
+  ),
+  {
+    first: "2021-02-07T00:00:00.000Z",
+    last: "2021-02-08T00:00:00.000Z",
+  },
+);
 
 const mappedForecast = selectionsForValidDate(
   forecastInfo,
@@ -177,6 +190,14 @@ assert.equal(
     mappedForecast,
   )?.toISOString(),
   "2021-02-07T09:00:00.000Z",
+);
+assert.equal(
+  seriesStartDate(
+    forecastInfo,
+    forecastVariable,
+    mappedForecast,
+  )?.toISOString(),
+  "2021-02-07T06:00:00.000Z",
 );
 
 const preservedAcrossInitChange = selectionsAfterAxisChange(
@@ -291,6 +312,17 @@ const analysisVariable = {
   ...forecastVariable,
   dimensions: ["time", "latitude", "longitude"],
 } satisfies VariableConfig;
+assert.deepEqual(
+  Object.fromEntries(
+    Object.entries(validDateRange(analysisInfo, analysisVariable) ?? {}).map(
+      ([key, value]) => [key, value.toISOString()],
+    ),
+  ),
+  {
+    first: "2021-02-07T00:00:00.000Z",
+    last: "2021-02-07T12:00:00.000Z",
+  },
+);
 const mappedAnalysis = selectionsForValidDate(
   analysisInfo,
   analysisVariable,

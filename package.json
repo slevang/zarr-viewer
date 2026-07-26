@@ -13,6 +13,7 @@
     "check:static": "node scripts/check-static-build.mjs",
     "check:data": "tsx scripts/check-remote-data.ts",
     "check:derived": "tsx scripts/check-derived-variables.ts",
+    "check:color-range": "tsx scripts/check-color-range.ts",
     "check:new-data": "tsx scripts/check-new-data.ts",
     "check:queue": "tsx scripts/check-async-queue.ts",
     "check:variables": "tsx scripts/check-common-variables.ts",
@@ -21,7 +22,7 @@
     "preview": "vite preview --host 127.0.0.1 --port 3000",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "test": "npm run lint && npm run typecheck && npm run check:queue && npm run check:variables && npm run check:time && npm run check:units && npm run check:derived && npm run build && npm run check:static"
+    "test": "npm run lint && npm run typecheck && npm run check:queue && npm run check:variables && npm run check:time && npm run check:units && npm run check:derived && npm run check:color-range && npm run build && npm run check:static"
   },
   "dependencies": {
     "@carbonplan/zarr-layer": "^0.6.1",

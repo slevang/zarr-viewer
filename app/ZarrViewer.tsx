@@ -5,6 +5,11 @@ import {
   DEFAULT_COLORMAP,
   defaultColormap,
 } from "./colormaps";
+import {
+  addFiniteValues,
+  createFiniteValueSample,
+  robustColorRange,
+} from "./color-range";
 import { commonVariableMatches } from "./common-variables";
 import { derivedLayerOptions } from "./derived-store";
 import { derivedDisplayId } from "./derived-variables";
@@ -46,8 +51,10 @@ import {
   selectionsForValidDate,
   selectorFor,
   selectedValidDate,
+  seriesStartDate,
   timedeltaMilliseconds,
   toDataCoordinates,
+  validDateRange,
   type AxisConfig,
   type AxisSelection,
   type PointSeries,
@@ -72,6 +79,9 @@ import {
 } from "./google-auth";
 
 type Projection = "globe" | "mercator";
+type SeriesComparisonOptions = {
+  addMapDataset?: boolean;
+};
 const DATASET_PARAMETER = "dataset";
 const UNIT_PREFERENCES_STORAGE_KEY = "zarr-viewer:unit-preferences";
 type InspectionPoint = { lng: number; lat: number };
@@ -115,7 +125,7 @@ const PLAYBACK_PREFETCH_BASE_BEHIND = 3;
 const PLAYBACK_PREFETCH_FALLBACK_CONCURRENCY = 2;
 const PLAYBACK_PREFETCH_MAX_CONCURRENCY = 32;
 const PLAYBACK_PREFETCH_MEMORY_BUDGET_BYTES = 1024 * 1024 * 1024;
-const COLOR_RANGE_ESTIMATOR_VERSION = 3;
+const COLOR_RANGE_ESTIMATOR_VERSION = 4;
 const DEFAULT_CENTER: [number, number] = [-98, 38.5];
 const DEFAULT_ZOOM = 1.75;
 const READY_STATE: LoadState = { phase: "ready", message: "Ready" };
@@ -134,6 +144,54 @@ const FULL_IMAGE_GEOMETRIES = [
     [west, -89.999],
   ]],
 }));
+
+type DeferredCalendarInputProps = {
+  axisId: string;
+  label: string;
+  value: string;
+  min: string;
+  max: string;
+  onCommit: (value: string) => void;
+};
+
+function DeferredCalendarInput({
+  axisId,
+  label,
+  value,
+  min,
+  max,
+  onCommit,
+}: DeferredCalendarInputProps) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const pendingValue = draft ?? value;
+
+  const commitDraft = (next: string) => {
+    if (!next || next === value) return;
+    onCommit(next);
+  };
+
+  return (
+    <input
+      className="axis-calendar"
+      aria-label={`${label} calendar`}
+      data-testid={`calendar-${axisId}`}
+      type="datetime-local"
+      step="3600"
+      value={pendingValue}
+      min={min}
+      max={max}
+      onInput={(event) => setDraft(event.currentTarget.value)}
+      onChange={(event) => setDraft(event.currentTarget.value)}
+      onBlur={() => commitDraft(pendingValue)}
+      onKeyDown={(event) => {
+        if (event.key === "Escape") setDraft(null);
+      }}
+      onKeyUp={(event) => {
+        if (event.key === "Enter") commitDraft(event.currentTarget.value);
+      }}
+    />
+  );
+}
 
 function loadingState(message = "Loading…"): LoadState {
   return { phase: "loading", message };
@@ -365,6 +423,10 @@ function formatAsosTime(date: Date) {
   return `${date.toISOString().slice(0, 16).replace("T", " ")}Z`;
 }
 
+function formatUtcTime(date: Date) {
+  return `${date.toISOString().slice(0, 16).replace("T", " ")} UTC`;
+}
+
 function formatOptionalValue(
   value: number | null,
   unit: string,
@@ -411,44 +473,6 @@ function roundRangeToSignificant(
   ];
 }
 
-function fullRange(value: unknown): [number, number] | null {
-  let min = Number.POSITIVE_INFINITY;
-  let max = Number.NEGATIVE_INFINITY;
-
-  const visit = (candidate: unknown) => {
-    if (typeof candidate === "number") {
-      if (Number.isFinite(candidate)) {
-        min = Math.min(min, candidate);
-        max = Math.max(max, candidate);
-      }
-      return;
-    }
-    if (typeof candidate === "bigint") {
-      const numeric = Number(candidate);
-      if (Number.isFinite(numeric)) {
-        min = Math.min(min, numeric);
-        max = Math.max(max, numeric);
-      }
-      return;
-    }
-    if (Array.isArray(candidate) || ArrayBuffer.isView(candidate)) {
-      for (const item of Array.from(candidate as ArrayLike<unknown>)) visit(item);
-      return;
-    }
-    if (candidate && typeof candidate === "object") {
-      for (const item of Object.values(candidate)) visit(item);
-    }
-  };
-
-  visit(value);
-  if (!Number.isFinite(min) || !Number.isFinite(max)) return null;
-  if (min === max) {
-    const padding = Math.abs(min) * 0.05 || 1;
-    return [min - padding, max + padding];
-  }
-  return [min, max];
-}
-
 function initialDisplayRange(variable: VariableConfig): [number, number] {
   const name = `${variable.id} ${variable.label}`.toLowerCase();
   const unit = variable.unit.toLowerCase();
@@ -471,7 +495,11 @@ function initialDisplayRange(variable: VariableConfig): [number, number] {
       ? [900, 1050]
       : [90_000, 105_000];
   }
-  if (name.includes("precip") || name.includes("snowfall")) return [0, 25];
+  if (name.includes("precip") || name.includes("rainfall") || name.includes("snowfall")) {
+    if (/^(?:m|meter|metre)s?$/.test(unit)) return [0, 0.025];
+    if (unit.includes("inch") || unit === "in") return [0, 1];
+    return [0, 25];
+  }
   if (name.includes("wind") && /\b(?:u|v)\b/.test(name)) return [-30, 30];
   if (name.includes("wind")) return [0, 30];
   if (name.includes("geopotential height")) return [0, 6_000];
@@ -575,6 +603,15 @@ function seriesCoversDate(series: PointSeries | undefined, date?: Date) {
   return target >= Math.min(first, last) && target <= Math.max(first, last);
 }
 
+function isInitializationAxis(axis: AxisConfig) {
+  return [
+    "init_time",
+    "initialization_time",
+    "forecast_reference_time",
+    "forecast_date",
+  ].includes(axis.id.toLowerCase());
+}
+
 function utcHour(date: Date) {
   return Number.isFinite(date.getTime())
     ? `${date.toISOString().slice(0, 13).replace("T", " ")}Z`
@@ -648,6 +685,7 @@ export function ZarrViewer() {
   const inspectionPointRef = useRef<InspectionPoint | null>(null);
   const inspectionMarkerRef = useRef<import("maplibre-gl").Marker | null>(null);
   const inspectionRequestGeneration = useRef(0);
+  const stationSearchInputRef = useRef<HTMLInputElement>(null);
   const seriesRequestGeneration = useRef(0);
   const seriesRequestControllerRef = useRef<AbortController | null>(null);
   const seriesDatasetIdsRef = useRef<string[]>([]);
@@ -659,7 +697,10 @@ export function ZarrViewer() {
   const rememberedValidDateRef = useRef<Date | undefined>(undefined);
   const weatherNextStoreGenerationRef = useRef(0);
   const resetPlaybackPrefetchRef = useRef<() => void>(() => {});
-  const startSeriesComparisonRef = useRef<(point: InspectionPoint) => void>(() => {});
+  const startSeriesComparisonRef = useRef<(
+    point: InspectionPoint,
+    options?: SeriesComparisonOptions,
+  ) => void>(() => {});
   const startAsosComparisonRef = useRef<(station: AsosStation) => void>(() => {});
   const inspectLocationRef = useRef<(
     point: InspectionPoint,
@@ -669,6 +710,8 @@ export function ZarrViewer() {
   const [datasetId, setDatasetId] = useState(
     initialDatasetId,
   );
+  const [mapInstallRevision, setMapInstallRevision] = useState(0);
+  const [unavailableMapDate, setUnavailableMapDate] = useState<Date | null>(null);
   const [googleAuth, setGoogleAuth] = useState(googleAuthSnapshot);
   const [info, setInfo] = useState<StoreInfo | null>(null);
   const [variable, setVariable] = useState<VariableConfig | null>(null);
@@ -697,6 +740,7 @@ export function ZarrViewer() {
   >("idle");
   const [stations, setStations] = useState<AsosStation[]>([]);
   const [stationSearchQuery, setStationSearchQuery] = useState("");
+  const [stationSearchIndex, setStationSearchIndex] = useState(-1);
   const [asosStation, setAsosStation] = useState<AsosStation | null>(null);
   const [asosWindow, setAsosWindow] = useState<AsosWindow | null>(null);
   const [inspector, setInspector] = useState<Inspector | null>(null);
@@ -806,11 +850,16 @@ export function ZarrViewer() {
     [compactPlaybackAxes],
   );
   const selectedMapValidDate = useMemo(
-    () => info && variable
+    () => unavailableMapDate ?? (info && variable
       ? selectedValidDate(info, variable, selections)
-      : undefined,
-    [info, selections, variable],
+      : undefined),
+    [info, selections, unavailableMapDate, variable],
   );
+  const forecastValidDate = dataset.category === "forecast"
+    && selectedMapValidDate
+    && Number.isFinite(selectedMapValidDate.getTime())
+    ? selectedMapValidDate
+    : undefined;
 
   const resetPlaybackPrefetch = useCallback(() => {
     const queue = playbackPrefetchRef.current;
@@ -1042,7 +1091,7 @@ export function ZarrViewer() {
     try {
       const sourceInitializationAxis = comparisonDatasetId === sourceInfo.dataset.id
         ? Object.values(sourceInfo.axes).find(
-          (axis) => axis.requiresStoreReload && axis.kind === "time",
+          (axis) => axis.kind === "time" && isInitializationAxis(axis),
         )
         : undefined;
       const comparisonTargetDate = sourceInitializationAxis
@@ -1069,14 +1118,22 @@ export function ZarrViewer() {
         comparisonVariable,
       );
       if (anchorDate) {
-        for (const dimension of comparisonVariable.dimensions) {
+        const comparisonDimensions = new Set([
+          ...comparisonVariable.dimensions,
+          ...Object.values(comparisonInfo.axes)
+            .filter((axis) => axis.requiresStoreReload)
+            .map((axis) => axis.id),
+        ]);
+        for (const dimension of comparisonDimensions) {
           const axis = comparisonInfo.axes[dimension];
           if (axis?.kind === "time") {
             comparisonSelections[dimension] = comparisonTimeIndex(
               comparisonInfo,
               comparisonVariable,
               axis,
-              anchorDate,
+              isInitializationAxis(axis)
+                ? comparisonTargetDate ?? anchorDate
+                : anchorDate,
             );
           }
         }
@@ -1122,13 +1179,17 @@ export function ZarrViewer() {
             ...entry,
             phase: "error",
             message: error instanceof Error ? error.message : String(error),
+            series: undefined,
           }
           : entry
       ));
     }
   }, []);
 
-  const startSeriesComparison = useCallback((point: InspectionPoint) => {
+  const startSeriesComparison = useCallback((
+    point: InspectionPoint,
+    options: SeriesComparisonOptions = {},
+  ) => {
     seriesRequestControllerRef.current?.abort();
     const controller = new AbortController();
     seriesRequestControllerRef.current = controller;
@@ -1142,16 +1203,24 @@ export function ZarrViewer() {
         selectionsRef.current,
       )
       : undefined;
-    const selectedDatasetIds = seriesDatasetIdsRef.current;
+    const selectedDatasetIds = [...seriesDatasetIdsRef.current];
+    const mapDatasetId = currentInfo
+      && currentVariable
+      && hasSeriesSource(currentInfo.dataset)
+      ? currentInfo.dataset.id
+      : undefined;
+    if (
+      options.addMapDataset
+      && mapDatasetId
+      && !selectedDatasetIds.includes(mapDatasetId)
+    ) {
+      selectedDatasetIds.push(mapDatasetId);
+    }
     const comparisonDatasetIds = selectedDatasetIds.length
       ? selectedDatasetIds
-      : (
-        currentInfo
-        && currentVariable
-        && hasSeriesSource(currentInfo.dataset)
-          ? [currentInfo.dataset.id]
-          : []
-      );
+      : mapDatasetId
+        ? [mapDatasetId]
+        : [];
     seriesDatasetIdsRef.current = [...comparisonDatasetIds];
     setSeriesEntries((current) => {
       const comparisons = comparisonDatasetIds.map((comparisonDatasetId) => ({
@@ -1187,7 +1256,7 @@ export function ZarrViewer() {
     if (!currentInfo || !currentVariable) return;
     const generation = seriesRequestGeneration.current;
     const signal = seriesRequestControllerRef.current?.signal;
-    const start = selectedValidDate(
+    const start = seriesStartDate(
       currentInfo,
       currentVariable,
       selectionsRef.current,
@@ -1345,7 +1414,7 @@ export function ZarrViewer() {
     const currentSelections = { ...selectionsRef.current };
     const currentSelector = selectorFor(currentVariable, currentSelections);
     try {
-      const extents: [number, number][] = [];
+      const sample = createFiniteValueSample();
       for (const geometry of FULL_IMAGE_GEOMETRIES) {
         if (generation !== rangeGeneration.current) return;
         const result = await layer.queryData(
@@ -1353,18 +1422,15 @@ export function ZarrViewer() {
           currentSelector,
           { includeSpatialCoordinates: false },
         );
-        const extent = fullRange(result[currentVariable.id]);
-        if (extent) extents.push(extent);
+        addFiniteValues(sample, result[currentVariable.id]);
       }
       if (
         generation !== rangeGeneration.current
         || variableRef.current?.id !== currentVariable.id
       ) return;
-      const rangeFromData: [number, number] | null = extents.length
-        ? roundRangeToSignificant([
-          Math.min(...extents.map(([min]) => min)),
-          Math.max(...extents.map(([, max]) => max)),
-        ])
+      const estimatedRange = robustColorRange(sample, currentVariable);
+      const rangeFromData = estimatedRange
+        ? roundRangeToSignificant(estimatedRange)
         : null;
       if (!rangeFromData) return;
       displayRangesRef.current.set(
@@ -1504,6 +1570,10 @@ export function ZarrViewer() {
   }, [refreshInspection]);
 
   useEffect(() => {
+    if (stationsVisible) stationSearchInputRef.current?.focus();
+  }, [stationsVisible]);
+
+  useEffect(() => {
     stationsVisibleRef.current = stationsVisible;
     const map = mapRef.current;
     if (!mapReady || !map) return;
@@ -1616,6 +1686,7 @@ export function ZarrViewer() {
       seriesRequestControllerRef.current?.abort();
       seriesRequestGeneration.current += 1;
       setLoadState(loadingState("Opening dataset…"));
+      setUnavailableMapDate(null);
       setInfo(null);
       setVariable(null);
       if (googleAuthRequired && !hasGoogleAccessToken()) {
@@ -1637,11 +1708,13 @@ export function ZarrViewer() {
       const nextVariable = nextInfo.variables.find(
         (candidate) => candidate.id === nextInfo.dataset.defaultVariable,
       ) ?? nextInfo.variables[0];
-      const nextSelections = rememberedValidDateRef.current
+      const requestedValidDate = rememberedValidDateRef.current;
+      const availableRange = validDateRange(nextInfo, nextVariable);
+      const nextSelections = requestedValidDate
         ? selectionsForValidDate(
           nextInfo,
           nextVariable,
-          rememberedValidDateRef.current,
+          requestedValidDate,
         )
         : defaultSelections(nextInfo, nextVariable);
       const nextColormap = defaultColormap(nextVariable);
@@ -1652,6 +1725,31 @@ export function ZarrViewer() {
         : initialDisplayRange(nextVariable);
       const map = mapRef.current;
       if (!map) return;
+      if (
+        requestedValidDate
+        && availableRange
+        && (
+          requestedValidDate.getTime() < availableRange.first.getTime()
+          || requestedValidDate.getTime() > availableRange.last.getTime()
+        )
+      ) {
+        if (map.getLayer(ZARR_LAYER_ID)) map.removeLayer(ZARR_LAYER_ID);
+        layerRef.current = null;
+        infoRef.current = nextInfo;
+        variableRef.current = nextVariable;
+        selectionsRef.current = nextSelections;
+        setInfo(nextInfo);
+        setVariable(nextVariable);
+        setSelections(nextSelections);
+        setColormapId(nextColormap.id);
+        setActiveDisplayRange(nextDisplayRange);
+        setUnavailableMapDate(requestedValidDate);
+        setLoadState(errorState(new Error(
+          `Map unavailable at ${utcHour(requestedValidDate)}`
+          + ` · available ${utcHour(availableRange.first)}–${utcHour(availableRange.last)}`,
+        )));
+        return;
+      }
 
       if (map.getLayer(ZARR_LAYER_ID)) map.removeLayer(ZARR_LAYER_ID);
       layerRef.current = null;
@@ -1702,20 +1800,38 @@ export function ZarrViewer() {
       );
       const point = inspectionPointRef.current;
       if (point) {
-        startSeriesComparisonRef.current(point);
+        startSeriesComparisonRef.current(point, {
+          addMapDataset: true,
+        });
         const station = asosStationRef.current;
         if (station) startAsosComparisonRef.current(station);
       }
     };
     void installDataset().catch((error) => {
-      if (!cancelled) setLoadState(errorState(error));
+      if (cancelled) return;
+      const map = mapRef.current;
+      if (map?.getLayer(ZARR_LAYER_ID)) map.removeLayer(ZARR_LAYER_ID);
+      layerRef.current = null;
+      infoRef.current = null;
+      variableRef.current = null;
+      selectionsRef.current = {};
+      setInfo(null);
+      setVariable(null);
+      setSelections({});
+      setLoadState(errorState(error));
     });
     return () => {
       cancelled = true;
       requestGeneration.current += 1;
       rangeGeneration.current += 1;
     };
-  }, [datasetId, googleAuthRequired, googleConnected, mapReady]);
+  }, [
+    datasetId,
+    googleAuthRequired,
+    googleConnected,
+    mapInstallRevision,
+    mapReady,
+  ]);
 
   useEffect(() => {
     if (loadState.phase !== "ready" || !needsRangeEstimateRef.current) return;
@@ -2037,6 +2153,17 @@ export function ZarrViewer() {
       resetPlaybackPrefetch();
       setPlayingAxis(null);
     }
+    if (unavailableMapDate) {
+      if (axis.kind === "time" || axis.kind === "timedelta") {
+        const nextValidDate = selectedValidDate(info, variable, next);
+        if (nextValidDate) {
+          rememberedValidDateRef.current = nextValidDate;
+          setUnavailableMapDate(null);
+          setMapInstallRevision((current) => current + 1);
+        }
+      }
+      return;
+    }
     if (axis.requiresStoreReload) {
       void changeWeatherNextInitialization(
         axisValueAsDate(info.dataset, axis, clamped),
@@ -2080,7 +2207,9 @@ export function ZarrViewer() {
   const changeDataset = (nextDatasetId: string) => {
     const currentInfo = infoRef.current;
     const currentVariable = variableRef.current;
-    if (currentInfo && currentVariable) {
+    if (unavailableMapDate) {
+      rememberedValidDateRef.current = unavailableMapDate;
+    } else if (currentInfo && currentVariable) {
       rememberedValidDateRef.current = selectedValidDate(
         currentInfo,
         currentVariable,
@@ -2117,9 +2246,10 @@ export function ZarrViewer() {
   };
 
   const changeOpacity = (next: number) => {
-    opacityRef.current = next;
-    setOpacity(next);
-    layerRef.current?.setOpacity(next);
+    const clamped = Math.round(Math.max(0.2, Math.min(1, next)) * 100) / 100;
+    opacityRef.current = clamped;
+    setOpacity(clamped);
+    layerRef.current?.setOpacity(clamped);
   };
 
   const chooseStation = (station: AsosStation) => {
@@ -2127,6 +2257,7 @@ export function ZarrViewer() {
     if (!map) return;
     const point = { lng: station.longitude, lat: station.latitude };
     setStationSearchQuery("");
+    setStationSearchIndex(-1);
     map.flyTo({
       center: [station.longitude, station.latitude],
       zoom: Math.max(map.getZoom(), 5),
@@ -2286,29 +2417,79 @@ export function ZarrViewer() {
         {stationsVisible ? (
           <div className="station-search">
             <input
+              ref={stationSearchInputRef}
               type="search"
               value={stationSearchQuery}
               placeholder={stationsPhase === "loading"
                 ? "Loading stations…"
                 : "Find station…"}
+              role="combobox"
+              aria-autocomplete="list"
               aria-label="Find ASOS or AWOS station"
-              disabled={stationsPhase !== "ready"}
-              onChange={(event) => setStationSearchQuery(event.target.value)}
+              aria-busy={stationsPhase === "loading"}
+              aria-controls="station-search-results"
+              aria-expanded={Boolean(
+                stationSearchQuery.trim() && stationsPhase === "ready",
+              )}
+              aria-activedescendant={
+                stationSearchIndex >= 0
+                && stationSearchResults[stationSearchIndex]
+                ? `station-search-option-${stationSearchResults[stationSearchIndex]?.station}`
+                : undefined
+              }
+              onChange={(event) => {
+                setStationSearchQuery(event.target.value);
+                setStationSearchIndex(-1);
+              }}
               onKeyDown={(event) => {
-                if (event.key === "Escape") setStationSearchQuery("");
-                if (event.key === "Enter" && stationSearchResults[0]) {
-                  chooseStation(stationSearchResults[0]);
+                if (event.key === "ArrowDown" && stationSearchResults.length) {
+                  event.preventDefault();
+                  setStationSearchIndex((current) =>
+                    current < 0
+                      ? 0
+                      : (current + 1) % stationSearchResults.length
+                  );
+                }
+                if (event.key === "ArrowUp" && stationSearchResults.length) {
+                  event.preventDefault();
+                  setStationSearchIndex((current) =>
+                    current <= 0
+                      ? stationSearchResults.length - 1
+                      : current - 1
+                  );
+                }
+                if (event.key === "Escape") {
+                  setStationSearchQuery("");
+                  setStationSearchIndex(-1);
+                }
+                if (event.key === "Enter") {
+                  const station = stationSearchResults[
+                    stationSearchIndex >= 0 ? stationSearchIndex : 0
+                  ];
+                  if (station) {
+                    event.preventDefault();
+                    chooseStation(station);
+                  }
                 }
               }}
             />
             {stationSearchQuery.trim() && stationsPhase === "ready" ? (
-              <div className="station-search-results" role="listbox" aria-label="Station results">
-                {stationSearchResults.length ? stationSearchResults.map((station) => (
+              <div
+                id="station-search-results"
+                className="station-search-results"
+                role="listbox"
+                aria-label="Station results"
+              >
+                {stationSearchResults.length ? stationSearchResults.map((station, index) => (
                   <button
                     key={station.station}
+                    id={`station-search-option-${station.station}`}
+                    className={index === stationSearchIndex ? "active" : ""}
                     type="button"
                     role="option"
-                    aria-selected="false"
+                    aria-selected={index === stationSearchIndex}
+                    onMouseEnter={() => setStationSearchIndex(index)}
+                    onFocus={() => setStationSearchIndex(index)}
                     onClick={() => chooseStation(station)}
                   >
                     <strong>{station.station}</strong>
@@ -2397,6 +2578,14 @@ export function ZarrViewer() {
           }) : (
             <span className="mobile-axis-empty">No time coordinate for this variable</span>
           )}
+          {forecastValidDate ? (
+            <div className="forecast-valid-time compact">
+              <span>Valid time</span>
+              <time dateTime={forecastValidDate.toISOString()}>
+                {formatUtcTime(forecastValidDate)}
+              </time>
+            </div>
+          ) : null}
         </div>
         <div className={`status-indicator ${loadState.phase}`} role="status" title={loadState.message}>
           <span className="status-spinner" aria-hidden="true" />
@@ -2405,7 +2594,12 @@ export function ZarrViewer() {
 
         <div className="field-grid">
           <label className="field">
-            <span>Dataset</span>
+            <span className="dataset-heading">
+              <span>Dataset</span>
+              <small className="dataset-chunking">
+                {datasetChunkingLabel(dataset)}
+              </small>
+            </span>
             <select
               data-testid="dataset-select"
               value={datasetId}
@@ -2426,11 +2620,6 @@ export function ZarrViewer() {
                 </optgroup>
               ))}
             </select>
-            <small className="dataset-chunking">
-              {googleAuthRequired && !googleConnected && !variable
-                ? "WeatherNext credentials required."
-                : datasetChunkingLabel(dataset)}
-            </small>
             {googleAuthRequired ? (
               <div className={`google-auth-control ${googleAuth.phase}`}>
                 <button
@@ -2456,23 +2645,9 @@ export function ZarrViewer() {
           </label>
 
           <div className="field">
-            <div className="field-heading">
-              <label htmlFor="variable-select">Variable</label>
-              {availableUnitOptions.length > 1 && selectedUnit ? (
-                <select
-                  className="unit-select"
-                  aria-label="Display unit"
-                  value={selectedUnit.id}
-                  onChange={(event) => changeDisplayUnit(event.target.value)}
-                >
-                  {availableUnitOptions.map((option) => (
-                    <option key={option.id} value={option.id}>
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
-              ) : null}
-            </div>
+            <label className="field-heading" htmlFor="variable-select">
+              Variable
+            </label>
             <select
               id="variable-select"
               data-testid="variable-select"
@@ -2523,28 +2698,36 @@ export function ZarrViewer() {
 
           {activeAxes.map((axis) => {
             const selected = selections[axis.id] ?? 0;
+            const showsUnavailableAnalysisDate = Boolean(
+              unavailableMapDate
+              && dataset.category === "analysis"
+              && axis.kind === "time",
+            );
             const canPlay = (
               axis.kind === "time" || axis.kind === "timedelta"
-            ) && !axis.requiresStoreReload;
+            ) && !axis.requiresStoreReload && !unavailableMapDate;
             return (
               <div className="axis-control" key={axis.id}>
                 <div className="axis-heading">
                   <span>{axis.label}</span>
-                  <strong>{formatAxisValue(dataset, axis, selected)}</strong>
+                  <strong>
+                    {showsUnavailableAnalysisDate && unavailableMapDate
+                      ? formatUtcTime(unavailableMapDate)
+                      : formatAxisValue(dataset, axis, selected)}
+                  </strong>
                 </div>
                 {axis.kind === "time" ? (
-                  <input
-                    className="axis-calendar"
-                    aria-label={`${axis.label} calendar`}
-                    data-testid={`calendar-${axis.id}`}
-                    type="datetime-local"
-                    step="3600"
-                    value={axisDateInputValue(dataset, axis, selected)}
+                  <DeferredCalendarInput
+                    key={`${axis.id}:${selected}:${unavailableMapDate?.getTime() ?? ""}`}
+                    axisId={axis.id}
+                    label={axis.label}
+                    value={showsUnavailableAnalysisDate && unavailableMapDate
+                      ? unavailableMapDate.toISOString().slice(0, 16)
+                      : axisDateInputValue(dataset, axis, selected)}
                     min={axisDateInputValue(dataset, axis, 0)}
                     max={axisDateInputValue(dataset, axis, axis.values.length - 1)}
-                    onChange={(event) => {
-                      if (!event.target.value) return;
-                      const date = new Date(`${event.target.value}Z`);
+                    onCommit={(nextValue) => {
+                      const date = new Date(`${nextValue}Z`);
                       if (!Number.isNaN(date.getTime())) {
                         changeAxis(axis, axisIndexForDate(dataset, axis, date));
                       }
@@ -2579,13 +2762,60 @@ export function ZarrViewer() {
               </div>
             );
           })}
+          {forecastValidDate ? (
+            <div className="forecast-valid-time">
+              <span>Valid time</span>
+              <time dateTime={forecastValidDate.toISOString()}>
+                {formatUtcTime(forecastValidDate)}
+              </time>
+            </div>
+          ) : null}
         </div>
 
         <div className="legend" ref={legendRef} aria-label={`${variable?.label ?? "Variable"} legend`}>
-          <label className="opacity-control">
-            <span>Opacity <strong>{Math.round(opacity * 100)}%</strong></span>
-            <input data-testid="opacity-slider" type="range" min="0.2" max="1" step="0.05" value={opacity} onChange={(event) => changeOpacity(Number(event.target.value))} />
-          </label>
+          <div className="legend-controls">
+            <label className="legend-unit-control">
+              <span>Units</span>
+              {availableUnitOptions.length > 1 && selectedUnit ? (
+                <select
+                  className="unit-select"
+                  aria-label="Display unit"
+                  value={selectedUnit.id}
+                  onChange={(event) => changeDisplayUnit(event.target.value)}
+                >
+                  {availableUnitOptions.map((option) => (
+                    <option key={option.id} value={option.id}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <strong>{displayUnitLabel || "—"}</strong>
+              )}
+            </label>
+            <div className="opacity-stepper">
+              <span>Opacity</span>
+              <button
+                type="button"
+                disabled={opacity <= 0.2}
+                aria-label="Decrease opacity"
+                title="Decrease opacity"
+                onClick={() => changeOpacity(opacity - 0.05)}
+              >
+                −
+              </button>
+              <strong>{Math.round(opacity * 100)}%</strong>
+              <button
+                type="button"
+                disabled={opacity >= 1}
+                aria-label="Increase opacity"
+                title="Increase opacity"
+                onClick={() => changeOpacity(opacity + 0.05)}
+              >
+                +
+              </button>
+            </div>
+          </div>
           <button className="legend-bar" data-testid="colormap-trigger" type="button" style={{ background: legendGradient }} onClick={() => setColormapOpen((current) => !current)} aria-label={`Choose colormap. Current: ${colormap.label}`} aria-expanded={colormapOpen} aria-haspopup="menu" />
           {colormapOpen ? (
             <div className="colormap-menu" role="menu" aria-label="Colormaps">

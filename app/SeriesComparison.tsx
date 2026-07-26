@@ -1,4 +1,10 @@
-import { useEffect, useMemo, useRef } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import {
   DATASET_CATEGORY_GROUPS,
   datasetOptionLabel,
@@ -118,11 +124,12 @@ function formatUtcRangeDate(date: Date) {
   return `${date.toISOString().slice(0, 16).replace("T", " ")}Z`;
 }
 
-function valueAtTime(series: PointSeries, timestamp: number) {
-  const values = series.kind === "history"
-    ? series.values
-    : series.quantiles.map((value) => value.q50);
-  const timestamps = series.dates.map((date) => date.getTime());
+function interpolatedValueAtTime(
+  dates: Date[],
+  values: number[],
+  timestamp: number,
+) {
+  const timestamps = dates.map((date) => date.getTime());
   if (
     !timestamps.length
     || timestamp < timestamps[0]
@@ -145,6 +152,31 @@ function valueAtTime(series: PointSeries, timestamp: number) {
   return lowValue + (highValue - lowValue) * fraction;
 }
 
+function valueAtTime(series: PointSeries, timestamp: number) {
+  return interpolatedValueAtTime(
+    series.dates,
+    series.kind === "history"
+      ? series.values
+      : series.quantiles.map((value) => value.q50),
+    timestamp,
+  );
+}
+
+function nearestTimestamp(timestamps: number[], target: number) {
+  if (!timestamps.length) return target;
+  let low = 0;
+  let high = timestamps.length - 1;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (timestamps[middle] < target) low = middle + 1;
+    else high = middle;
+  }
+  if (low === 0) return timestamps[0];
+  const previous = timestamps[low - 1];
+  const next = timestamps[low];
+  return target - previous <= next - target ? previous : next;
+}
+
 export function SeriesComparison({
   entries,
   availableDatasets,
@@ -156,6 +188,11 @@ export function SeriesComparison({
   displayUnit,
 }: SeriesComparisonProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [hover, setHover] = useState<{
+    timestamp: number;
+    x: number;
+    alignRight: boolean;
+  } | null>(null);
   const plottedEntries = useMemo(
     () => entries.flatMap((entry) =>
       entry.series
@@ -183,6 +220,14 @@ export function SeriesComparison({
       max: max + padding,
     };
   }, [plottedEntries]);
+  const chartTimestamps = useMemo(
+    () => Array.from(new Set(
+      plottedEntries.flatMap((entry) =>
+        entry.series.dates.map((date) => date.getTime()).filter(Number.isFinite),
+      ),
+    )).sort((left, right) => left - right),
+    [plottedEntries],
+  );
   const units = Array.from(new Set(plottedEntries.map((entry) => entry.series.unit)));
   const unitLabel = units.length === 1
     ? units[0] || "unitless"
@@ -199,6 +244,85 @@ export function SeriesComparison({
     && cursorTimestamp! >= chartBounds.start
     && cursorTimestamp! <= chartBounds.stop,
   );
+  const hoverValues = useMemo(() => {
+    if (!hover) return [];
+    return plottedEntries.flatMap((entry) => {
+      const value = valueAtTime(entry.series, hover.timestamp);
+      if (value === null) return [];
+      const ranges = entry.series.kind === "forecast"
+        && entry.series.memberCount > 1
+        ? {
+          q10: interpolatedValueAtTime(
+            entry.series.dates,
+            entry.series.quantiles.map((item) => item.q10),
+            hover.timestamp,
+          ),
+          q25: interpolatedValueAtTime(
+            entry.series.dates,
+            entry.series.quantiles.map((item) => item.q25),
+            hover.timestamp,
+          ),
+          q75: interpolatedValueAtTime(
+            entry.series.dates,
+            entry.series.quantiles.map((item) => item.q75),
+            hover.timestamp,
+          ),
+          q90: interpolatedValueAtTime(
+            entry.series.dates,
+            entry.series.quantiles.map((item) => item.q90),
+            hover.timestamp,
+          ),
+        }
+        : null;
+      const dataset = availableDatasets.find(
+        (candidate) => candidate.id === entry.datasetId,
+      );
+      return [{
+        datasetId: entry.datasetId,
+        label: entry.label ?? dataset?.label ?? entry.datasetId,
+        color: entryColor(entry, availableDatasets),
+        unit: entry.series.unit,
+        value,
+        ranges,
+      }];
+    });
+  }, [availableDatasets, hover, plottedEntries]);
+
+  const updateHover = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (!chartBounds) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    const chartWidth = Math.max(320, rect.width);
+    const logicalX = (event.clientX - rect.left) * (chartWidth / rect.width);
+    const logicalY = (event.clientY - rect.top) * (204 / rect.height);
+    const plotLeft = 56;
+    const plotRight = chartWidth - 8;
+    const plotTop = 24;
+    const plotBottom = 204 - 28;
+    if (
+      logicalX < plotLeft
+      || logicalX > plotRight
+      || logicalY < plotTop
+      || logicalY > plotBottom
+    ) {
+      setHover(null);
+      return;
+    }
+    const fraction = (logicalX - plotLeft) / Math.max(1, plotRight - plotLeft);
+    const timestamp = nearestTimestamp(
+      chartTimestamps,
+      chartBounds.start + fraction * (chartBounds.stop - chartBounds.start),
+    );
+    const snappedFraction = (timestamp - chartBounds.start)
+      / Math.max(1, chartBounds.stop - chartBounds.start);
+    const visibleX = (
+      plotLeft + snappedFraction * (plotRight - plotLeft)
+    ) * (rect.width / chartWidth);
+    setHover({
+      timestamp,
+      x: visibleX,
+      alignRight: visibleX > rect.width / 2,
+    });
+  };
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -374,6 +498,32 @@ export function SeriesComparison({
         context.stroke();
       });
     }
+    if (hover) {
+      const x = plot.left
+        + ((hover.timestamp - chartBounds.start) / xSpan)
+        * (plot.right - plot.left);
+      context.save();
+      context.strokeStyle = "rgba(255,255,255,0.55)";
+      context.lineWidth = 1;
+      context.beginPath();
+      context.moveTo(x, plot.top);
+      context.lineTo(x, plot.bottom);
+      context.stroke();
+      context.restore();
+
+      plottedEntries.forEach((entry) => {
+        const value = valueAtTime(entry.series, hover.timestamp);
+        if (value === null) return;
+        const [, y] = point(new Date(hover.timestamp), value);
+        context.beginPath();
+        context.arc(x, y, 3.5, 0, Math.PI * 2);
+        context.fillStyle = entryColor(entry, availableDatasets);
+        context.fill();
+        context.strokeStyle = "rgba(255,255,255,0.9)";
+        context.lineWidth = 1;
+        context.stroke();
+      });
+    }
     context.restore();
   }, [
     availableDatasets,
@@ -381,6 +531,7 @@ export function SeriesComparison({
     cursorInRange,
     cursorTimestamp,
     decimals,
+    hover,
     plottedEntries,
     unitLabel,
   ]);
@@ -436,12 +587,48 @@ export function SeriesComparison({
                 : "Map time outside range"}
             </strong>
           </div>
-          <canvas
-            ref={canvasRef}
-            aria-label={cursorInRange && cursorDate
-              ? `Overlaid model time series with map tracer at ${formatUtcRangeDate(cursorDate)}`
-              : "Overlaid model time series"}
-          />
+          <div className="series-chart">
+            <canvas
+              ref={canvasRef}
+              aria-label={cursorInRange && cursorDate
+                ? `Overlaid model time series with map tracer at ${formatUtcRangeDate(cursorDate)}`
+                : "Overlaid model time series"}
+              onPointerMove={updateHover}
+              onPointerLeave={() => setHover(null)}
+            />
+            {hover && hoverValues.length ? (
+              <div
+                className={`series-tooltip ${hover.alignRight ? "right" : ""}`}
+                style={{ left: hover.x }}
+                aria-hidden="true"
+              >
+                <time>{formatUtcRangeDate(new Date(hover.timestamp))}</time>
+                {hoverValues.map((item) => (
+                  <div className="series-tooltip-row" key={item.datasetId}>
+                    <i style={{ background: item.color }} />
+                    <span>
+                      <strong>{item.label}</strong>
+                      {item.ranges
+                        && item.ranges.q10 !== null
+                        && item.ranges.q25 !== null
+                        && item.ranges.q75 !== null
+                        && item.ranges.q90 !== null ? (
+                          <small>
+                            25–75% {item.ranges.q25.toFixed(decimals)}
+                            –{item.ranges.q75.toFixed(decimals)}
+                            {" · "}10–90% {item.ranges.q10.toFixed(decimals)}
+                            –{item.ranges.q90.toFixed(decimals)}
+                          </small>
+                        ) : null}
+                    </span>
+                    <b>
+                      {item.value.toFixed(decimals)} {item.unit}
+                    </b>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </div>
           <div className="series-dates">
             <span>{formatUtcRangeDate(new Date(chartBounds.start))}</span>
             <span>{formatUtcRangeDate(new Date(chartBounds.stop))}</span>

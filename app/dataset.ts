@@ -1487,6 +1487,41 @@ function temporalDimensions(info: StoreInfo, variable: VariableConfig) {
   return { valid, initialization, lead };
 }
 
+export function validDateRange(
+  info: StoreInfo,
+  variable: VariableConfig,
+): { first: Date; last: Date } | undefined {
+  const { valid, initialization, lead } = temporalDimensions(info, variable);
+  if (!initialization) return undefined;
+  const timeAxis = info.axes[initialization];
+  if (!timeAxis?.values.length) return undefined;
+  const endpointDates = [
+    axisValueAsDate(info.dataset, timeAxis, 0).getTime(),
+    axisValueAsDate(
+      info.dataset,
+      timeAxis,
+      timeAxis.values.length - 1,
+    ).getTime(),
+  ];
+  if (!endpointDates.every(Number.isFinite)) return undefined;
+  let first = Math.min(...endpointDates);
+  let last = Math.max(...endpointDates);
+  if (!valid && lead) {
+    const leadAxis = info.axes[lead];
+    const leadOffsets = leadAxis.values.map((_, index) =>
+      timedeltaMilliseconds(leadAxis, index)
+    ).filter(Number.isFinite);
+    if (leadOffsets.length) {
+      first += Math.min(...leadOffsets);
+      last += Math.max(...leadOffsets);
+    }
+  }
+  return {
+    first: new Date(first),
+    last: new Date(last),
+  };
+}
+
 export function selectedValidDate(
   info: StoreInfo,
   variable: VariableConfig,
@@ -1503,6 +1538,19 @@ export function selectedValidDate(
   return new Date(
     base.getTime()
     + timedeltaMilliseconds(info.axes[lead], selections[lead] ?? 0),
+  );
+}
+
+export function seriesStartDate(
+  info: StoreInfo,
+  variable: VariableConfig,
+  selections: AxisSelection,
+) {
+  const { lead } = temporalDimensions(info, variable);
+  return selectedValidDate(
+    info,
+    variable,
+    lead ? { ...selections, [lead]: 0 } : selections,
   );
 }
 

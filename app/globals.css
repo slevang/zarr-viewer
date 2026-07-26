@@ -32,16 +32,19 @@ button { cursor: pointer; }
 .maplibregl-ctrl-attrib { color: #233129; }
 
 .map-toolbar {
+  --toolbar-control-height: 36px;
   position: absolute;
   z-index: 3;
   top: 16px;
   right: 16px;
   display: flex;
+  align-items: flex-start;
   gap: 8px;
 }
 
 .projection-switch {
   display: flex;
+  height: var(--toolbar-control-height);
   gap: 2px;
   padding: 3px;
   border: 1px solid var(--border);
@@ -54,7 +57,6 @@ button { cursor: pointer; }
 .projection-switch button,
 .station-toggle,
 .reset-button {
-  min-height: 32px;
   border: 0;
   border-radius: 6px;
   background: transparent;
@@ -62,20 +64,46 @@ button { cursor: pointer; }
   font-size: 12px;
 }
 
-.projection-switch button { min-width: 56px; padding: 0 12px; }
+.projection-switch button {
+  min-width: 56px;
+  height: 28px;
+  min-height: 28px;
+  padding: 0 12px;
+}
 .projection-switch button.active { background: rgba(255, 255, 255, 0.11); color: var(--text); }
-.station-toggle { display: flex; align-items: center; gap: 7px; padding: 0 12px; border: 1px solid var(--border); background: var(--panel); backdrop-filter: blur(14px); }
+.station-toggle {
+  display: flex;
+  height: var(--toolbar-control-height);
+  min-height: var(--toolbar-control-height);
+  align-items: center;
+  gap: 7px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  backdrop-filter: blur(14px);
+}
 .station-toggle i { width: 7px; height: 7px; border: 1px solid rgba(255, 255, 255, 0.55); border-radius: 50%; background: transparent; }
 .station-toggle.active { color: var(--text); }
 .station-toggle.active i { border-color: #111412; background: #c9cecb; box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.2); }
 .station-toggle.loading i { animation: series-pulse .8s ease-in-out infinite alternate; }
 .station-toggle.error i { border-color: var(--error); }
-.reset-button { padding: 0 13px; border: 1px solid var(--border); background: var(--panel); backdrop-filter: blur(14px); }
+.reset-button {
+  height: var(--toolbar-control-height);
+  min-height: var(--toolbar-control-height);
+  padding: 0 13px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  backdrop-filter: blur(14px);
+}
 .projection-switch button:hover, .station-toggle:hover, .reset-button:hover { color: var(--text); }
-.station-search { position: relative; width: 210px; }
+.station-search {
+  position: relative;
+  width: 210px;
+  height: var(--toolbar-control-height);
+}
 .station-search input {
   width: 100%;
-  height: 34px;
+  height: 100%;
   padding: 0 30px 0 10px;
   border: 1px solid var(--border);
   border-radius: 7px;

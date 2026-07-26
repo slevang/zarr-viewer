@@ -2344,7 +2344,7 @@ export function ZarrViewer() {
 
         <div className="field-grid">
           <label className="field">
-            <span>Dataset <em>{dataset.provider}</em></span>
+            <span>Dataset</span>
             <select
               data-testid="dataset-select"
               value={datasetId}

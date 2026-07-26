@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WeatherNext Credentials · Zarr Viewer</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: ui-sans-serif, system-ui, sans-serif;
+        background: #171914;
+        color: #f2f3ed;
+      }
+      body {
+        min-height: 100vh;
+        box-sizing: border-box;
+        display: grid;
+        place-items: center;
+        margin: 0;
+        padding: 28px;
+      }
+      main {
+        width: min(100%, 390px);
+        padding: 30px;
+        border: 1px solid #4b5046;
+        border-radius: 18px;
+        background: #22251f;
+        box-shadow: 0 20px 60px rgb(0 0 0 / 35%);
+      }
+      h1 {
+        margin: 0 0 12px;
+        font-size: 1.45rem;
+      }
+      button {
+        width: 100%;
+        padding: 12px 16px;
+        border: 1px solid #7f8778;
+        border-radius: 10px;
+        background: #f2f3ed;
+        color: #171914;
+        font: inherit;
+        font-weight: 650;
+        cursor: pointer;
+      }
+      button:disabled {
+        cursor: wait;
+        opacity: 0.55;
+      }
+      #status {
+        min-height: 1.4em;
+        margin: 16px 0 0;
+        color: #ffaaa2;
+        font-size: 0.9rem;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>WeatherNext Credentials</h1>
+      <button id="authorize" type="button" disabled>Loading Google…</button>
+      <p id="status" role="status"></p>
+    </main>
+    <script>
+      (() => {
+        const params = new URL(location.href).searchParams;
+        const clientId = params.get("client_id");
+        const channelName = params.get("channel");
+        const resultKey = `zarr-viewer:google-auth-result:${channelName}`;
+        const scope = "https://www.googleapis.com/auth/devstorage.read_only";
+        const button = document.querySelector("#authorize");
+        const status = document.querySelector("#status");
+        const channel = channelName ? new BroadcastChannel(channelName) : null;
+        let settled = false;
+        let tokenClient;
+
+        const send = (result) => {
+          if (settled) return;
+          settled = true;
+          try {
+            localStorage.setItem(resultKey, JSON.stringify(result));
+          } catch {
+            // BroadcastChannel normally carries the result.
+          }
+          channel?.postMessage(result);
+        };
+        const finish = (result) => {
+          send(result);
+          setTimeout(() => window.close(), 80);
+        };
+        const fail = (message) => {
+          status.textContent = message;
+          button.disabled = false;
+          button.textContent = "Try again";
+        };
+
+        if (!clientId || !channelName) {
+          fail("This authorization window is missing its viewer connection.");
+          return;
+        }
+
+        window.onGoogleIdentityLoad = () => {
+          const oauth2 = window.google?.accounts?.oauth2;
+          if (!oauth2) {
+            fail("Google Identity Services did not initialize.");
+            return;
+          }
+          tokenClient = oauth2.initTokenClient({
+            client_id: clientId,
+            scope,
+            callback: (response) => {
+              if (!response.access_token) {
+                const message = response.error_description
+                  || response.error
+                  || "Google did not return an access token.";
+                finish({ type: "error", message });
+                return;
+              }
+              finish({
+                type: "token",
+                accessToken: response.access_token,
+                expiresIn: Number(response.expires_in || 3600),
+              });
+            },
+            error_callback: (error) => {
+              const message = error.type === "popup_closed"
+                ? "Google authorization was cancelled."
+                : error.type === "popup_failed_to_open"
+                  ? "The Google authorization popup was blocked."
+                  : error.message || error.type
+                    || "Google authorization could not be completed.";
+              finish({ type: "error", message });
+            },
+          });
+          button.disabled = false;
+          button.textContent = "Continue with Google";
+        };
+
+        button.addEventListener("click", () => {
+          if (!tokenClient) return;
+          button.disabled = true;
+          button.textContent = "Waiting for Google…";
+          status.textContent = "";
+          tokenClient.requestAccessToken({ prompt: "" });
+        });
+        window.addEventListener("pagehide", () => {
+          send({ type: "error", message: "Google authorization was cancelled." });
+        });
+
+        const script = document.createElement("script");
+        script.src = "https://accounts.google.com/gsi/client";
+        script.async = true;
+        script.defer = true;
+        script.addEventListener("load", window.onGoogleIdentityLoad);
+        script.addEventListener("error", () => {
+          fail("Google Identity Services could not be loaded.");
+        });
+        document.head.append(script);
+      })();
+    </script>
+  </body>
+</html>

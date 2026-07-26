@@ -6,6 +6,7 @@ import {
   unitKind,
   unitOptions,
 } from "../app/units";
+import { weatherNextVariableUnit } from "../app/dataset";
 
 function close(actual: number, expected: number) {
   if (Math.abs(actual - expected) > 1e-9) {
@@ -27,6 +28,12 @@ if (!["tempK", "tempC", "tempF"].every((unit) =>
 }
 if (nativeUnitOption("degree_Celsius")?.id !== "tempC") {
   throw new Error("Celsius did not resolve to its absolute-temperature unit");
+}
+if (
+  weatherNextVariableUnit("2m_temperature") !== "K"
+  || weatherNextVariableUnit("total_precipitation_6hr") !== "m"
+) {
+  throw new Error("WeatherNext unit fallback metadata is incomplete");
 }
 
 const precipitationOptions = unitOptions("m", "total_precipitation");

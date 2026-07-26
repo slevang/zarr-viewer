@@ -4,11 +4,12 @@ export type DatasetCategory = "forecast" | "analysis";
 
 export type DatasetSourceConfig = {
   id: string;
-  kind: "zarr" | "icechunk";
+  kind: "zarr" | "icechunk" | "weatherzarr" | "weathernext";
   url: string;
   s3Url?: string;
   group?: string;
   zarrVersion: 2 | 3;
+  auth?: "google";
   spatialDimensions?: { lat: string; lon: string };
   bounds?: [number, number, number, number];
   crs?: string;
@@ -19,7 +20,7 @@ export type DatasetSourceConfig = {
 export type DatasetConfig = {
   id: string;
   label: string;
-  provider: "Google" | "dynamical.org" | "Earthmover";
+  provider: string;
   category: DatasetCategory;
   description: string;
   sources: {
@@ -232,6 +233,61 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
 
 export const DATASETS: DatasetConfig[] = [
   {
+    id: "google-weathernext-2",
+    label: "WeatherNext 2 forecast",
+    provider: "Google",
+    category: "forecast",
+    description: "Current global 0.25° 64-member, 15-day AI forecast.",
+    sources: {
+      map: {
+        id: "google-weathernext-2",
+        kind: "weathernext",
+        url: "https://storage.googleapis.com/weathernext/weathernext_2_0_0/zarr",
+        zarrVersion: 2,
+        auth: "google",
+        spatialDimensions: { lat: "lat", lon: "lon" },
+        bounds: [0, -90, 360, 90],
+        crs: "EPSG:4326",
+        latIsAscending: true,
+      },
+    },
+    support: "experimental",
+    supportNote: "Requires Google authorization; each map chunk contains one global ensemble-member field.",
+    defaultVariable: "2m_temperature",
+  },
+  {
+    id: "weatherzarr-ecmwf-ifs",
+    label: "ECMWF IFS forecast",
+    provider: "WeatherZarr",
+    category: "forecast",
+    description: "Current global 0.25° IFS control forecast with paired map and point layouts.",
+    sources: {
+      map: {
+        id: "weatherzarr-ecmwf-ifs-spatial",
+        kind: "weatherzarr",
+        url: "https://weatherzarr.com/data/ecmwf-ifs025/latest.json",
+        zarrVersion: 3,
+        spatialDimensions: { lat: "latitude", lon: "longitude" },
+        bounds: [-180, -90, 180, 90],
+        crs: "EPSG:4326",
+        latIsAscending: false,
+      },
+      series: {
+        id: "weatherzarr-ecmwf-ifs-timeseries",
+        kind: "weatherzarr",
+        url: "https://weatherzarr.com/data/ecmwf-ifs025/latest.json",
+        zarrVersion: 3,
+        spatialDimensions: { lat: "latitude", lon: "longitude" },
+        bounds: [-180, -90, 180, 90],
+        crs: "EPSG:4326",
+        latIsAscending: false,
+      },
+    },
+    support: "experimental",
+    supportNote: "WeatherZarr retains a rolling set of recent operational runs.",
+    defaultVariable: "2t",
+  },
+  {
     id: "google-arco-era5",
     label: "ECMWF ERA5 reanalysis",
     provider: "Google",
@@ -279,6 +335,26 @@ export const DATASETS: DatasetConfig[] = [
     supportNote: "Uses the read-only PCodec WASM decoder.",
     defaultVariable: "t2m",
   },
+  {
+    id: "salient-gemai-v3-reforecast",
+    label: "Salient GemAI v3 reforecast",
+    provider: "Salient",
+    category: "forecast",
+    description: "Global 0.25° 50-member extended-range reforecasts from 2000–2025.",
+    sources: sharedSource({
+      id: "salient-gemai-v3-reforecast",
+      kind: "zarr",
+      url: "https://gemv3-reforecast.salient-open-data.com/forecast",
+      zarrVersion: 3,
+      spatialDimensions: { lat: "lat", lon: "lon" },
+      bounds: [-180, -90, 180, 90],
+      crs: "EPSG:4326",
+      latIsAscending: true,
+    }),
+    support: "experimental",
+    supportNote: "Uses sharded PCodec chunks spanning seven leads and all 50 members.",
+    defaultVariable: "2m_temperature",
+  },
 ];
 
 const DATASET_ALIASES: Record<string, string> = {
@@ -287,7 +363,7 @@ const DATASET_ALIASES: Record<string, string> = {
 };
 
 export const DEFAULT_DATASET_ID =
-  import.meta.env?.VITE_DATASET_ID || "google-arco-era5";
+  import.meta.env?.VITE_DATASET_ID || "weatherzarr-ecmwf-ifs";
 
 export const DATASET_CATEGORY_GROUPS = [
   { id: "forecast", label: "Forecast" },

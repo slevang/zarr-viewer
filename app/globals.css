@@ -143,6 +143,33 @@ button { cursor: pointer; }
 .field > span em { color: rgba(219, 232, 255, 0.72); font-style: normal; }
 .field-heading { display: flex; min-height: 18px; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 11px; }
 .dataset-chunking { color: var(--muted); font-size: 10px; line-height: 1.4; }
+.google-auth-control { display: grid; gap: 5px; }
+.google-auth-control button {
+  display: flex;
+  width: max-content;
+  min-height: 29px;
+  align-items: center;
+  gap: 7px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--control);
+  color: var(--muted);
+  font-size: 10px;
+}
+.google-auth-control button:hover:not(:disabled) { color: var(--text); }
+.google-auth-control i {
+  width: 7px;
+  height: 7px;
+  border: 1px solid currentColor;
+  border-radius: 50%;
+}
+.google-auth-control.connected button { color: #c8e7d2; }
+.google-auth-control.connected i { border-color: #74c88d; background: #74c88d; }
+.google-auth-control.connecting i { animation: series-pulse .8s ease-in-out infinite alternate; }
+.google-auth-control.error button,
+.google-auth-control.error small { color: var(--error); }
+.google-auth-control small { color: var(--muted); font-size: 9px; line-height: 1.35; }
 
 select,
 input[type="datetime-local"] {

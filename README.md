@@ -6,9 +6,11 @@ on an interactive globe. It uses
 MapLibre and reads chunks directly from object storage without an application
 server.
 
-The viewer includes Google ARCO ERA5 plus the public dynamical.org weather
-catalog. Icechunk repositories are opened with `icechunk-js`; variables and
-all non-spatial dimensions are discovered from Zarr metadata. See
+The viewer defaults to the current WeatherZarr ECMWF IFS forecast and also
+includes Google WeatherNext 2 for authorized users, Google ARCO ERA5, Salient
+GemAI v3 reforecasts, and the public dynamical.org weather catalog. Icechunk
+repositories are opened with `icechunk-js`; variables and all non-spatial
+dimensions are discovered from Zarr metadata. See
 [`docs/datasets.md`](docs/datasets.md) for pinned HTTPS/S3 paths and codec
 compatibility.
 
@@ -33,6 +35,9 @@ compatibility.
 - Ensemble forecast envelopes with min/10/25/50/75/90/max quantiles by default
 - Explicit per-dataset opt-in for point time-series extraction
 - Browser Gribberish codec support for virtual HRRR chunks
+- Manifest-backed paired spatial/temporal WeatherZarr stores
+- Browser PCodec and FixedScaleOffset support for GemAI v3 reforecasts
+- In-browser Google OAuth for authorized WeatherNext 2 map reads
 - Static production build with no backend runtime
 
 ## Run locally
@@ -48,8 +53,37 @@ normal macOS/Linux development machine.
 
 Open <http://localhost:3000>.
 
-The Vite development and preview servers include the cross-origin-isolation
-headers required by the virtual HRRR Gribberish decoder.
+The viewer remains cross-origin isolated so the threaded Gribberish decoder is
+always available without a dataset-specific reload. Google authorization runs
+in a small same-origin `/google-auth.html` bridge that is intentionally not
+isolated and returns its result over a browser-local channel. The Vite
+development/preview middleware and static service worker implement these
+per-page headers.
+
+### Google WeatherNext authorization
+
+WeatherNext is not anonymous. Its dataset entry offers a **Connect Google**
+button that requests the read-only Cloud Storage scope with Google Identity
+Services in the non-isolated bridge page. The resulting short-lived access
+token is retained in browser `localStorage`, removed on disconnect or expiry,
+and restored across tabs and browser restarts while still valid. It is never
+placed in a cookie, sent to the application host, or stored as a refresh token;
+this static application does not use or contain a client secret.
+
+The included public OAuth client is configured for the deployed GitHub Pages
+origin. To use another deployment, create a Web application OAuth client and
+set its client ID at build time:
+
+```sh
+VITE_GOOGLE_OAUTH_CLIENT_ID=your-client-id.apps.googleusercontent.com npm run dev
+```
+
+Add the exact development and deployment origins under **Google Auth
+Platform → Clients → Authorized JavaScript origins**, for example
+`http://localhost:3000`, `http://127.0.0.1:3000`, and
+`https://slevang.github.io`. While the app's publishing status is **Testing**,
+also add each Google account under **Google Auth Platform → Audience → Test
+users**. Add the Cloud Storage read-only scope under **Data Access**.
 
 ## Checks
 
@@ -67,9 +101,11 @@ npm test
 - `app/asos.ts` — lazy browser Parquet queries for point observations
 - `app/asos-types.ts` — station, observation, and map-overlay types
 - `app/units.ts` — CF-unit normalization and JS-Quantities conversion layer
+- `app/google-auth.ts` — persistent short-lived Google token and bridge flow
 - `app/codecs/gribberish.ts` — read-only Zarrita codec for virtual GRIB chunks
+- `app/codecs/fixedscaleoffset.ts` — read-only Numcodecs FixedScaleOffset adapter
 - `app/colormaps.ts` — palettes and lightweight default-palette rules
-- `packages/zarrita-pcodec` — Rust/WASM PCodec decoder for Earthmover ERA5
+- `packages/zarrita-pcodec` — Rust/WASM PCodec decoder for Earthmover ERA5 and GemAI v3
 - `scripts/build-coastline.mjs` — generates the bundled Natural Earth coastline
 - `scripts/build-asos-manifest.ts` — refreshes the checked-in active-station GeoJSON
 
@@ -79,8 +115,8 @@ explicit Lambert conformal grid configuration. The materialized HRRR forecast
 is retained for point-series reads but omitted from the map selector; the
 GRIB-backed HRRR forecast is the map source. HRRR additionally
 requires cross-origin-isolation headers because the upstream Gribberish WASM
-package uses shared memory; it is loaded lazily so this requirement does not
-affect other datasets.
+package uses shared memory. The viewer is therefore always isolated; only the
+dedicated Google authorization bridge opts out.
 
 Each logical dataset in `app/catalog.ts` has independent optional `map` and
 `series` sources. The two roles may resolve to the same store, different groups

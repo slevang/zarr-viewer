@@ -1,13 +1,74 @@
 # Open dataset catalog
 
-Checked against the [dynamical.org STAC catalog](https://stac.dynamical.org/catalog.json)
-and the [AWS Open Data ERA5 listing](https://registry.opendata.aws/earthmover-era5/)
-on 2026-07-24.
+Checked against the [dynamical.org STAC catalog](https://stac.dynamical.org/catalog.json),
+the [AWS Open Data ERA5 listing](https://registry.opendata.aws/earthmover-era5/),
+the [WeatherZarr catalog](https://www.weatherzarr.com/), and the
+[GemAI v3 release](https://gemv3.salient-open-data.com/) on 2026-07-25.
 
 The browser uses the HTTPS forms. S3 forms are included for Python, CLI, and
 server-side clients. Dynamical's versions are intentionally pinned: future
 catalog releases can change them, so update `app/catalog.ts` and this table
 together.
+
+## WeatherZarr ECMWF IFS
+
+Latest-run pointer:
+
+- `https://weatherzarr.com/data/ecmwf-ifs025/latest.json`
+- Access: anonymous, CORS-enabled HTTPS
+- Resolution: global 0.25°
+- Retention: rolling 240 hours
+
+Each run publishes one Zarr v3 store per variable and layout. The viewer reads
+the latest pointer and run manifest, then presents the separate stores as one
+logical dataset. The map layout uses chunks of
+`valid_time 1 × latitude 721 × longitude 1024`; the point layout uses
+`valid_time 61 × latitude 64 × longitude 64`. Both use standard bytes and
+Zstandard codecs. The current source variables are `2t`, `2d`, `10u`, `10v`,
+`tcc`, `tp`, `mslp`, `z500`, `t850`, `u250`, and `v250`.
+
+WeatherZarr is the default map because it provides a current, efficiently
+chunked global forecast. It is a new third-party rolling service rather than a
+permanent archive; the catalog entry can be replaced by Dynamical's virtual
+global store when that becomes available.
+
+## Google WeatherNext 2
+
+Repository root:
+
+- HTTPS: `https://storage.googleapis.com/weathernext/weathernext_2_0_0/zarr`
+- Format: consolidated Zarr v2 forecast repositories
+- Grid: global 0.25°
+- Ensemble: 64 samples
+- Forecast range: 60 six-hour steps
+- Access: Google account with WeatherNext Cloud Storage permission
+
+The viewer generates paths directly from a requested initialization date rather
+than listing the bucket. For example:
+
+`2025_to_present/20260725_18hr_01_preds/predictions.zarr`
+
+Dates from 2022–2024 use the corresponding annual period, such as
+`2024_to_2025`. The adapter targets the 00/06/12/18 UTC cycles and probes recent
+generated `.zmetadata` paths backward to tolerate publication latency or a
+missing run. Object reads use a short-lived bearer token obtained by Google
+Identity Services with the `devstorage.read_only` scope.
+
+The token is retained in browser `localStorage`, so tabs, reloads, and browser
+restarts reuse it while it remains valid. It is removed on disconnect or expiry
+and is never sent to the viewer host as a cookie. Authorization occurs in the
+non-isolated `/google-auth.html` bridge while the main viewer remains isolated
+for the HRRR decoder. No OAuth client secret belongs in a static browser
+application.
+
+WeatherNext is currently map-only in the viewer. Its arrays are chunked as one
+sample, one lead time, and a full global field, so a point time series would
+needlessly fetch many complete maps. The viewer supplies an initialization-time
+calendar and slider from the known six-hourly run schedule; changing it opens
+the generated store path, while the native Zarr `time` coordinate remains the
+lead-time selector. While the OAuth app is in Google's Testing state,
+accounts must be explicitly listed under **Google Auth Platform → Audience →
+Test users** and must periodically reauthorize.
 
 ## dynamical.org
 
@@ -82,6 +143,29 @@ pointwise historical series. Both layouts use the `numcodecs.pcodec` codec for
 data arrays. Coordinates use standard codecs. Data arrays are decoded by the
 small Rust/WASM package in `packages/zarrita-pcodec`.
 
+## Salient GemAI v3 reforecast
+
+Repository:
+
+- HTTPS: `https://gemv3-reforecast.salient-open-data.com/forecast`
+- Format: inline-consolidated Zarr v3
+- Coverage: 3,443 forecast dates from 2000–2025
+- Grid: global 0.25°
+- Ensemble: 50 samples
+- Forecast range: 126 days
+
+Data arrays have outer chunks of
+`forecast_date 1 × lead 7 × sample 50 × lat 288 × lon 288` and sharded inner
+chunks of `1 × 7 × 50 × 36 × 36`. The inner codec pipeline combines
+`numcodecs.fixedscaleoffset` with `numcodecs.pcodec`; both read-only adapters
+are registered by the viewer.
+
+The endpoint currently omits browser CORS response headers. Node and server-side
+reads work, including full 50-member point forecasts, but static browser reads
+will fail until the R2 bucket CORS policy allows the viewer origin (or `*` for
+the public dataset). Purge the custom-domain cache after applying the policy so
+existing objects begin returning the new headers.
+
 ## Source-role policy
 
 Catalog entries describe logical datasets rather than individual physical
@@ -92,8 +176,7 @@ stores. Each entry can independently provide `sources.map` and
 - Different groups in one repository cover layouts such as Earthmover ERA5.
 - Different repositories cover HRRR's spatial GRIB-backed maps and materialized
   point forecasts.
-- An absent role disables that capability, as with Google ARCO ERA5 point
-  histories.
+- An absent role disables that capability.
 
 A map click loads the selected logical dataset's series source when present.
 Each read is limited to a 15-day window; ensemble stores are reduced to
@@ -117,6 +200,9 @@ one comparison uses the same scale.
 | --- | --- | --- | --- |
 | Dynamical materialized stores | `icechunk-js` | Zarrita standard codecs | Ready for regular latitude/longitude grids; store reads use a bounded 32-request queue and 1 GiB byte cache |
 | Materialized HRRR forecast | `icechunk-js` | Sharded Blosc/Zstd | Reserved for point-series reads because its time-oriented chunks make map reads impractical |
-| Dynamical virtual HRRR | `icechunk-js` virtual ranges | Gribberish WASM adapter | Codec validated; explicit Lambert conformal grid; requires cross-origin-isolated hosting |
+| Dynamical virtual HRRR | `icechunk-js` virtual ranges | Gribberish WASM adapter | Codec validated; explicit Lambert conformal grid; viewer is always cross-origin isolated |
 | Earthmover ERA5 | `icechunk-js` | PCodec WASM adapter | Ready |
-| Google ARCO ERA5 | FetchStore / consolidated Zarr | Zarrita standard codecs | Ready; retained as the original map source |
+| Google ARCO ERA5 | FetchStore / consolidated Zarr | Zarrita standard codecs | Ready |
+| Google WeatherNext 2 | Authenticated GCS FetchStore | Zarrita standard codecs | Map-only; requires an authorized Google account |
+| WeatherZarr IFS | Manifest-backed multiplexed FetchStore | Zarrita standard codecs | Ready; current default, rolling retention |
+| Salient GemAI v3 | FetchStore / consolidated Zarr | FixedScaleOffset + PCodec WASM | Decoder validated; awaiting data-host CORS |

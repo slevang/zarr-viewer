@@ -60,8 +60,17 @@ import {
   unitOptions,
   type UnitOption,
 } from "./units";
+import {
+  disconnectGoogle,
+  googleAuthSnapshot,
+  hasGoogleAccessToken,
+  requestGoogleAuthorization,
+  subscribeGoogleAuth,
+} from "./google-auth";
 
 type Projection = "globe" | "mercator";
+const DATASET_PARAMETER = "dataset";
+const UNIT_PREFERENCES_STORAGE_KEY = "zarr-viewer:unit-preferences";
 type InspectionPoint = { lng: number; lat: number };
 type Inspector = InspectionPoint & { value: number | null };
 type StationFeatureLike = {
@@ -179,6 +188,35 @@ function chunkingSummary(variable: VariableConfig | null) {
     variable,
     variable.innerChunkShape ?? variable.chunkShape,
   )}`;
+}
+
+function initialDatasetId() {
+  if (typeof window === "undefined") return getDataset(DEFAULT_DATASET_ID).id;
+  const requested = new URL(window.location.href).searchParams.get(
+    DATASET_PARAMETER,
+  );
+  return requested && MAP_DATASETS.some((candidate) => candidate.id === requested)
+    ? requested
+    : getDataset(DEFAULT_DATASET_ID).id;
+}
+
+function storedUnitPreferences() {
+  if (typeof window === "undefined") return {};
+  try {
+    const value = window.localStorage.getItem(UNIT_PREFERENCES_STORAGE_KEY);
+    if (!value) return {};
+    const parsed = JSON.parse(value) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    return Object.fromEntries(
+      Object.entries(parsed).filter(
+        (entry): entry is [string, string] => typeof entry[1] === "string",
+      ),
+    );
+  } catch {
+    return {};
+  }
 }
 
 function playbackPrefetchProfile(
@@ -367,6 +405,19 @@ function decimalsForRange([min, max]: readonly [number, number]) {
   if (width >= 10) return 1;
   if (width >= 1) return 2;
   return 3;
+}
+
+function roundToSignificant(value: number, digits = 6) {
+  return value === 0 ? 0 : Number(value.toPrecision(digits));
+}
+
+function roundRangeToSignificant(
+  range: readonly [number, number],
+): [number, number] {
+  return [
+    roundToSignificant(range[0]),
+    roundToSignificant(range[1]),
+  ];
 }
 
 function fullRange(value: unknown): [number, number] | null {
@@ -599,6 +650,7 @@ export function ZarrViewer() {
   const playbackPrefetchGenerationRef = useRef(0);
   const playbackViewportMovingRef = useRef(false);
   const rememberedValidDateRef = useRef<Date | undefined>(undefined);
+  const weatherNextStoreGenerationRef = useRef(0);
   const resetPlaybackPrefetchRef = useRef<() => void>(() => {});
   const startSeriesComparisonRef = useRef<(point: InspectionPoint) => void>(() => {});
   const startAsosComparisonRef = useRef<(station: AsosStation) => void>(() => {});
@@ -608,14 +660,17 @@ export function ZarrViewer() {
   ) => void>(() => {});
 
   const [datasetId, setDatasetId] = useState(
-    () => getDataset(DEFAULT_DATASET_ID).id,
+    initialDatasetId,
   );
+  const [googleAuth, setGoogleAuth] = useState(googleAuthSnapshot);
   const [info, setInfo] = useState<StoreInfo | null>(null);
   const [variable, setVariable] = useState<VariableConfig | null>(null);
   const [selections, setSelections] = useState<AxisSelection>({});
   const [opacity, setOpacity] = useState(1);
   const [activeDisplayRange, setActiveDisplayRange] = useState<[number, number]>([0, 1]);
-  const [unitPreferences, setUnitPreferences] = useState<Record<string, string>>({});
+  const [unitPreferences, setUnitPreferences] = useState<Record<string, string>>(
+    storedUnitPreferences,
+  );
   const [colormapId, setColormapId] = useState(DEFAULT_COLORMAP.id);
   const [colormapOpen, setColormapOpen] = useState(false);
   const [editingLimit, setEditingLimit] = useState<Limit | null>(null);
@@ -644,6 +699,9 @@ export function ZarrViewer() {
   );
 
   const dataset = getDataset(datasetId);
+  const googleAuthRequired = dataset.sources.map?.auth === "google";
+  const googleConnected = googleAuth.phase === "connected"
+    && hasGoogleAccessToken();
   const variableUnitContext = variable
     ? `${variable.id} ${variable.label}`
     : "";
@@ -702,16 +760,36 @@ export function ZarrViewer() {
     () => `linear-gradient(90deg, ${colormap.colors.join(", ")})`,
     [colormap],
   );
+
+  useEffect(() => subscribeGoogleAuth(setGoogleAuth), []);
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        UNIT_PREFERENCES_STORAGE_KEY,
+        JSON.stringify(unitPreferences),
+      );
+    } catch {
+      // Unit selection still works for the current session without storage.
+    }
+  }, [unitPreferences]);
   const activeAxes = useMemo(() => {
     if (!info || !variable) return [];
-    return variable.dimensions.flatMap((dimension) => {
+    const dimensions = [
+      ...Object.values(info.axes)
+        .filter((axis) => axis.requiresStoreReload)
+        .map((axis) => axis.id),
+      ...variable.dimensions,
+    ];
+    return [...new Set(dimensions)].flatMap((dimension) => {
       const axis = info.axes[dimension];
       return axis ? [axis] : [];
     });
   }, [info, variable]);
   const compactPlaybackAxes = useMemo(
     () => activeAxes.filter(
-      (axis) => axis.kind === "time" || axis.kind === "timedelta",
+      (axis) => (
+        axis.kind === "time" || axis.kind === "timedelta"
+      ) && !axis.requiresStoreReload,
     ),
     [activeAxes],
   );
@@ -955,7 +1033,25 @@ export function ZarrViewer() {
     });
 
     try {
-      const comparisonInfo = await loadStoreInfo(comparisonDatasetId, "series");
+      const sourceInitializationAxis = comparisonDatasetId === sourceInfo.dataset.id
+        ? Object.values(sourceInfo.axes).find(
+          (axis) => axis.requiresStoreReload && axis.kind === "time",
+        )
+        : undefined;
+      const comparisonTargetDate = sourceInitializationAxis
+        ? axisValueAsDate(
+          sourceInfo.dataset,
+          sourceInitializationAxis,
+          selectionsRef.current[sourceInitializationAxis.id]
+            ?? sourceInitializationAxis.defaultIndex
+            ?? 0,
+        )
+        : anchorDate;
+      const comparisonInfo = await loadStoreInfo(
+        comparisonDatasetId,
+        "series",
+        comparisonTargetDate,
+      );
       if (signal.aborted || generation !== seriesRequestGeneration.current) return;
       const comparisonVariable = matchingVariable(comparisonInfo, sourceVariable);
       if (!comparisonVariable) {
@@ -982,9 +1078,7 @@ export function ZarrViewer() {
         entry.datasetId === comparisonDatasetId
           ? {
             ...entry,
-            message: isForecastSeries(comparisonInfo, comparisonVariable)
-              ? "Computing ensemble quantiles…"
-              : "Loading 15 days…",
+            message: "Loading timeseries…",
           }
           : entry
       ));
@@ -1260,10 +1354,10 @@ export function ZarrViewer() {
         || variableRef.current?.id !== currentVariable.id
       ) return;
       const rangeFromData: [number, number] | null = extents.length
-        ? [
+        ? roundRangeToSignificant([
           Math.min(...extents.map(([min]) => min)),
           Math.max(...extents.map(([, max]) => max)),
-        ]
+        ])
         : null;
       if (!rangeFromData) return;
       displayRangesRef.current.set(
@@ -1509,6 +1603,7 @@ export function ZarrViewer() {
     if (!mapReady) return;
     let cancelled = false;
     const installDataset = async () => {
+      weatherNextStoreGenerationRef.current += 1;
       setPlayingAxis(null);
       resetPlaybackPrefetchRef.current();
       seriesRequestControllerRef.current?.abort();
@@ -1516,7 +1611,21 @@ export function ZarrViewer() {
       setLoadState(loadingState("Opening dataset…"));
       setInfo(null);
       setVariable(null);
-      const nextInfo = await loadStoreInfo(datasetId);
+      if (googleAuthRequired && !hasGoogleAccessToken()) {
+        const map = mapRef.current;
+        if (map?.getLayer(ZARR_LAYER_ID)) map.removeLayer(ZARR_LAYER_ID);
+        layerRef.current = null;
+        setLoadState({
+          phase: "ready",
+          message: "WeatherNext credentials required",
+        });
+        return;
+      }
+      const nextInfo = await loadStoreInfo(
+        datasetId,
+        "map",
+        rememberedValidDateRef.current,
+      );
       if (cancelled) return;
       const nextVariable = nextInfo.variables.find(
         (candidate) => candidate.id === nextInfo.dataset.defaultVariable,
@@ -1595,7 +1704,7 @@ export function ZarrViewer() {
       requestGeneration.current += 1;
       rangeGeneration.current += 1;
     };
-  }, [datasetId, mapReady]);
+  }, [datasetId, googleAuthRequired, googleConnected, mapReady]);
 
   useEffect(() => {
     if (loadState.phase !== "ready" || !needsRangeEstimateRef.current) return;
@@ -1759,6 +1868,97 @@ export function ZarrViewer() {
     }
   };
 
+  const changeWeatherNextInitialization = async (
+    initializationDate: Date,
+    desiredSelections: AxisSelection,
+  ) => {
+    if (!info || !variable) return;
+    const generation = ++weatherNextStoreGenerationRef.current;
+    setLoadState(loadingState());
+    try {
+      const nextInfo = await loadStoreInfo(
+        info.dataset.id,
+        "map",
+        initializationDate,
+      );
+      if (generation !== weatherNextStoreGenerationRef.current) return;
+      const nextVariable = nextInfo.variables.find(
+        (candidate) => candidate.id === variable.id,
+      ) ?? nextInfo.variables.find(
+        (candidate) => candidate.id === nextInfo.dataset.defaultVariable,
+      ) ?? nextInfo.variables[0];
+      const physicalSelections = { ...desiredSelections };
+      for (const axis of Object.values(nextInfo.axes)) {
+        if (axis.requiresStoreReload) delete physicalSelections[axis.id];
+      }
+      const reconciled = reconcileSelections(
+        nextInfo,
+        nextVariable,
+        physicalSelections,
+      );
+      const nextSelections = rememberedValidDateRef.current
+        ? selectionsForValidDate(
+          nextInfo,
+          nextVariable,
+          rememberedValidDateRef.current,
+          reconciled,
+        )
+        : reconciled;
+      const map = mapRef.current;
+      if (!map) return;
+      const { ZarrLayer } = await import("@carbonplan/zarr-layer");
+      if (generation !== weatherNextStoreGenerationRef.current) return;
+      const nextLayer = new ZarrLayer({
+        id: ZARR_LAYER_ID,
+        variable: nextVariable.id,
+        selector: selectorFor(nextVariable, nextSelections),
+        colormap: [...colormap.colors],
+        clim: activeDisplayRange,
+        opacity: opacityRef.current,
+        ...nextInfo.layerOptions,
+        onLoadingStateChange: (loading) => {
+          if (generation !== weatherNextStoreGenerationRef.current) return;
+          if (loading.error) setLoadState(errorState(loading.error));
+          else if (loading.loading) setLoadState(loadingState());
+          else setLoadState(READY_STATE);
+        },
+      });
+      if (map.getLayer(ZARR_LAYER_ID)) map.removeLayer(ZARR_LAYER_ID);
+      const firstSymbol = map.getStyle().layers?.find(
+        (candidate) => candidate.type === "symbol",
+      )?.id;
+      const beforeLayer = map.getLayer("basemap-coastline")
+        ? "basemap-coastline"
+        : firstSymbol;
+      map.addLayer(
+        nextLayer as unknown as import("maplibre-gl").CustomLayerInterface,
+        beforeLayer,
+      );
+      layerRef.current = nextLayer;
+      infoRef.current = nextInfo;
+      variableRef.current = nextVariable;
+      selectionsRef.current = nextSelections;
+      rememberedValidDateRef.current = selectedValidDate(
+        nextInfo,
+        nextVariable,
+        nextSelections,
+      ) ?? rememberedValidDateRef.current;
+      setInfo(nextInfo);
+      setVariable(nextVariable);
+      setSelections(nextSelections);
+      const point = inspectionPointRef.current;
+      if (point) {
+        startSeriesComparisonRef.current(point);
+        const station = asosStationRef.current;
+        if (station) startAsosComparisonRef.current(station);
+      }
+    } catch (error) {
+      if (generation === weatherNextStoreGenerationRef.current) {
+        setLoadState(errorState(error));
+      }
+    }
+  };
+
   const changeAxis = (axis: AxisConfig, nextIndex: number, manual = true) => {
     if (!info || !variable) return;
     const clamped = Math.max(0, Math.min(axis.values.length - 1, nextIndex));
@@ -1777,6 +1977,13 @@ export function ZarrViewer() {
       resetPlaybackPrefetch();
       setPlayingAxis(null);
     }
+    if (axis.requiresStoreReload) {
+      void changeWeatherNextInitialization(
+        axisValueAsDate(info.dataset, axis, clamped),
+        next,
+      );
+      return;
+    }
     void applySelector(variable, next).then(() => {
       const point = inspectionPointRef.current;
       if (manual && axis.kind === "time" && point) {
@@ -1791,7 +1998,9 @@ export function ZarrViewer() {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) return;
       const axis = activeAxes.find((candidate) =>
-        candidate.kind === "time" || candidate.kind === "timedelta",
+        candidate.kind === "timedelta" && !candidate.requiresStoreReload
+      ) ?? activeAxes.find((candidate) =>
+        candidate.kind === "time" && !candidate.requiresStoreReload
       ) ?? activeAxes[0];
       if (!axis) return;
       if (event.key === "ArrowLeft") changeAxis(axis, (selectionsRef.current[axis.id] ?? 0) - 1);
@@ -1818,7 +2027,22 @@ export function ZarrViewer() {
         selectionsRef.current,
       ) ?? rememberedValidDateRef.current;
     }
-    setDatasetId(nextDatasetId);
+    weatherNextStoreGenerationRef.current += 1;
+    const nextDataset = getDataset(nextDatasetId);
+    setDatasetId(nextDataset.id);
+  };
+
+  const toggleGoogleAuthorization = async () => {
+    if (googleAuth.phase === "connected") {
+      disconnectGoogle();
+      return;
+    }
+    try {
+      await requestGoogleAuthorization();
+    } catch {
+      // The auth control displays popup and consent errors without replacing
+      // the map's independent loading state.
+    }
   };
 
   const togglePlayback = (axis: AxisConfig) => {
@@ -1871,7 +2095,9 @@ export function ZarrViewer() {
   const beginLimitEdit = (limit: Limit) => {
     setColormapOpen(false);
     setEditingLimit(limit);
-    setLimitDraft(String(limit === "min" ? legendMin : legendMax));
+    setLimitDraft(String(roundToSignificant(
+      limit === "min" ? legendMin : legendMax,
+    )));
   };
 
   const commitLimitEdit = () => {
@@ -1881,9 +2107,9 @@ export function ZarrViewer() {
       const updated: [number, number] = [legendMin, legendMax];
       updated[editingLimit === "min" ? 0 : 1] = next;
       if (updated[0] < updated[1]) {
-        const rawUpdated = selectedUnit
+        const rawUpdated = roundRangeToSignificant(selectedUnit
           ? convertUnitRange(updated, selectedUnit.id, variable.unit)
-          : updated;
+          : updated);
         if (info && variable) {
           displayRangesRef.current.set(
             displayRangeKey(info.dataset.id, variable.id),
@@ -2139,7 +2365,33 @@ export function ZarrViewer() {
                 </optgroup>
               ))}
             </select>
-            <small className="dataset-chunking">{chunkingSummary(variable)}</small>
+            <small className="dataset-chunking">
+              {googleAuthRequired && !googleConnected && !variable
+                ? "WeatherNext credentials required."
+                : chunkingSummary(variable)}
+            </small>
+            {googleAuthRequired ? (
+              <div className={`google-auth-control ${googleAuth.phase}`}>
+                <button
+                  type="button"
+                  disabled={googleAuth.phase === "connecting"}
+                  onClick={() => void toggleGoogleAuthorization()}
+                  title={googleAuth.phase === "connected"
+                    ? "Forget the saved WeatherNext credentials"
+                    : googleAuth.message}
+                >
+                  <i aria-hidden="true" />
+                  {googleAuth.phase === "connected"
+                    ? "WeatherNext Authenticated"
+                    : googleAuth.phase === "connecting"
+                      ? "Authenticating…"
+                      : "WeatherNext Credentials"}
+                </button>
+                {googleAuth.phase === "error" ? (
+                  <small>{googleAuth.message}</small>
+                ) : null}
+              </div>
+            ) : null}
           </label>
 
           <div className="field">
@@ -2197,7 +2449,9 @@ export function ZarrViewer() {
 
           {activeAxes.map((axis) => {
             const selected = selections[axis.id] ?? 0;
-            const canPlay = axis.kind === "time" || axis.kind === "timedelta";
+            const canPlay = (
+              axis.kind === "time" || axis.kind === "timedelta"
+            ) && !axis.requiresStoreReload;
             return (
               <div className="axis-control" key={axis.id}>
                 <div className="axis-heading">

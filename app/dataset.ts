@@ -2,7 +2,12 @@ import { IcechunkStore } from "icechunk-js";
 import proj4 from "proj4";
 import * as zarr from "zarrita";
 import type { Selector, TransformRequest } from "@carbonplan/zarr-layer";
-import type { Readable } from "zarrita";
+import type {
+  AbsolutePath,
+  GetOptions,
+  RangeQuery,
+  Readable,
+} from "zarrita";
 import {
   getDataset,
   getDatasetSource,
@@ -11,10 +16,15 @@ import {
   type DatasetSourceRole,
 } from "./catalog";
 import { createBoundedAsyncQueue } from "./async-queue";
+import { registerFixedScaleOffset } from "./codecs/fixedscaleoffset";
 import { registerGribberishCodec } from "./codecs/gribberish";
 import { registerPcodec } from "./codecs/pcodec";
+import {
+  googleAuthorizedFetch,
+} from "./google-auth";
 
 registerGribberishCodec();
+registerFixedScaleOffset();
 registerPcodec();
 
 export type AxisKind = "time" | "timedelta" | "number" | "category";
@@ -25,6 +35,8 @@ export type AxisConfig = {
   unit: string;
   kind: AxisKind;
   values: Array<number | string>;
+  defaultIndex?: number;
+  requiresStoreReload?: boolean;
 };
 
 export type VariableConfig = {
@@ -115,6 +127,47 @@ type ConsolidatedMetadata = {
   metadata?: Record<string, Record<string, unknown>>;
 };
 
+type ZarrV2ArrayMetadata = {
+  shape?: unknown;
+  chunks?: unknown;
+  dtype?: unknown;
+};
+
+type ZarrV3RootMetadata = {
+  zarr_format?: number;
+  node_type?: string;
+  attributes?: Record<string, unknown>;
+  consolidated_metadata?: {
+    kind?: string;
+    metadata?: Record<string, ZarrMetadata>;
+  };
+};
+
+type WeatherZarrStore = {
+  var: string;
+  layout: "spatial" | "timeseries";
+  key: string;
+  units?: string;
+  chunks: number[];
+  shape: number[];
+  dims: string[];
+  url?: string;
+};
+
+type WeatherZarrManifest = {
+  run: string;
+  stores: WeatherZarrStore[];
+};
+
+type WeatherZarrCatalogRun = {
+  run: string;
+  manifest: string;
+};
+
+type WeatherZarrCatalog = {
+  models?: Record<string, WeatherZarrCatalogRun[]>;
+};
+
 export type AxisSelection = Record<string, number>;
 
 const GOOGLE_TIME_ORIGIN_MS = Date.UTC(1900, 0, 1);
@@ -170,6 +223,7 @@ function axisKind(name: string, attrs: Record<string, unknown>, dataType = ""): 
 }
 
 function axisLabel(name: string, attrs: Record<string, unknown>) {
+  if (name.toLowerCase() === "sample") return "Ensemble member";
   const longName = typeof attrs.long_name === "string" ? attrs.long_name.trim() : "";
   return longName || name.replaceAll("_", " ");
 }
@@ -205,7 +259,7 @@ function defaultLayerOptions(
 }
 
 function cacheStoreReads(
-  store: IcechunkStore,
+  store: Readable,
   limit = STORE_READ_CONCURRENCY,
   maxBytes = STORE_READ_CACHE_BYTES,
 ): Readable {
@@ -270,15 +324,20 @@ function cacheStoreReads(
     return promise;
   };
 
-  const cachedGet: IcechunkStore["get"] = (...args) =>
-    read(`get:${args[0]}`, () => store.get(...args));
-  const cachedGetRange: IcechunkStore["getRange"] = (...args) =>
-    read(`range:${args[0]}:${JSON.stringify(args[1])}`, () => store.getRange(...args));
+  const cachedGet = (key: AbsolutePath, options?: GetOptions) =>
+    read(`get:${key}`, () => Promise.resolve(store.get(key, options)));
+  const cachedGetRange = store.getRange
+    ? (key: AbsolutePath, query: RangeQuery, options?: GetOptions) =>
+      read(
+        `range:${key}:${JSON.stringify(query)}`,
+        () => Promise.resolve(store.getRange?.(key, query, options)),
+      )
+    : undefined;
 
   return new Proxy(store, {
     get(target, property) {
       if (property === "get") return cachedGet;
-      if (property === "getRange") return cachedGetRange;
+      if (property === "getRange" && cachedGetRange) return cachedGetRange;
       const value = Reflect.get(target, property, target) as unknown;
       return typeof value === "function"
         ? (value as (...args: unknown[]) => unknown).bind(target)
@@ -387,6 +446,747 @@ async function loadIcechunkStoreInfo(
     axes,
     store,
     layerOptions: defaultLayerOptions(source, cacheStoreReads(store)),
+  };
+}
+
+function variablesFromV3Metadata(
+  metadata: Record<string, ZarrMetadata>,
+  source: DatasetSourceConfig,
+) {
+  const variables: VariableConfig[] = [];
+  const dimensionLengths = new Map<string, number>();
+
+  for (const [id, arrayMetadata] of Object.entries(metadata)) {
+    if (arrayMetadata.node_type !== "array") continue;
+    const dimensions = arrayMetadata.dimension_names?.filter(
+      (dimension): dimension is string => typeof dimension === "string",
+    ) ?? [];
+    const hasLatitude = dimensions.some((dimension) =>
+      ["latitude", "lat", "y", source.spatialDimensions?.lat].includes(dimension),
+    );
+    const hasLongitude = dimensions.some((dimension) =>
+      ["longitude", "lon", "x", source.spatialDimensions?.lon].includes(dimension),
+    );
+    if (!hasLatitude || !hasLongitude) continue;
+
+    dimensions.forEach((dimension, index) => {
+      if (!isSpatialDimension(dimension, source)) {
+        dimensionLengths.set(
+          dimension,
+          Math.max(
+            dimensionLengths.get(dimension) ?? 0,
+            arrayMetadata.shape?.[index] ?? 0,
+          ),
+        );
+      }
+    });
+
+    const attrs = arrayMetadata.attributes ?? {};
+    const longName = typeof attrs.long_name === "string" ? attrs.long_name.trim() : "";
+    variables.push({
+      id,
+      label: longName || id.replaceAll("_", " "),
+      unit: typeof attrs.units === "string" ? attrs.units : "",
+      standardName: typeof attrs.standard_name === "string"
+        ? attrs.standard_name
+        : undefined,
+      dimensions,
+      shape: arrayMetadata.shape,
+      chunkShape: arrayMetadata.chunk_grid?.configuration?.chunk_shape,
+      innerChunkShape: arrayMetadata.codecs?.find(
+        (codec) => codec.name === "sharding_indexed",
+      )?.configuration?.chunk_shape,
+      dataType: arrayMetadata.data_type,
+    });
+  }
+
+  variables.sort((a, b) =>
+    a.label.localeCompare(b.label, undefined, { sensitivity: "base" }),
+  );
+  return { variables, dimensionLengths };
+}
+
+async function readV3Coordinate(
+  store: Readable,
+  metadata: Record<string, ZarrMetadata>,
+  dimension: string,
+  expectedLength: number,
+): Promise<AxisConfig> {
+  const arrayMetadata = metadata[dimension];
+  const attrs = arrayMetadata?.attributes ?? {};
+  let values: Array<number | string>;
+
+  if (
+    arrayMetadata?.node_type === "array"
+    && product(arrayMetadata.shape ?? []) <= 1_000_000
+  ) {
+    const array = await zarr.open(zarr.root(store).resolve(dimension), {
+      kind: "array",
+    });
+    const result = await zarr.get(array);
+    values = Array.from(result.data as ArrayLike<unknown>, normalizeValue);
+  } else {
+    values = Array.from({ length: expectedLength }, (_, index) => index);
+  }
+
+  return {
+    id: dimension,
+    label: axisLabel(dimension, attrs),
+    unit: typeof attrs.units === "string" ? attrs.units : "",
+    kind: axisKind(dimension, attrs, arrayMetadata?.data_type),
+    values,
+  };
+}
+
+async function fetchV3Root(url: string) {
+  const response = await fetch(`${url.replace(/\/$/, "")}/zarr.json`);
+  if (!response.ok) {
+    throw new Error(`Zarr metadata request failed (${response.status})`);
+  }
+  const root = await response.json() as ZarrV3RootMetadata;
+  const metadata = root.consolidated_metadata?.metadata;
+  if (!metadata) {
+    throw new Error("The Zarr v3 store does not contain inline consolidated metadata");
+  }
+  return { root, metadata };
+}
+
+async function axesFromV3Metadata(
+  store: Readable,
+  metadata: Record<string, ZarrMetadata>,
+  dimensionLengths: Map<string, number>,
+) {
+  const axes: Record<string, AxisConfig> = {};
+  await Promise.all(Array.from(dimensionLengths, async ([dimension, length]) => {
+    axes[dimension] = await readV3Coordinate(
+      store,
+      metadata,
+      dimension,
+      length,
+    );
+  }));
+  return axes;
+}
+
+async function loadV3StoreInfo(
+  dataset: DatasetConfig,
+  source: DatasetSourceConfig,
+  role: DatasetSourceRole,
+): Promise<StoreInfo> {
+  const { metadata } = await fetchV3Root(source.url);
+  const store = new zarr.FetchStore(source.url);
+  const { variables, dimensionLengths } = variablesFromV3Metadata(
+    metadata,
+    source,
+  );
+  if (!variables.length) {
+    throw new Error("This store did not report any compatible spatial variables");
+  }
+  const axes = await axesFromV3Metadata(store, metadata, dimensionLengths);
+  const timeLength = dimensionLengths.get("time");
+  if (
+    timeLength
+    && metadata.datetime?.node_type === "array"
+    && metadata.datetime.dimension_names?.includes("time")
+  ) {
+    const validTime = await readV3Coordinate(
+      store,
+      metadata,
+      "datetime",
+      timeLength,
+    );
+    axes.time = {
+      ...validTime,
+      id: "time",
+      label: "Valid time",
+      kind: "time",
+    };
+  }
+  const cachedStore = cacheStoreReads(store);
+
+  return {
+    dataset,
+    source,
+    role,
+    variables,
+    axes,
+    store: cachedStore,
+    layerOptions: defaultLayerOptions(source, cachedStore),
+  };
+}
+
+function googleStorageLocation(url: string) {
+  const parsed = new URL(url);
+  if (parsed.hostname !== "storage.googleapis.com") {
+    throw new Error(`Unsupported Google Cloud Storage URL: ${url}`);
+  }
+  const [bucket, ...objectParts] = parsed.pathname
+    .split("/")
+    .filter(Boolean)
+    .map(decodeURIComponent);
+  if (!bucket || !objectParts.length) {
+    throw new Error(`Google Cloud Storage URL does not include an object path: ${url}`);
+  }
+  return { bucket, object: objectParts.join("/") };
+}
+
+function googleStorageMediaUrl(url: string) {
+  const { bucket, object } = googleStorageLocation(url);
+  return `https://storage.googleapis.com/download/storage/v1/b/${
+    encodeURIComponent(bucket)
+  }/o/${encodeURIComponent(object)}?alt=media`;
+}
+
+async function fetchWeatherNextObject(request: Request) {
+  const response = await googleAuthorizedFetch(
+    new Request(googleStorageMediaUrl(request.url), request),
+  );
+  if (!response.ok || !new URL(request.url).pathname.endsWith("/.zarray")) {
+    return response;
+  }
+  const metadata = await response.clone().json() as Record<string, unknown>;
+  if (
+    typeof metadata.dtype !== "string"
+    || !/^([<|>])[mM]8\[[^\]]+\]$/.test(metadata.dtype)
+  ) {
+    return response;
+  }
+  metadata.dtype = metadata.dtype.replace(/[mM]8\[[^\]]+\]$/, "i8");
+  const headers = new Headers(response.headers);
+  headers.delete("content-length");
+  headers.delete("content-encoding");
+  headers.delete("etag");
+  return new Response(JSON.stringify(metadata), {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+function weatherNextPeriod(date: Date) {
+  const year = date.getUTCFullYear();
+  if (year >= 2025) return "2025_to_present";
+  if (year >= 2022) return `${year}_to_${year + 1}`;
+  throw new Error("WeatherNext 2 forecasts are only available from 2022");
+}
+
+function weatherNextDateId(date: Date) {
+  return [
+    date.getUTCFullYear().toString().padStart(4, "0"),
+    (date.getUTCMonth() + 1).toString().padStart(2, "0"),
+    date.getUTCDate().toString().padStart(2, "0"),
+  ].join("");
+}
+
+export function weatherNextStoreUrl(
+  sourceRoot: string,
+  initializationDate: Date,
+) {
+  const root = sourceRoot.replace(/\/$/, "");
+  const cycleHour = Math.floor(initializationDate.getUTCHours() / 6) * 6;
+  const run = `${weatherNextDateId(initializationDate)}_${
+    cycleHour.toString().padStart(2, "0")
+  }hr_01_preds`;
+  return `${root}/${weatherNextPeriod(initializationDate)}/${run}/predictions.zarr`;
+}
+
+function weatherNextCycleAtOrBefore(date: Date) {
+  return new Date(Date.UTC(
+    date.getUTCFullYear(),
+    date.getUTCMonth(),
+    date.getUTCDate(),
+    Math.floor(date.getUTCHours() / 6) * 6,
+  ));
+}
+
+function previousWeatherNextCycle(date: Date, offset: number) {
+  return new Date(
+    weatherNextCycleAtOrBefore(date).getTime() - offset * 6 * HOUR_MS,
+  );
+}
+
+async function resolveWeatherNextStore(
+  source: DatasetSourceConfig,
+  targetDate?: Date,
+) {
+  const now = new Date();
+  const requested = targetDate && Number.isFinite(targetDate.getTime())
+    ? targetDate
+    : now;
+  const start = requested.getTime() > now.getTime() ? now : requested;
+
+  for (let offset = 0; offset < 16; offset += 1) {
+    const candidateDate = previousWeatherNextCycle(start, offset);
+    if (candidateDate.getUTCFullYear() < 2022) break;
+    const url = weatherNextStoreUrl(source.url, candidateDate);
+    const response = await googleAuthorizedFetch(
+      googleStorageMediaUrl(`${url}/.zmetadata`),
+      { cache: "no-store" },
+    );
+    if (response.ok) {
+      return {
+        url,
+        initializationDate: candidateDate,
+        consolidated: await response.json() as ConsolidatedMetadata,
+      };
+    }
+    if (response.status === 404) continue;
+    if (response.status === 403) {
+      throw new Error(
+        "This Google account does not have access to this WeatherNext forecast",
+      );
+    }
+    const detail = (await response.text()).slice(0, 300);
+    throw new Error(
+      `WeatherNext metadata request failed (${response.status})${
+        detail ? `: ${detail}` : ""
+      }`,
+    );
+  }
+  throw new Error(
+    "No WeatherNext forecast was found in the recent six-hour cycles near the selected date",
+  );
+}
+
+function numericArray(value: unknown): number[] | undefined {
+  return Array.isArray(value)
+    && value.every((item) => typeof item === "number")
+    ? value
+    : undefined;
+}
+
+const WEATHER_NEXT_UNITS: Record<string, string> = {
+  total_precipitation_6hr: "m",
+  "10m_u_component_of_wind": "m/s",
+  "10m_v_component_of_wind": "m/s",
+  "100m_u_component_of_wind": "m/s",
+  "100m_v_component_of_wind": "m/s",
+  "100m_wind_speed": "m/s",
+  "2m_temperature": "K",
+  mean_sea_level_pressure: "Pa",
+  sea_surface_temperature: "K",
+  geopotential: "m^2/s^2",
+  specific_humidity: "kg/kg",
+  temperature: "K",
+  u_component_of_wind: "m/s",
+  v_component_of_wind: "m/s",
+  vertical_velocity: "Pa/s",
+};
+
+export function weatherNextVariableUnit(variableId: string) {
+  return WEATHER_NEXT_UNITS[variableId] ?? "";
+}
+
+function metadataUnit(
+  attrs: Record<string, unknown>,
+  source: DatasetSourceConfig,
+  variableId: string,
+) {
+  const entry = Object.entries(attrs).find(([key, value]) =>
+    ["unit", "units"].includes(key.toLowerCase())
+    && typeof value === "string"
+  );
+  if (entry && typeof entry[1] === "string") return entry[1];
+  return source.kind === "weathernext"
+    ? weatherNextVariableUnit(variableId)
+    : "";
+}
+
+function variablesFromV2Metadata(
+  consolidated: ConsolidatedMetadata,
+  source: DatasetSourceConfig,
+) {
+  const metadata = consolidated.metadata ?? {};
+  const variables: VariableConfig[] = [];
+  const dimensionLengths = new Map<string, number>();
+
+  for (const [key, attrs] of Object.entries(metadata)) {
+    if (!key.endsWith("/.zattrs")) continue;
+    const id = key.slice(0, -"/.zattrs".length);
+    if (id.includes("/")) continue;
+    const dimensions = attrs._ARRAY_DIMENSIONS;
+    if (
+      !Array.isArray(dimensions)
+      || !dimensions.every((value) => typeof value === "string")
+    ) continue;
+    const typedDimensions = dimensions as string[];
+    const hasLatitude = typedDimensions.some((dimension) =>
+      ["latitude", "lat", "y", source.spatialDimensions?.lat].includes(dimension)
+    );
+    const hasLongitude = typedDimensions.some((dimension) =>
+      ["longitude", "lon", "x", source.spatialDimensions?.lon].includes(dimension)
+    );
+    if (!hasLatitude || !hasLongitude) continue;
+
+    const arrayMetadata = metadata[`${id}/.zarray`] as
+      | ZarrV2ArrayMetadata
+      | undefined;
+    const shape = numericArray(arrayMetadata?.shape);
+    typedDimensions.forEach((dimension, index) => {
+      if (!isSpatialDimension(dimension, source)) {
+        dimensionLengths.set(
+          dimension,
+          Math.max(
+            dimensionLengths.get(dimension) ?? 0,
+            shape?.[index] ?? 0,
+          ),
+        );
+      }
+    });
+    const longName = typeof attrs.long_name === "string"
+      ? attrs.long_name.trim()
+      : "";
+    variables.push({
+      id,
+      label: longName || id.replaceAll("_", " "),
+      unit: metadataUnit(attrs, source, id),
+      standardName: typeof attrs.standard_name === "string"
+        ? attrs.standard_name
+        : undefined,
+      dimensions: typedDimensions,
+      shape,
+      chunkShape: numericArray(arrayMetadata?.chunks),
+      dataType: typeof arrayMetadata?.dtype === "string"
+        ? arrayMetadata.dtype
+        : undefined,
+    });
+  }
+  variables.sort((first, second) =>
+    first.label.localeCompare(second.label, undefined, { sensitivity: "base" })
+  );
+  return { variables, dimensionLengths };
+}
+
+async function readV2Coordinate(
+  store: Readable,
+  consolidated: ConsolidatedMetadata,
+  dimension: string,
+  expectedLength: number,
+): Promise<AxisConfig> {
+  const metadata = consolidated.metadata ?? {};
+  const attrs = metadata[`${dimension}/.zattrs`] ?? {};
+  const arrayMetadata = metadata[`${dimension}/.zarray`] as
+    | ZarrV2ArrayMetadata
+    | undefined;
+  const shape = numericArray(arrayMetadata?.shape);
+  let values: Array<number | string>;
+
+  if (shape && product(shape) <= 1_000_000) {
+    const array = await zarr.open(zarr.root(store).resolve(dimension), {
+      kind: "array",
+    });
+    const result = await zarr.get(array);
+    values = Array.from(result.data as ArrayLike<unknown>, normalizeValue);
+  } else {
+    values = Array.from({ length: expectedLength }, (_, index) => index);
+  }
+
+  const dataType = typeof arrayMetadata?.dtype === "string"
+    ? arrayMetadata.dtype
+    : "";
+  return {
+    id: dimension,
+    label: axisLabel(dimension, attrs),
+    unit: typeof attrs.units === "string" ? attrs.units : "",
+    kind: axisKind(dimension, attrs, dataType),
+    values,
+  };
+}
+
+async function loadWeatherNextStoreInfo(
+  dataset: DatasetConfig,
+  source: DatasetSourceConfig,
+  role: DatasetSourceRole,
+  targetDate?: Date,
+): Promise<StoreInfo> {
+  const { url, initializationDate, consolidated } = await resolveWeatherNextStore(
+    source,
+    targetDate,
+  );
+  const resolvedSource = { ...source, url };
+  const store = new zarr.FetchStore(url, {
+    fetch: fetchWeatherNextObject,
+  });
+  const { variables, dimensionLengths } = variablesFromV2Metadata(
+    consolidated,
+    resolvedSource,
+  );
+  if (!variables.length) {
+    throw new Error("WeatherNext did not report any compatible spatial variables");
+  }
+  const axes: Record<string, AxisConfig> = {};
+  await Promise.all(Array.from(dimensionLengths, async ([dimension, length]) => {
+    axes[dimension] = await readV2Coordinate(
+      store,
+      consolidated,
+      dimension,
+      length,
+    );
+  }));
+  const timeMetadata = consolidated.metadata?.["time/.zarray"] as
+    | ZarrV2ArrayMetadata
+    | undefined;
+  if (axes.time) {
+    const durationUnit = typeof timeMetadata?.dtype === "string"
+      && timeMetadata.dtype.toLowerCase().includes("m8[ns]")
+      ? "nanoseconds"
+      : axes.time.unit || "seconds";
+    axes.time = {
+      ...axes.time,
+      label: "Lead time",
+      kind: "timedelta",
+      unit: durationUnit,
+    };
+  }
+  const firstInitialization = Date.UTC(2022, 0, 1);
+  const lastInitialization = weatherNextCycleAtOrBefore(new Date()).getTime();
+  const initializationValues = Array.from(
+    {
+      length: Math.floor(
+        (lastInitialization - firstInitialization) / (6 * HOUR_MS),
+      ) + 1,
+    },
+    (_, index) => (firstInitialization + index * 6 * HOUR_MS) / 1_000,
+  );
+  axes.init_time = {
+    id: "init_time",
+    label: "Initialization time",
+    unit: "seconds since 1970-01-01T00:00:00Z",
+    kind: "time",
+    values: initializationValues,
+    defaultIndex: Math.max(
+      0,
+      Math.min(
+        initializationValues.length - 1,
+        Math.round(
+          (initializationDate.getTime() - firstInitialization) / (6 * HOUR_MS),
+        ),
+      ),
+    ),
+    requiresStoreReload: true,
+  };
+  const cachedStore = cacheStoreReads(store);
+  return {
+    dataset,
+    source: resolvedSource,
+    role,
+    variables,
+    axes,
+    store: cachedStore,
+    layerOptions: defaultLayerOptions(resolvedSource, cachedStore),
+  };
+}
+
+function weatherZarrProxyUrl(key: string) {
+  const normalized = key.replace(/^\/+/, "").replace(/^wxmap\//, "");
+  return `https://weatherzarr.com/${normalized}`;
+}
+
+function weatherZarrRunDate(run: string) {
+  const match = run.match(
+    /^(\d{4})(\d{2})(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?Z$/,
+  );
+  return match
+    ? new Date(Date.UTC(
+      Number(match[1]),
+      Number(match[2]) - 1,
+      Number(match[3]),
+      Number(match[4]),
+      Number(match[5]),
+      Number(match[6] ?? 0),
+    ))
+    : new Date(run);
+}
+
+async function resolveWeatherZarrManifest(
+  latestUrl: string,
+  targetDate?: Date,
+) {
+  const parsed = new URL(latestUrl);
+  const segments = parsed.pathname.split("/").filter(Boolean);
+  const dataIndex = segments.indexOf("data");
+  const model = dataIndex >= 0 ? segments[dataIndex + 1] : undefined;
+  const catalogResponse = await fetch(
+    new URL("/catalog.json", parsed.origin),
+    { cache: "no-store" },
+  );
+  if (!catalogResponse.ok) {
+    throw new Error(`WeatherZarr catalog request failed (${catalogResponse.status})`);
+  }
+  const catalog = await catalogResponse.json() as WeatherZarrCatalog;
+  const runs = model ? catalog.models?.[model] ?? [] : [];
+  if (!runs.length) {
+    throw new Error("WeatherZarr catalog did not report any available runs");
+  }
+  const selectedRun = targetDate && Number.isFinite(targetDate.getTime())
+    ? runs.reduce((nearest, candidate) => (
+      Math.abs(weatherZarrRunDate(candidate.run).getTime() - targetDate.getTime())
+        < Math.abs(weatherZarrRunDate(nearest.run).getTime() - targetDate.getTime())
+        ? candidate
+        : nearest
+    ))
+    : runs.reduce((latest, candidate) => (
+      weatherZarrRunDate(candidate.run).getTime()
+        > weatherZarrRunDate(latest.run).getTime()
+        ? candidate
+        : latest
+    ));
+  const manifestResponse = await fetch(
+    weatherZarrProxyUrl(selectedRun.manifest),
+    { cache: "no-store" },
+  );
+  if (!manifestResponse.ok) {
+    throw new Error(`WeatherZarr manifest request failed (${manifestResponse.status})`);
+  }
+  const manifest = await manifestResponse.json() as WeatherZarrManifest;
+  return { manifest, runs, selectedRun };
+}
+
+function createWeatherZarrStore(
+  rootMetadata: ZarrV3RootMetadata,
+  metadata: Record<string, ZarrMetadata>,
+  storesByNode: Map<string, zarr.FetchStore>,
+  fallbackStore: zarr.FetchStore,
+): Readable {
+  const rootBytes = new TextEncoder().encode(JSON.stringify({
+    ...rootMetadata,
+    consolidated_metadata: {
+      kind: "inline",
+      must_understand: false,
+      metadata,
+    },
+  }));
+  const route = (key: string) => {
+    const node = key.split("/").filter(Boolean)[0];
+    return storesByNode.get(node) ?? fallbackStore;
+  };
+  const range = (
+    bytes: Uint8Array,
+    query: Parameters<NonNullable<Readable["getRange"]>>[1],
+  ) => {
+    if ("suffixLength" in query) {
+      return bytes.slice(Math.max(0, bytes.length - query.suffixLength));
+    }
+    return bytes.slice(query.offset, query.offset + query.length);
+  };
+  return {
+    async get(key, options) {
+      if (key === "/zarr.json") return rootBytes;
+      return route(key).get(key, options);
+    },
+    async getRange(key, query, options) {
+      if (key === "/zarr.json") return range(rootBytes, query);
+      return route(key).getRange(key, query, options);
+    },
+  };
+}
+
+async function loadWeatherZarrStoreInfo(
+  dataset: DatasetConfig,
+  source: DatasetSourceConfig,
+  role: DatasetSourceRole,
+  targetDate?: Date,
+): Promise<StoreInfo> {
+  const { manifest, runs, selectedRun } = await resolveWeatherZarrManifest(
+    source.url,
+    targetDate,
+  );
+  const layout = role === "map" ? "spatial" : "timeseries";
+  const entries = manifest.stores.filter((entry) => entry.layout === layout);
+  if (!entries.length) {
+    throw new Error(`WeatherZarr run ${manifest.run} has no ${layout} stores`);
+  }
+
+  const roots = await Promise.all(entries.map(async (entry) => {
+    const url = weatherZarrProxyUrl(entry.key);
+    const { root, metadata } = await fetchV3Root(url);
+    return {
+      entry,
+      url,
+      root,
+      metadata,
+      store: new zarr.FetchStore(url),
+    };
+  }));
+  const combinedMetadata: Record<string, ZarrMetadata> = {};
+  const storesByNode = new Map<string, zarr.FetchStore>();
+  for (const item of roots) {
+    for (const [node, metadata] of Object.entries(item.metadata)) {
+      if (node === item.entry.var || !(node in combinedMetadata)) {
+        combinedMetadata[node] = metadata;
+      }
+      if (node === item.entry.var || !storesByNode.has(node)) {
+        storesByNode.set(node, item.store);
+      }
+    }
+  }
+  const first = roots[0];
+  const multiplexed = createWeatherZarrStore(
+    first.root,
+    combinedMetadata,
+    storesByNode,
+    first.store,
+  );
+  const { variables, dimensionLengths } = variablesFromV3Metadata(
+    combinedMetadata,
+    source,
+  );
+  if (!variables.length) {
+    throw new Error("WeatherZarr did not report any compatible spatial variables");
+  }
+  const axes = await axesFromV3Metadata(
+    multiplexed,
+    combinedMetadata,
+    dimensionLengths,
+  );
+  const validTimeLength = dimensionLengths.get("valid_time");
+  if (
+    validTimeLength
+    && combinedMetadata.step?.node_type === "array"
+    && combinedMetadata.step.dimension_names?.includes("valid_time")
+  ) {
+    const leadTime = await readV3Coordinate(
+      multiplexed,
+      combinedMetadata,
+      "step",
+      validTimeLength,
+    );
+    axes.valid_time = {
+      ...leadTime,
+      id: "valid_time",
+      label: "Lead time",
+      kind: "timedelta",
+    };
+  }
+  const initializationValues = runs
+    .map((run) => weatherZarrRunDate(run.run).getTime() / 1_000)
+    .filter(Number.isFinite)
+    .sort((a, b) => a - b);
+  const selectedInitialization = weatherZarrRunDate(selectedRun.run).getTime() / 1_000;
+  axes.init_time = {
+    id: "init_time",
+    label: "Initialization time",
+    unit: "seconds since 1970-01-01T00:00:00Z",
+    kind: "time",
+    values: initializationValues,
+    defaultIndex: Math.max(
+      0,
+      initializationValues.findIndex(
+        (value) => value === selectedInitialization,
+      ),
+    ),
+    requiresStoreReload: true,
+  };
+  const cachedStore = cacheStoreReads(multiplexed);
+
+  return {
+    dataset,
+    source,
+    role,
+    variables,
+    axes,
+    store: cachedStore,
+    layerOptions: defaultLayerOptions(source, cachedStore),
   };
 }
 
@@ -546,6 +1346,7 @@ const storeInfoPromises = new Map<string, Promise<StoreInfo>>();
 export function loadStoreInfo(
   datasetId: string,
   role: DatasetSourceRole = "map",
+  targetDate?: Date,
 ) {
   const dataset = getDataset(datasetId);
   const source = getDatasetSource(dataset, role);
@@ -554,14 +1355,25 @@ export function loadStoreInfo(
       new Error(`This dataset does not define a ${role} store`),
     );
   }
-  const cacheKey = `${dataset.id}:${role}:${source.id}`;
+  const targetKey = (
+    source.kind === "weathernext" || source.kind === "weatherzarr"
+  ) && targetDate
+    ? `:${targetDate.toISOString().slice(0, 13)}`
+    : "";
+  const cacheKey = `${dataset.id}:${role}:${source.id}${targetKey}`;
   const cached = storeInfoPromises.get(cacheKey);
   if (cached) return cached;
 
   const promise = (
     source.kind === "icechunk"
       ? loadIcechunkStoreInfo(dataset, source, role)
-      : loadGoogleStoreInfo(dataset, source, role)
+      : source.kind === "weatherzarr"
+        ? loadWeatherZarrStoreInfo(dataset, source, role, targetDate)
+        : source.kind === "weathernext"
+          ? loadWeatherNextStoreInfo(dataset, source, role, targetDate)
+        : dataset.id === "google-arco-era5"
+          ? loadGoogleStoreInfo(dataset, source, role)
+          : loadV3StoreInfo(dataset, source, role)
   ).catch((error) => {
     storeInfoPromises.delete(cacheKey);
     throw error;
@@ -572,19 +1384,34 @@ export function loadStoreInfo(
 
 export function defaultSelections(info: StoreInfo, variable: VariableConfig): AxisSelection {
   const selections: AxisSelection = {};
+  const hasLeadAxis = variable.dimensions.some(
+    (candidate) => info.axes[candidate]?.kind === "timedelta",
+  );
   for (const dimension of variable.dimensions) {
     const axis = info.axes[dimension];
     if (!axis) continue;
     const historicalSeries = info.role === "series"
-      && !variable.dimensions.some(
-        (candidate) => info.axes[candidate]?.kind === "timedelta",
-      );
+      && !hasLeadAxis;
+    const forecastValidTime = info.dataset.category === "forecast"
+      && axis.kind === "time"
+      && (
+        dimension.toLowerCase().includes("valid")
+        || info.source.kind === "weathernext"
+      )
+      && !hasLeadAxis;
     selections[dimension] = axis.kind === "time"
-      ? Math.max(
+      ? forecastValidTime
+        ? 0
+        : Math.max(
         0,
         axis.values.length - (historicalSeries ? SERIES_LOOKAHEAD_HOURS : 1),
       )
       : 0;
+  }
+  for (const axis of Object.values(info.axes)) {
+    if (axis.requiresStoreReload) {
+      selections[axis.id] = axis.defaultIndex ?? 0;
+    }
   }
   return selections;
 }
@@ -595,7 +1422,13 @@ export function reconcileSelections(
   current: AxisSelection,
 ) {
   const next = defaultSelections(info, variable);
-  for (const dimension of variable.dimensions) {
+  const selectableDimensions = new Set([
+    ...variable.dimensions,
+    ...Object.values(info.axes)
+      .filter((axis) => axis.requiresStoreReload)
+      .map((axis) => axis.id),
+  ]);
+  for (const dimension of selectableDimensions) {
     const axis = info.axes[dimension];
     const selected = current[dimension];
     if (!axis || selected === undefined) continue;
@@ -605,7 +1438,13 @@ export function reconcileSelections(
 }
 
 function temporalDimensions(info: StoreInfo, variable: VariableConfig) {
-  const time = variable.dimensions.filter(
+  const dimensions = [
+    ...variable.dimensions,
+    ...Object.values(info.axes)
+      .filter((axis) => axis.requiresStoreReload)
+      .map((axis) => axis.id),
+  ];
+  const time = dimensions.filter(
     (dimension) => info.axes[dimension]?.kind === "time",
   );
   const valid = time.find((dimension) =>
@@ -613,10 +1452,12 @@ function temporalDimensions(info: StoreInfo, variable: VariableConfig) {
   );
   const initialization = valid
     ?? time.find((dimension) =>
-      ["init_time", "forecast_reference_time"].includes(dimension.toLowerCase()),
+      ["init_time", "forecast_reference_time", "forecast_date"].includes(
+        dimension.toLowerCase(),
+      ),
     )
     ?? time[0];
-  const lead = variable.dimensions.find(
+  const lead = dimensions.find(
     (dimension) => info.axes[dimension]?.kind === "timedelta",
   );
   return { valid, initialization, lead };
@@ -699,9 +1540,11 @@ export function selectionsForValidDate(
   const next = { ...initial };
   const { valid, initialization } = temporalDimensions(info, variable);
   if (!initialization || !Number.isFinite(validDate.getTime())) return next;
-  next[initialization] = valid
-    ? axisIndexForDate(info.dataset, info.axes[initialization], validDate)
-    : latestTimeIndexAtOrBefore(info, info.axes[initialization], validDate);
+  if (!info.axes[initialization].requiresStoreReload) {
+    next[initialization] = valid
+      ? axisIndexForDate(info.dataset, info.axes[initialization], validDate)
+      : latestTimeIndexAtOrBefore(info, info.axes[initialization], validDate);
+  }
   return matchLeadToValidDate(info, variable, next, validDate);
 }
 
@@ -871,7 +1714,13 @@ export function toDataCoordinates(
   longitude: number,
   latitude: number,
 ): [number, number] {
-  if (dataset.id === "google-arco-era5") {
+  const source = getDatasetSource(dataset, "map");
+  if (
+    source?.crs === "EPSG:4326"
+    && source.bounds
+    && source.bounds[0] >= 0
+    && source.bounds[2] > 180
+  ) {
     return [((longitude % 360) + 360) % 360, latitude];
   }
   return [longitude, latitude];
@@ -894,6 +1743,20 @@ function nearestCoordinateIndex(values: ArrayLike<number>, target: number) {
   return Math.abs(values[low] - target) < Math.abs(values[previous] - target)
     ? low
     : previous;
+}
+
+function nearestLongitudeIndex(values: ArrayLike<number>, target: number) {
+  let nearestIndex = 0;
+  let nearestDistance = Infinity;
+  for (let index = 0; index < values.length; index += 1) {
+    const difference = ((Number(values[index]) - target + 540) % 360) - 180;
+    const distance = Math.abs(difference);
+    if (distance < nearestDistance) {
+      nearestDistance = distance;
+      nearestIndex = index;
+    }
+  }
+  return nearestIndex;
 }
 
 function spatialDimension(
@@ -966,7 +1829,9 @@ async function pointSpatialSelection(
     latitudeDimension,
     longitudeDimension,
     latitudeIndex: nearestCoordinateIndex(latitudeValues, sourceLatitude),
-    longitudeIndex: nearestCoordinateIndex(longitudeValues, sourceLongitude),
+    longitudeIndex: info.source.proj4
+      ? nearestCoordinateIndex(longitudeValues, sourceLongitude)
+      : nearestLongitudeIndex(longitudeValues, sourceLongitude),
   };
 }
 
@@ -1071,10 +1936,17 @@ export async function loadPointForecast(
   options: PointSeriesLoadOptions = {},
 ): Promise<PointForecastSeries | null> {
   if (info.role !== "series" || !info.store) return null;
-  const initDimension = variable.dimensions.find(
+  const initDimension = [
+    ...variable.dimensions,
+    ...Object.values(info.axes)
+      .filter((axis) => axis.requiresStoreReload)
+      .map((axis) => axis.id),
+  ].find(
     (dimension) =>
       info.axes[dimension]?.kind === "time"
-      && ["init_time", "forecast_reference_time"].includes(dimension.toLowerCase()),
+      && ["init_time", "forecast_reference_time", "forecast_date"].includes(
+        dimension.toLowerCase(),
+      ),
   );
   const leadDimension = variable.dimensions.find(
     (dimension) => info.axes[dimension]?.kind === "timedelta",

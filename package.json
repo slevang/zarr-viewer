@@ -12,6 +12,7 @@
     "build:coastline": "node scripts/build-coastline.mjs",
     "check:static": "node scripts/check-static-build.mjs",
     "check:data": "tsx scripts/check-remote-data.ts",
+    "check:new-data": "tsx scripts/check-new-data.ts",
     "check:queue": "tsx scripts/check-async-queue.ts",
     "check:variables": "tsx scripts/check-common-variables.ts",
     "check:time": "tsx scripts/check-time-axes.ts",

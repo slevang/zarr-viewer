@@ -1,16 +1,44 @@
 import assert from "node:assert/strict";
-import type { DatasetConfig } from "../app/catalog";
+import { getDataset, type DatasetConfig } from "../app/catalog";
 import {
   axisDateMatch,
   axisIndexForDate,
   axisValueAsDate,
+  defaultSelections,
   selectionsAfterAxisChange,
   selectionsForValidDate,
+  selectorFor,
   selectedValidDate,
+  toDataCoordinates,
+  weatherNextStoreUrl,
   type AxisConfig,
   type StoreInfo,
   type VariableConfig,
 } from "../app/dataset";
+
+const weatherNextRoot =
+  "https://storage.googleapis.com/weathernext/weathernext_2_0_0/zarr";
+assert.equal(
+  weatherNextStoreUrl(weatherNextRoot, new Date("2026-07-25T18:00:00Z")),
+  `${weatherNextRoot}/2025_to_present/20260725_18hr_01_preds/predictions.zarr`,
+);
+assert.equal(
+  weatherNextStoreUrl(weatherNextRoot, new Date("2024-02-03T18:00:00Z")),
+  `${weatherNextRoot}/2024_to_2025/20240203_18hr_01_preds/predictions.zarr`,
+);
+assert.equal(
+  weatherNextStoreUrl(weatherNextRoot, new Date("2024-02-03T07:59:00Z")),
+  `${weatherNextRoot}/2024_to_2025/20240203_06hr_01_preds/predictions.zarr`,
+);
+
+assert.deepEqual(
+  toDataCoordinates(getDataset("google-arco-era5"), -98, 38.5),
+  [262, 38.5],
+);
+assert.deepEqual(
+  toDataCoordinates(getDataset("weatherzarr-ecmwf-ifs"), -98, 38.5),
+  [-98, 38.5],
+);
 
 const dataset = {
   id: "time-axis-check",
@@ -180,6 +208,69 @@ assert.deepEqual(cannotPreserveBeforeInitialization, {
   lead_time: 0,
 });
 
+const weatherNextInfo = {
+  ...forecastInfo,
+  source: {
+    ...forecastInfo.source,
+    kind: "weathernext",
+    zarrVersion: 2,
+  },
+  axes: {
+    init_time: {
+      ...forecastInfo.axes.init_time,
+      defaultIndex: 1,
+      requiresStoreReload: true,
+    },
+    time: {
+      id: "time",
+      label: "Lead time",
+      unit: "hours",
+      kind: "timedelta",
+      values: [0, 6, 12, 18],
+    },
+    sample: {
+      id: "sample",
+      label: "Sample",
+      unit: "",
+      kind: "number",
+      values: [0, 1],
+    },
+  },
+} satisfies StoreInfo;
+const weatherNextVariable = {
+  ...forecastVariable,
+  dimensions: ["sample", "time", "lat", "lon"],
+} satisfies VariableConfig;
+assert.deepEqual(
+  defaultSelections(weatherNextInfo, weatherNextVariable),
+  { sample: 0, time: 0, init_time: 1 },
+);
+const weatherNextAtNoon = selectionsForValidDate(
+  weatherNextInfo,
+  weatherNextVariable,
+  new Date("2021-02-07T12:00:00Z"),
+);
+assert.deepEqual(weatherNextAtNoon, {
+  sample: 0,
+  time: 1,
+  init_time: 1,
+});
+assert.equal(
+  selectedValidDate(
+    weatherNextInfo,
+    weatherNextVariable,
+    weatherNextAtNoon,
+  )?.toISOString(),
+  "2021-02-07T12:00:00.000Z",
+);
+assert.deepEqual(
+  selectorFor(weatherNextVariable, weatherNextAtNoon),
+  {
+    sample: { selected: 0, type: "index" },
+    time: { selected: 1, type: "index" },
+  },
+);
+
 const analysisInfo = {
   ...forecastInfo,
   source: {
@@ -210,5 +301,62 @@ const mappedAnalysis = selectionsForValidDate(
   )!,
 );
 assert.deepEqual(mappedAnalysis, { time: 1 });
+
+const validTimeForecastInfo = {
+  ...forecastInfo,
+  dataset: {
+    ...dataset,
+    category: "forecast",
+  },
+  axes: {
+    valid_time: {
+      id: "valid_time",
+      label: "Valid time",
+      unit: "hours since 2026-07-25T12:00:00",
+      kind: "time",
+      values: [0, 3, 6, 9],
+    },
+  },
+} satisfies StoreInfo;
+const validTimeForecastVariable = {
+  ...forecastVariable,
+  dimensions: ["valid_time", "latitude", "longitude"],
+} satisfies VariableConfig;
+assert.deepEqual(
+  defaultSelections(validTimeForecastInfo, validTimeForecastVariable),
+  { valid_time: 0 },
+);
+
+const forecastDateInfo = {
+  ...forecastInfo,
+  axes: {
+    forecast_date: {
+      id: "forecast_date",
+      label: "Forecast date",
+      unit: "days since 2021-02-07T00:00:00",
+      kind: "time",
+      values: [0, 1, 2],
+    },
+    lead: {
+      id: "lead",
+      label: "Lead",
+      unit: "hours",
+      kind: "timedelta",
+      values: [0, 6, 12],
+    },
+  },
+} satisfies StoreInfo;
+const forecastDateVariable = {
+  ...forecastVariable,
+  dimensions: ["forecast_date", "lead", "sample", "latitude", "longitude"],
+} satisfies VariableConfig;
+assert.deepEqual(
+  selectionsForValidDate(
+    forecastDateInfo,
+    forecastDateVariable,
+    new Date("2021-02-08T06:00:00Z"),
+  ),
+  { forecast_date: 1, lead: 1 },
+);
 
 console.log("Time-axis checks passed");

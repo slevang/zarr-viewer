@@ -80,6 +80,30 @@ assertMatches("Earthmover ERA5", [
   "v10:v10",
 ]);
 
+assertMatches("Salient GemAI v3", [
+  variable("2m_temperature", "2 metre temperature"),
+  variable(
+    "mean_2m_dewpoint_temperature",
+    "Mean 2 metre dewpoint temperature",
+  ),
+  variable(
+    "mean_total_precipitation_rate",
+    "Mean total precipitation rate",
+    "precipitation_flux",
+  ),
+  variable(
+    "mean_surface_downward_short_wave_radiation_flux",
+    "Mean surface downward short wave radiation flux",
+  ),
+  variable("mean_total_cloud_cover", "Mean total cloud cover"),
+], [
+  "t2m:2m_temperature",
+  "d2m:mean_2m_dewpoint_temperature",
+  "tp:mean_total_precipitation_rate",
+  "ssrd:mean_surface_downward_short_wave_radiation_flux",
+  "tcc:mean_total_cloud_cover",
+]);
+
 assertMatches("No false solar aggregate", [
   variable("downward_diffuse_short_wave_radiation_flux_surface"),
   variable("downward_direct_short_wave_radiation_flux_surface"),

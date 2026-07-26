@@ -225,7 +225,7 @@ export function SeriesComparison({
     context.fillStyle = "rgba(219,232,255,0.7)";
     context.textBaseline = "middle";
     context.textAlign = "left";
-    context.fillText(`Value (${unitLabel})`, 5, 10);
+    context.fillText(unitLabel, 5, 10);
 
     context.lineWidth = 1;
     for (const fraction of [0, 0.25, 0.5, 0.75, 1]) {
@@ -429,7 +429,7 @@ export function SeriesComparison({
       {chartBounds ? (
         <>
           <div className="series-heading">
-            <span>15-day comparison · UTC · {unitLabel}</span>
+            <span>15-day timeseries</span>
             <strong>
               {cursorInRange && cursorDate
                 ? `Map ${formatUtcRangeDate(cursorDate)}`
@@ -462,8 +462,8 @@ export function SeriesComparison({
             ? entry.series.kind === "forecast"
               ? entry.series.memberCount > 1
                 ? `${entry.series.variableLabel} · ${entry.series.memberCount} members · median + 10–90 / 25–75%`
-                : `${entry.series.variableLabel} · ${entry.series.quantiles.length} deterministic steps`
-              : `${entry.series.variableLabel} · ${entry.series.values.length} values`
+                : entry.series.variableLabel
+              : entry.series.variableLabel
             : entry.message;
           return (
             <div className={`series-list-item ${entry.phase}`} key={entry.datasetId}>

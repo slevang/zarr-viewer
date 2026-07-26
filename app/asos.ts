@@ -6,6 +6,7 @@ import {
 } from "hyparquet";
 import { compressors } from "hyparquet-compressors";
 import type { VariableConfig } from "./dataset";
+import { executeDerivedPipeline } from "./derived-variables";
 import type {
   AsosRecord,
   AsosStation,
@@ -34,12 +35,9 @@ const ASOS_COLUMNS = [
 ];
 
 type AsosVariable = {
-  column: keyof Pick<
-    AsosRecord,
-    "tmpc" | "dwpc" | "relh" | "sknt" | "mslp" | "p01m"
-  >;
   label: string;
   unit: string;
+  values: (records: AsosRecord[]) => Array<number | null>;
 };
 
 type YearFile = {
@@ -152,7 +150,76 @@ function asDate(value: unknown) {
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
-function observationVariable(variable: VariableConfig): AsosVariable | null {
+type DirectAsosColumn = keyof Pick<
+  AsosRecord,
+  "tmpc" | "dwpc" | "relh" | "sknt" | "mslp" | "p01m"
+>;
+
+function directObservation(
+  column: DirectAsosColumn,
+  label: string,
+  unit: string,
+): AsosVariable {
+  return {
+    label,
+    unit,
+    values: (records) => records.map((record) => record[column]),
+  };
+}
+
+function derivedObservation(variable: VariableConfig): AsosVariable | null {
+  if (!variable.derived) return null;
+  const inputUnits: Record<string, string> = {
+    temperature: "°C",
+    dew_point: "°C",
+    u: "knot",
+    v: "knot",
+  };
+  const inputs = Object.entries(variable.derived.inputs);
+  if (inputs.some(([key]) => !inputUnits[key])) return null;
+
+  const nativeVariables: VariableConfig[] = inputs.map(([key, id]) => ({
+    id,
+    label: `ASOS ${key}`,
+    unit: inputUnits[key],
+    dimensions: ["valid"],
+  }));
+  return {
+    label: variable.label,
+    unit: variable.unit,
+    values: (records) => {
+      const requireWindDirection = (
+        variable.derived?.key === "wind_direction_10m"
+      );
+      const values = Object.fromEntries(inputs.map(([key]) => [
+        key,
+        records.map((record) => {
+          if (key === "temperature") return record.tmpc ?? NaN;
+          if (key === "dew_point") return record.dwpc ?? NaN;
+          if (record.sknt === null) return NaN;
+          if (requireWindDirection && record.drct === null) return NaN;
+          const direction = (record.drct ?? 0) * Math.PI / 180;
+          return key === "u"
+            ? -record.sknt * Math.sin(direction)
+            : -record.sknt * Math.cos(direction);
+        }),
+      ]));
+      const derived = executeDerivedPipeline(
+        variable,
+        nativeVariables,
+        values,
+      );
+      return Array.from(
+        derived.values,
+        (value) => Number.isFinite(value) ? value : null,
+      );
+    },
+  };
+}
+
+export function observationVariable(variable: VariableConfig): AsosVariable | null {
+  const derived = derivedObservation(variable);
+  if (derived) return derived;
   const id = variable.id.toLowerCase();
   const name = `${variable.id} ${variable.label} ${variable.standardName ?? ""}`
     .toLowerCase();
@@ -162,7 +229,11 @@ function observationVariable(variable: VariableConfig): AsosVariable | null {
     || name.includes("dew point")
     || name.includes("dew_point")
   );
-  if (dewPoint) return { column: "dwpc", label: "2 m dew point", unit: "°C" };
+  if (dewPoint) return directObservation(
+    "dwpc",
+    "2 m dew point",
+    "°C",
+  );
 
   const temperature = (
     id === "t2m"
@@ -172,30 +243,34 @@ function observationVariable(variable: VariableConfig): AsosVariable | null {
     || name.includes("2 metre temperature")
   );
   if (temperature) {
-    return { column: "tmpc", label: "2 m temperature", unit: "°C" };
+    return directObservation("tmpc", "2 m temperature", "°C");
   }
   if (name.includes("relative humidity") || id === "r2") {
-    return { column: "relh", label: "relative humidity", unit: "%" };
+    return directObservation("relh", "relative humidity", "%");
   }
   if (
     (name.includes("wind speed") || id === "si10")
     && !name.includes("component")
   ) {
-    return { column: "sknt", label: "wind speed", unit: "knot" };
+    return directObservation("sknt", "wind speed", "knot");
   }
   if (
     name.includes("mean sea level pressure")
     || name.includes("mean_sea_level_pressure")
     || id === "msl"
   ) {
-    return { column: "mslp", label: "mean sea-level pressure", unit: "hPa" };
+    return directObservation("mslp", "mean sea-level pressure", "hPa");
   }
   if (
     name.includes("precipitation")
     || name.includes("precip")
     || id === "tp"
   ) {
-    return { column: "p01m", label: "one-hour precipitation", unit: "mm" };
+    return directObservation(
+      "p01m",
+      "one-hour precipitation",
+      "mm",
+    );
   }
   return null;
 }
@@ -317,9 +392,10 @@ export async function loadAsosWindow(
     } satisfies AsosRecord];
   }).sort((a, b) => a.valid.getTime() - b.valid.getTime());
 
-  const values = records.flatMap((record) => {
-    const value = record[observedVariable.column];
-    return value === null ? [] : [{
+  const observedValues = observedVariable.values(records);
+  const values = records.flatMap((record, index) => {
+    const value = observedValues[index];
+    return value === null || value === undefined ? [] : [{
       date: record.valid,
       value,
     }];

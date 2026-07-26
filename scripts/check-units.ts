@@ -48,6 +48,15 @@ close(convertUnitValue(0, "degree_Celsius", "tempF"), 32);
 const [low, high] = convertUnitRange([273.15, 303.15], "K", "tempC");
 close(low, 0);
 close(high, 30);
+if (
+  unitKind("degree_day_K") !== "degree_day"
+  || unitOptions("degree_day_K").map((option) => option.id).join(",")
+    !== "degreeDayK,degreeDayC,degreeDayF"
+) {
+  throw new Error("Degree-day units were not kept separate from absolute temperature");
+}
+close(convertUnitValue(10, "degree_day_K", "degreeDayF"), 18);
+close(convertUnitValue(18, "degree_day_F", "degreeDayC"), 10);
 
 const converted = convertPointSeries({
   kind: "history",

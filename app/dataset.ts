@@ -20,6 +20,11 @@ import { registerFixedScaleOffset } from "./codecs/fixedscaleoffset";
 import { registerGribberishCodec } from "./codecs/gribberish";
 import { registerPcodec } from "./codecs/pcodec";
 import {
+  derivedVariableMatches,
+  executeDerivedPipeline,
+  nativeInputsForDerived,
+} from "./derived-variables";
+import {
   googleAuthorizedFetch,
 } from "./google-auth";
 
@@ -39,6 +44,20 @@ export type AxisConfig = {
   requiresStoreReload?: boolean;
 };
 
+export type DerivedTransformConfig = {
+  id: string;
+  kind: "elementwise";
+  operator: string;
+  inputs: string[];
+};
+
+export type DerivedVariableSpec = {
+  key: string;
+  inputs: Record<string, string>;
+  transforms: DerivedTransformConfig[];
+  output: string;
+};
+
 export type VariableConfig = {
   id: string;
   label: string;
@@ -49,6 +68,7 @@ export type VariableConfig = {
   chunkShape?: number[];
   innerChunkShape?: number[];
   dataType?: string;
+  derived?: DerivedVariableSpec;
 };
 
 export type StoreInfo = {
@@ -56,6 +76,7 @@ export type StoreInfo = {
   source: DatasetSourceConfig;
   role: DatasetSourceRole;
   variables: VariableConfig[];
+  derivedVariables?: VariableConfig[];
   axes: Record<string, AxisConfig>;
   store?: Readable;
   layerOptions: {
@@ -1303,11 +1324,11 @@ async function loadGoogleStoreInfo(
     a.label.localeCompare(b.label, undefined, { sensitivity: "base" }),
   );
 
-  const store = role === "series"
-    ? new zarr.FetchStore(source.url, {
-      fetch: fetchGoogleObject,
-    })
-    : undefined;
+  // Native map layers can read through transformRequest, but derived layers
+  // need a Zarrita store so they can fetch and combine their source arrays.
+  const store = new zarr.FetchStore(source.url, {
+    fetch: fetchGoogleObject,
+  });
 
   return {
     dataset,
@@ -1364,7 +1385,7 @@ export function loadStoreInfo(
   const cached = storeInfoPromises.get(cacheKey);
   if (cached) return cached;
 
-  const promise = (
+  const promise = Promise.resolve(
     source.kind === "icechunk"
       ? loadIcechunkStoreInfo(dataset, source, role)
       : source.kind === "weatherzarr"
@@ -1374,7 +1395,10 @@ export function loadStoreInfo(
         : dataset.id === "google-arco-era5"
           ? loadGoogleStoreInfo(dataset, source, role)
           : loadV3StoreInfo(dataset, source, role)
-  ).catch((error) => {
+  ).then((info) => ({
+    ...info,
+    derivedVariables: derivedVariableMatches(info.variables),
+  })).catch((error) => {
     storeInfoPromises.delete(cacheKey);
     throw error;
   });
@@ -1915,6 +1939,15 @@ function quantile(sorted: number[], probability: number) {
   return sorted[lower] * (1 - weight) + sorted[upper] * weight;
 }
 
+type RawPointForecast = {
+  values: Float64Array;
+  dates: Date[];
+  leadCount: number;
+  memberCount: number;
+  latitude: number;
+  longitude: number;
+};
+
 export function timedeltaMilliseconds(axis: AxisConfig, index: number) {
   const value = Number(axis.values[index]);
   const unit = axis.unit.toLowerCase();
@@ -1927,14 +1960,14 @@ export function timedeltaMilliseconds(axis: AxisConfig, index: number) {
   return value * 1_000;
 }
 
-export async function loadPointForecast(
+async function loadRawPointForecast(
   info: StoreInfo,
   variable: VariableConfig,
   selections: AxisSelection,
   longitude: number,
   latitude: number,
   options: PointSeriesLoadOptions = {},
-): Promise<PointForecastSeries | null> {
+): Promise<RawPointForecast | null> {
   if (info.role !== "series" || !info.store) return null;
   const initDimension = [
     ...variable.dimensions,
@@ -2004,16 +2037,54 @@ export async function loadPointForecast(
   const memberPosition = memberDimension
     ? remainingDimensions.indexOf(memberDimension)
     : -1;
-  const values = result.data as ArrayLike<number | bigint>;
-  const allQuantiles = Array.from({ length: leadCount }, (_, leadIndex) => {
-    const members = Array.from({ length: memberCount }, (_, memberIndex) => {
+  const sourceValues = result.data as ArrayLike<number | bigint>;
+  const values = new Float64Array(leadCount * memberCount);
+  for (let leadIndex = 0; leadIndex < leadCount; leadIndex += 1) {
+    for (let memberIndex = 0; memberIndex < memberCount; memberIndex += 1) {
       let offset = leadIndex * result.stride[leadPosition];
       if (memberPosition >= 0) {
         offset += memberIndex * result.stride[memberPosition];
       }
-      return Number(values[offset]);
-    }).filter(Number.isFinite).sort((a, b) => a - b);
-    return {
+      values[leadIndex * memberCount + memberIndex] = Number(
+        sourceValues[offset],
+      );
+    }
+  }
+  const initDate = axisValueAsDate(
+    info.dataset,
+    initAxis,
+    selections[initDimension] ?? 0,
+  );
+  return {
+    values,
+    dates: leadAxis.values.slice(0, leadCount).map(
+      (_, index) => new Date(
+        initDate.getTime() + timedeltaMilliseconds(leadAxis, index),
+      ),
+    ),
+    leadCount,
+    memberCount,
+    latitude,
+    longitude,
+  };
+}
+
+function pointForecastFromRaw(
+  raw: RawPointForecast,
+  variable: VariableConfig,
+  values: ArrayLike<number | bigint>,
+  unit = variable.unit,
+): PointForecastSeries {
+  const allQuantiles = Array.from(
+    { length: raw.leadCount },
+    (_, leadIndex) => {
+      const members = Array.from(
+        { length: raw.memberCount },
+        (_, memberIndex) => Number(
+          values[leadIndex * raw.memberCount + memberIndex],
+        ),
+      ).filter(Number.isFinite).sort((a, b) => a - b);
+      return {
       min: members[0] ?? NaN,
       q10: quantile(members, 0.1),
       q25: quantile(members, 0.25),
@@ -2021,12 +2092,8 @@ export async function loadPointForecast(
       q75: quantile(members, 0.75),
       q90: quantile(members, 0.9),
       max: members.at(-1) ?? NaN,
-    };
-  });
-  const initDate = axisValueAsDate(
-    info.dataset,
-    initAxis,
-    selections[initDimension] ?? 0,
+      };
+    },
   );
   const lastFiniteIndex = allQuantiles.findLastIndex((item) =>
     Number.isFinite(item.q50),
@@ -2035,15 +2102,125 @@ export async function loadPointForecast(
   return {
     kind: "forecast",
     quantiles,
-    dates: leadAxis.values.slice(0, quantiles.length).map(
-      (_, index) => new Date(initDate.getTime() + timedeltaMilliseconds(leadAxis, index)),
-    ),
-    unit: variable.unit,
+    dates: raw.dates.slice(0, quantiles.length),
+    unit,
     variableLabel: variable.label,
-    latitude,
-    longitude,
-    memberCount,
+    latitude: raw.latitude,
+    longitude: raw.longitude,
+    memberCount: raw.memberCount,
   };
+}
+
+export async function loadPointForecast(
+  info: StoreInfo,
+  variable: VariableConfig,
+  selections: AxisSelection,
+  longitude: number,
+  latitude: number,
+  options: PointSeriesLoadOptions = {},
+): Promise<PointForecastSeries | null> {
+  const raw = await loadRawPointForecast(
+    info,
+    variable,
+    selections,
+    longitude,
+    latitude,
+    options,
+  );
+  return raw
+    ? pointForecastFromRaw(raw, variable, raw.values)
+    : null;
+}
+
+function sameDates(first: Date[], second: Date[]) {
+  return first.length === second.length
+    && first.every(
+      (date, index) => date.getTime() === second[index]?.getTime(),
+    );
+}
+
+async function loadDerivedPointTimeSeries(
+  info: StoreInfo,
+  variable: VariableConfig,
+  selections: AxisSelection,
+  longitude: number,
+  latitude: number,
+  options: PointSeriesLoadOptions,
+): Promise<PointTimeSeries | null> {
+  const inputs = nativeInputsForDerived(variable, info.variables);
+  const loaded = await Promise.all(inputs.map(
+    ({ variable: input }) => loadPointTimeSeries(
+      info,
+      input,
+      selections,
+      longitude,
+      latitude,
+      options,
+    ),
+  ));
+  const first = loaded[0];
+  if (
+    !first
+    || loaded.some((series) => !series || !sameDates(first.dates, series.dates))
+  ) return null;
+  const derived = executeDerivedPipeline(
+    variable,
+    info.variables,
+    Object.fromEntries(inputs.map(({ key }, index) => [
+      key,
+      loaded[index]?.values ?? [],
+    ])),
+  );
+  return {
+    ...first,
+    values: Array.from(derived.values),
+    unit: derived.unit,
+    variableLabel: variable.label,
+  };
+}
+
+async function loadDerivedPointForecast(
+  info: StoreInfo,
+  variable: VariableConfig,
+  selections: AxisSelection,
+  longitude: number,
+  latitude: number,
+  options: PointSeriesLoadOptions,
+): Promise<PointForecastSeries | null> {
+  const inputs = nativeInputsForDerived(variable, info.variables);
+  const loaded = await Promise.all(inputs.map(
+    ({ variable: input }) => loadRawPointForecast(
+      info,
+      input,
+      selections,
+      longitude,
+      latitude,
+      options,
+    ),
+  ));
+  const first = loaded[0];
+  if (
+    !first
+    || loaded.some((series) => (
+      !series
+      || series.memberCount !== first.memberCount
+      || !sameDates(first.dates, series.dates)
+    ))
+  ) return null;
+  const derived = executeDerivedPipeline(
+    variable,
+    info.variables,
+    Object.fromEntries(inputs.map(({ key }, index) => [
+      key,
+      loaded[index]?.values ?? [],
+    ])),
+  );
+  return pointForecastFromRaw(
+    first,
+    variable,
+    derived.values,
+    derived.unit,
+  );
 }
 
 export function isForecastSeries(
@@ -2063,6 +2240,25 @@ export function loadPointSeries(
   latitude: number,
   options: PointSeriesLoadOptions = {},
 ) {
+  if (variable.derived) {
+    return isForecastSeries(info, variable)
+      ? loadDerivedPointForecast(
+        info,
+        variable,
+        selections,
+        longitude,
+        latitude,
+        options,
+      )
+      : loadDerivedPointTimeSeries(
+        info,
+        variable,
+        selections,
+        longitude,
+        latitude,
+        options,
+      );
+  }
   return isForecastSeries(info, variable)
     ? loadPointForecast(info, variable, selections, longitude, latitude, options)
     : loadPointTimeSeries(info, variable, selections, longitude, latitude, options);

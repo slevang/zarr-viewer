@@ -56,7 +56,7 @@ const DEFAULT_RULES: readonly { id: string; pattern: RegExp }[] = [
   { id: "solar", pattern: /\b(?:solar|sunshine|ultraviolet|uv|short\s+wave|shortwave|toa\s+incident)\b/ },
   { id: "greys", pattern: /\b(?:cloud|clouds|fog)\b/ },
   { id: "ice", pattern: /\b(?:ice|snow|snowfall|snowmelt|frost|frozen|glacier)\b/ },
-  { id: "thermal", pattern: /\b(?:temperature|temperatures|dewpoint)\b/ },
+  { id: "thermal", pattern: /\b(?:temperature|temperatures|dewpoint|heat index|wind chill|degree days)\b/ },
 ];
 
 export function defaultColormap(variable: NamedVariable): Colormap {

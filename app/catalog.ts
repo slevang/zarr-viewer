@@ -84,7 +84,7 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
   },
   {
     id: "noaa-gefs-forecast-35-day",
-    label: "NOAA GEFS forecast · 35 day",
+    label: "NOAA GEFS forecast",
     provider: "dynamical.org",
     category: "forecast",
     description: "Global ensemble forecast through 35 days.",
@@ -369,6 +369,25 @@ export const DATASET_CATEGORY_GROUPS = [
   { id: "forecast", label: "Forecast" },
   { id: "analysis", label: "Analysis/Reanalysis" },
 ] as const satisfies Array<{ id: DatasetCategory; label: string }>;
+
+const DUAL_CHUNKED_DATASET_IDS = new Set([
+  "noaa-hrrr-forecast-48-hour",
+  "weatherzarr-ecmwf-ifs",
+  "earthmover-era5",
+]);
+
+const SPATIALLY_CHUNKED_DATASET_IDS = new Set([
+  "google-arco-era5",
+  "google-weathernext-2",
+]);
+
+export function datasetChunkingLabel(dataset: DatasetConfig) {
+  if (DUAL_CHUNKED_DATASET_IDS.has(dataset.id)) return "Dual-chunked";
+  if (SPATIALLY_CHUNKED_DATASET_IDS.has(dataset.id)) {
+    return "Spatially-chunked";
+  }
+  return "Timeseries-chunked";
+}
 
 export function datasetOptionLabel(dataset: DatasetConfig) {
   return `${dataset.label} — ${dataset.provider}`;

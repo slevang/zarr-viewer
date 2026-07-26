@@ -37,6 +37,14 @@ const DISPLAY_UNITS: Record<string, UnitOption[]> = {
     { id: "mm", label: "mm" },
     { id: "in", label: "in" },
   ],
+  degree_day: [
+    { id: "degreeDayK", label: "K·day" },
+    { id: "degreeDayC", label: "°C·day" },
+    { id: "degreeDayF", label: "°F·day" },
+  ],
+  angle: [
+    { id: "deg", label: "°" },
+  ],
 };
 
 const UNIT_ALIASES: Record<string, string> = {
@@ -59,14 +67,27 @@ const UNIT_ALIASES: Record<string, string> = {
   degf: "tempF",
   tempf: "tempF",
   "°f": "tempF",
+  degree_day_k: "degreeDayK",
+  degree_day_c: "degreeDayC",
+  degree_day_f: "degreeDayF",
+  degreedayk: "degreeDayK",
+  degreedayc: "degreeDayC",
+  degreedayf: "degreeDayF",
 };
 
 const converterCache = new Map<string, (value: number) => number>();
+const SPECIAL_UNITS: Record<string, { kind: string; factor: number }> = {
+  degreeDayK: { kind: "degree_day", factor: 1 },
+  degreeDayC: { kind: "degree_day", factor: 1 },
+  degreeDayF: { kind: "degree_day", factor: 5 / 9 },
+};
 
 export function normalizeUnit(unit: string) {
   const trimmed = unit.trim();
   if (!trimmed) return null;
   const aliased = UNIT_ALIASES[trimmed.toLowerCase()];
+  if (aliased && SPECIAL_UNITS[aliased]) return aliased;
+  if (SPECIAL_UNITS[trimmed]) return trimmed;
   const candidates = [
     aliased,
     trimmed,
@@ -88,7 +109,7 @@ export function normalizeUnit(unit: string) {
 
 function parsedUnit(unit: string) {
   const normalized = normalizeUnit(unit);
-  if (!normalized) return null;
+  if (!normalized || SPECIAL_UNITS[normalized]) return null;
   try {
     return Qty(1, normalized);
   } catch {
@@ -101,6 +122,9 @@ function isPrecipitation(context = "") {
 }
 
 export function unitKind(unit: string, context = "") {
+  const normalized = normalizeUnit(unit);
+  const specialKind = normalized ? SPECIAL_UNITS[normalized]?.kind : undefined;
+  if (specialKind) return specialKind;
   const kind = parsedUnit(unit)?.kind();
   return kind === "length" && isPrecipitation(context)
     ? "precipitation"
@@ -108,6 +132,9 @@ export function unitKind(unit: string, context = "") {
 }
 
 export function unitOptions(unit: string, context = ""): UnitOption[] {
+  const normalized = normalizeUnit(unit);
+  const special = normalized ? SPECIAL_UNITS[normalized] : undefined;
+  if (special) return [...(DISPLAY_UNITS[special.kind] ?? [])];
   const source = parsedUnit(unit);
   if (!source) return [];
   const preferred = DISPLAY_UNITS[unitKind(unit, context) ?? ""] ?? [];
@@ -120,7 +147,6 @@ export function unitOptions(unit: string, context = ""): UnitOption[] {
   });
   if (!compatible.length) return [];
 
-  const normalized = normalizeUnit(unit);
   if (
     normalized
     && !compatible.some((candidate) => candidate.id === normalized)
@@ -137,15 +163,22 @@ export function nativeUnitOption(unit: string, context = "") {
     ?? { id: normalized, label: unit };
 }
 
-export function convertUnitValue(
-  value: number,
+export function unitConverter(
   sourceUnit: string,
   targetUnit: string,
-) {
-  if (!Number.isFinite(value)) return value;
+): ((value: number) => number) | null {
   const source = normalizeUnit(sourceUnit);
   const target = normalizeUnit(targetUnit);
-  if (!source || !target || source === target) return value;
+  if (!source || !target) return null;
+  if (source === target) return (value) => value;
+  const sourceSpecial = SPECIAL_UNITS[source];
+  const targetSpecial = SPECIAL_UNITS[target];
+  if (sourceSpecial || targetSpecial) {
+    if (!sourceSpecial || !targetSpecial || sourceSpecial.kind !== targetSpecial.kind) {
+      return null;
+    }
+    return (value) => value * sourceSpecial.factor / targetSpecial.factor;
+  }
   const key = `${source}->${target}`;
   let converter = converterCache.get(key);
   if (!converter) {
@@ -154,9 +187,24 @@ export function convertUnitValue(
       converter = (candidate) => swift(candidate) as number;
       converterCache.set(key, converter);
     } catch {
-      return value;
+      return null;
     }
   }
+  return converter;
+}
+
+export function unitsCompatible(sourceUnit: string, targetUnit: string) {
+  return unitConverter(sourceUnit, targetUnit) !== null;
+}
+
+export function convertUnitValue(
+  value: number,
+  sourceUnit: string,
+  targetUnit: string,
+) {
+  if (!Number.isFinite(value)) return value;
+  const converter = unitConverter(sourceUnit, targetUnit);
+  if (!converter) return value;
   try {
     return converter(value);
   } catch {
@@ -178,7 +226,7 @@ export function convertPointSeries(
   series: PointSeries,
   target: UnitOption | null,
 ): PointSeries {
-  if (!target || !parsedUnit(series.unit)?.isCompatible(Qty(1, target.id))) {
+  if (!target || !unitsCompatible(series.unit, target.id)) {
     return series;
   }
   const convert = (value: number) =>

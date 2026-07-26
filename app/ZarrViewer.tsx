@@ -6,10 +6,13 @@ import {
   defaultColormap,
 } from "./colormaps";
 import { commonVariableMatches } from "./common-variables";
+import { derivedLayerOptions } from "./derived-store";
+import { derivedDisplayId } from "./derived-variables";
 import {
   DATASETS,
   DATASET_CATEGORY_GROUPS,
   DEFAULT_DATASET_ID,
+  datasetChunkingLabel,
   datasetOptionLabel,
   getDataset,
   hasMapSource,
@@ -176,20 +179,6 @@ function dataTypeByteWidth(dataType?: string) {
   return 4;
 }
 
-function formatChunkShape(variable: VariableConfig, shape: number[]) {
-  return shape.map(
-    (length, index) => `${variable.dimensions[index] ?? `dim ${index + 1}`} ${length}`,
-  ).join(" × ");
-}
-
-function chunkingSummary(variable: VariableConfig | null) {
-  if (!variable?.chunkShape) return "Opening dataset…";
-  return `Chunk: ${formatChunkShape(
-    variable,
-    variable.innerChunkShape ?? variable.chunkShape,
-  )}`;
-}
-
 function initialDatasetId() {
   if (typeof window === "undefined") return getDataset(DEFAULT_DATASET_ID).id;
   const requested = new URL(window.location.href).searchParams.get(
@@ -278,6 +267,8 @@ function playbackPrefetchProfile(
         ? 3
         : 2;
   const directChunkReads = (
+    !variable.derived
+    &&
     source.id === "earthmover-era5-single-spatial"
     && spatialChunksPerFrame === 1
   );
@@ -461,7 +452,14 @@ function fullRange(value: unknown): [number, number] | null {
 function initialDisplayRange(variable: VariableConfig): [number, number] {
   const name = `${variable.id} ${variable.label}`.toLowerCase();
   const unit = variable.unit.toLowerCase();
-  if (name.includes("temperature") || name.includes("dew point")) {
+  if (name.includes("wind direction")) return [0, 360];
+  if (name.includes("degree days")) return [0, 25];
+  if (
+    name.includes("temperature")
+    || name.includes("dew point")
+    || name.includes("heat index")
+    || name.includes("wind chill")
+  ) {
     return unit.includes("celsius") || unit.includes("°c")
       ? [-40, 40]
       : [230, 320];
@@ -521,7 +519,16 @@ function variableConcept(variable: VariableConfig) {
   return undefined;
 }
 
+function availableVariables(info: StoreInfo) {
+  return [...(info.derivedVariables ?? []), ...info.variables];
+}
+
 function matchingVariable(info: StoreInfo, source: VariableConfig) {
+  if (source.derived) {
+    return info.derivedVariables?.find(
+      (candidate) => candidate.derived?.key === source.derived?.key,
+    );
+  }
   const exact = info.variables.find((candidate) => candidate.id === source.id);
   if (exact) return exact;
   const standardName = source.standardName?.toLowerCase();
@@ -1649,6 +1656,10 @@ export function ZarrViewer() {
       if (map.getLayer(ZARR_LAYER_ID)) map.removeLayer(ZARR_LAYER_ID);
       layerRef.current = null;
       const { ZarrLayer } = await import("@carbonplan/zarr-layer");
+      const nextLayerOptions = await derivedLayerOptions(
+        nextInfo,
+        nextVariable,
+      );
       if (cancelled) return;
       const zarrLayer = new ZarrLayer({
         id: ZARR_LAYER_ID,
@@ -1657,7 +1668,7 @@ export function ZarrViewer() {
         colormap: [...nextColormap.colors],
         clim: nextDisplayRange,
         opacity: opacityRef.current,
-        ...nextInfo.layerOptions,
+        ...nextLayerOptions,
         onLoadingStateChange: (loading) => {
           if (loading.error) setLoadState(errorState(loading.error));
           else if (loading.loading) setLoadState(loadingState());
@@ -1806,8 +1817,10 @@ export function ZarrViewer() {
 
   const changeVariable = async (id: string) => {
     const layer = layerRef.current;
-    if (!info || !variable || !layer) return;
-    const nextVariable = info.variables.find((candidate) => candidate.id === id);
+    if (!info || !variable) return;
+    const nextVariable = availableVariables(info).find(
+      (candidate) => candidate.id === id,
+    );
     if (!nextVariable) return;
     const currentValidDate = selectedValidDate(
       info,
@@ -1853,10 +1866,53 @@ export function ZarrViewer() {
     setColormapId(nextColormap.id);
     setLoadState(loadingState());
     try {
-      layer.setClim(nextDisplayRange);
-      layer.setColormap([...nextColormap.colors]);
-      await layer.setVariable(nextVariable.id);
-      await applySelector(nextVariable, nextSelections);
+      if (variable.derived || nextVariable.derived) {
+        const map = mapRef.current;
+        if (!map) return;
+        const generation = ++requestGeneration.current;
+        const { ZarrLayer } = await import("@carbonplan/zarr-layer");
+        const nextLayerOptions = await derivedLayerOptions(info, nextVariable);
+        if (generation !== requestGeneration.current) return;
+        const nextLayer = new ZarrLayer({
+          id: ZARR_LAYER_ID,
+          variable: nextVariable.id,
+          selector: selectorFor(nextVariable, nextSelections),
+          colormap: [...nextColormap.colors],
+          clim: nextDisplayRange,
+          opacity: opacityRef.current,
+          ...nextLayerOptions,
+          onLoadingStateChange: (loading) => {
+            if (generation !== requestGeneration.current) return;
+            if (loading.error) setLoadState(errorState(loading.error));
+            else if (loading.loading) setLoadState(loadingState());
+            else {
+              setLoadState(READY_STATE);
+              const point = inspectionPointRef.current;
+              if (point) {
+                void refreshInspection(point, nextVariable, nextSelections);
+              }
+            }
+          },
+        });
+        if (map.getLayer(ZARR_LAYER_ID)) map.removeLayer(ZARR_LAYER_ID);
+        const firstSymbol = map.getStyle().layers?.find(
+          (candidate) => candidate.type === "symbol",
+        )?.id;
+        const beforeLayer = map.getLayer("basemap-coastline")
+          ? "basemap-coastline"
+          : firstSymbol;
+        map.addLayer(
+          nextLayer as unknown as import("maplibre-gl").CustomLayerInterface,
+          beforeLayer,
+        );
+        layerRef.current = nextLayer;
+      } else {
+        if (!layer) throw new Error("Map layer is unavailable");
+        layer.setClim(nextDisplayRange);
+        layer.setColormap([...nextColormap.colors]);
+        await layer.setVariable(nextVariable.id);
+        await applySelector(nextVariable, nextSelections);
+      }
       const point = inspectionPointRef.current;
       if (point) {
         startSeriesComparisonRef.current(point);
@@ -1882,7 +1938,7 @@ export function ZarrViewer() {
         initializationDate,
       );
       if (generation !== weatherNextStoreGenerationRef.current) return;
-      const nextVariable = nextInfo.variables.find(
+      const nextVariable = availableVariables(nextInfo).find(
         (candidate) => candidate.id === variable.id,
       ) ?? nextInfo.variables.find(
         (candidate) => candidate.id === nextInfo.dataset.defaultVariable,
@@ -1907,6 +1963,10 @@ export function ZarrViewer() {
       const map = mapRef.current;
       if (!map) return;
       const { ZarrLayer } = await import("@carbonplan/zarr-layer");
+      const nextLayerOptions = await derivedLayerOptions(
+        nextInfo,
+        nextVariable,
+      );
       if (generation !== weatherNextStoreGenerationRef.current) return;
       const nextLayer = new ZarrLayer({
         id: ZARR_LAYER_ID,
@@ -1915,7 +1975,7 @@ export function ZarrViewer() {
         colormap: [...colormap.colors],
         clim: activeDisplayRange,
         opacity: opacityRef.current,
-        ...nextInfo.layerOptions,
+        ...nextLayerOptions,
         onLoadingStateChange: (loading) => {
           if (generation !== weatherNextStoreGenerationRef.current) return;
           if (loading.error) setLoadState(errorState(loading.error));
@@ -2186,6 +2246,7 @@ export function ZarrViewer() {
     : inspector?.value;
   const currentAsos = asosAtTime(asosWindow, selectedMapValidDate);
   const commonVariables = commonVariableMatches(info?.variables ?? []);
+  const derivedVariables = info?.derivedVariables ?? [];
   const asosDisplayValue = (
     currentAsos.value !== null
     && asosWindow?.unit
@@ -2368,7 +2429,7 @@ export function ZarrViewer() {
             <small className="dataset-chunking">
               {googleAuthRequired && !googleConnected && !variable
                 ? "WeatherNext credentials required."
-                : chunkingSummary(variable)}
+                : datasetChunkingLabel(dataset)}
             </small>
             {googleAuthRequired ? (
               <div className={`google-auth-control ${googleAuth.phase}`}>
@@ -2429,6 +2490,19 @@ export function ZarrViewer() {
                       title={candidate.label || candidate.id}
                     >
                       {key === candidate.id ? candidate.id : `${key} · ${candidate.id}`}
+                    </option>
+                  ))}
+                </optgroup>
+              ) : null}
+              {derivedVariables.length ? (
+                <optgroup label="Derived variables">
+                  {derivedVariables.map((candidate) => (
+                    <option
+                      key={candidate.id}
+                      value={candidate.id}
+                      title={candidate.label}
+                    >
+                      {derivedDisplayId(candidate)}
                     </option>
                   ))}
                 </optgroup>

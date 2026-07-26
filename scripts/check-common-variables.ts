@@ -1,4 +1,8 @@
 import { commonVariableMatches } from "../app/common-variables";
+import {
+  datasetChunkingLabel,
+  getDataset,
+} from "../app/catalog";
 import type { VariableConfig } from "../app/dataset";
 
 function variable(
@@ -108,5 +112,20 @@ assertMatches("No false solar aggregate", [
   variable("downward_diffuse_short_wave_radiation_flux_surface"),
   variable("downward_direct_short_wave_radiation_flux_surface"),
 ], []);
+
+const expectedChunking = new Map([
+  ["weatherzarr-ecmwf-ifs", "Dual-chunked"],
+  ["noaa-hrrr-forecast-48-hour", "Dual-chunked"],
+  ["earthmover-era5", "Dual-chunked"],
+  ["google-arco-era5", "Spatially-chunked"],
+  ["google-weathernext-2", "Spatially-chunked"],
+  ["noaa-gfs-forecast", "Timeseries-chunked"],
+]);
+for (const [datasetId, expected] of expectedChunking) {
+  const actual = datasetChunkingLabel(getDataset(datasetId));
+  if (actual !== expected) {
+    throw new Error(`${datasetId}: expected ${expected}; received ${actual}`);
+  }
+}
 
 console.log("Common variable checks passed");

@@ -11,18 +11,17 @@ import {
   robustColorRange,
 } from "./color-range";
 import { commonVariableMatches } from "./common-variables";
+import { DeferredCalendarInput } from "./components/DeferredCalendarInput";
 import { derivedLayerOptions } from "./derived-store";
 import { derivedDisplayId } from "./derived-variables";
 import {
   DATASETS,
   DATASET_CATEGORY_GROUPS,
-  DEFAULT_DATASET_ID,
   datasetChunkingLabel,
   datasetOptionLabel,
   getDataset,
   hasMapSource,
   hasSeriesSource,
-  type DatasetSourceConfig,
 } from "./catalog";
 import {
   SeriesComparison,
@@ -38,30 +37,69 @@ import {
 } from "./asos-types";
 import {
   axisDateInputValue,
-  axisDateMatch,
   axisIndexForDate,
   axisValueAsDate,
   defaultSelections,
   formatAxisValue,
-  isForecastSeries,
-  loadPointSeries,
-  loadStoreInfo,
   reconcileSelections,
   selectionsAfterAxisChange,
   selectionsForValidDate,
   selectorFor,
   selectedValidDate,
   seriesStartDate,
-  timedeltaMilliseconds,
   toDataCoordinates,
   validDateRange,
-  type AxisConfig,
-  type AxisSelection,
-  type PointSeries,
-  type StoreInfo,
-  type VariableConfig,
+} from "./data/axes";
+import type {
+  AxisConfig,
+  AxisSelection,
+  StoreInfo,
+  VariableConfig,
+} from "./data/types";
+import {
+  loadStoreInfo,
 } from "./dataset";
+import { loadPointSeries } from "./data/point-series";
 import { temporalNeighborIndices } from "./temporal-prefetch";
+import {
+  decimalsForRange,
+  displayRangeKey,
+  errorState,
+  firstFinite,
+  formatOptionalValue,
+  formatUtcTime,
+  initialDisplayRange,
+  loadingState,
+  roundRangeToSignificant,
+  roundToSignificant,
+  type LoadState,
+} from "./viewer/display";
+import {
+  playbackChunkKey,
+  playbackInterval,
+  playbackPrefetchProfile,
+  type PlaybackPrefetchQueue,
+} from "./viewer/playback";
+import {
+  initialDatasetId,
+  storeUnitPreferences,
+  storedUnitPreferences,
+} from "./viewer/preferences";
+import {
+  formatAsosTime,
+  shortCoordinate,
+  stationFromFeature,
+  type StationFeatureLike,
+} from "./viewer/stations";
+import {
+  availableVariables,
+  axisSummary,
+  comparisonTimeIndex,
+  isInitializationAxis,
+  matchingVariable,
+  seriesCoversDate,
+  utcHour,
+} from "./viewer/variables";
 import {
   convertUnitRange,
   convertUnitValue,
@@ -82,50 +120,15 @@ type Projection = "globe" | "mercator";
 type SeriesComparisonOptions = {
   addMapDataset?: boolean;
 };
-const DATASET_PARAMETER = "dataset";
-const UNIT_PREFERENCES_STORAGE_KEY = "zarr-viewer:unit-preferences";
 type InspectionPoint = { lng: number; lat: number };
 type Inspector = InspectionPoint & { value: number | null };
-type StationFeatureLike = {
-  geometry: {
-    type: string;
-    coordinates?: unknown;
-  };
-  properties?: Record<string, unknown> | null;
-};
 type Limit = "min" | "max";
-type LoadState = { phase: "loading" | "ready" | "error"; message: string };
-type PlaybackPrefetchQueue = {
-  generation: number;
-  axisId: string;
-  ahead: number;
-  behind: number;
-  concurrency: number;
-  directChunkReads: boolean;
-  rampUp: boolean;
-  controller: AbortController;
-  ready: Set<number>;
-  promises: Map<number, Promise<void>>;
-  resolve: Map<number, () => void>;
-  queued: number[];
-  queuedSet: Set<number>;
-  inFlight: Set<number>;
-  attempts: Map<number, number>;
-};
 
 const MAP_STYLE = "https://tiles.openfreemap.org/styles/liberty";
 const ZARR_LAYER_ID = "zarr-data";
 const ASOS_SOURCE_ID = "asos-stations";
 const ASOS_DOT_LAYER_ID = "asos-station-dots";
 const ASOS_HIT_LAYER_ID = "asos-station-hits";
-const PLAYBACK_DATA_HOURS_PER_SECOND = 6;
-const PLAYBACK_FALLBACK_INTERVAL_MS = 250;
-const PLAYBACK_PREFETCH_BASE_AHEAD = 10;
-const PLAYBACK_PREFETCH_BASE_BEHIND = 3;
-const PLAYBACK_PREFETCH_FALLBACK_CONCURRENCY = 2;
-const PLAYBACK_PREFETCH_MAX_CONCURRENCY = 32;
-const PLAYBACK_PREFETCH_MEMORY_BUDGET_BYTES = 1024 * 1024 * 1024;
-const COLOR_RANGE_ESTIMATOR_VERSION = 4;
 const DEFAULT_CENTER: [number, number] = [-98, 38.5];
 const DEFAULT_ZOOM = 1.75;
 const READY_STATE: LoadState = { phase: "ready", message: "Ready" };
@@ -144,530 +147,6 @@ const FULL_IMAGE_GEOMETRIES = [
     [west, -89.999],
   ]],
 }));
-
-type DeferredCalendarInputProps = {
-  axisId: string;
-  label: string;
-  value: string;
-  min: string;
-  max: string;
-  onCommit: (value: string) => void;
-};
-
-function DeferredCalendarInput({
-  axisId,
-  label,
-  value,
-  min,
-  max,
-  onCommit,
-}: DeferredCalendarInputProps) {
-  const [draft, setDraft] = useState<string | null>(null);
-  const pendingValue = draft ?? value;
-
-  const commitDraft = (next: string) => {
-    if (!next || next === value) return;
-    onCommit(next);
-  };
-
-  return (
-    <input
-      className="axis-calendar"
-      aria-label={`${label} calendar`}
-      data-testid={`calendar-${axisId}`}
-      type="datetime-local"
-      step="3600"
-      value={pendingValue}
-      min={min}
-      max={max}
-      onInput={(event) => setDraft(event.currentTarget.value)}
-      onChange={(event) => setDraft(event.currentTarget.value)}
-      onBlur={() => commitDraft(pendingValue)}
-      onKeyDown={(event) => {
-        if (event.key === "Escape") setDraft(null);
-      }}
-      onKeyUp={(event) => {
-        if (event.key === "Enter") commitDraft(event.currentTarget.value);
-      }}
-    />
-  );
-}
-
-function loadingState(message = "Loading…"): LoadState {
-  return { phase: "loading", message };
-}
-
-function errorState(error: unknown): LoadState {
-  return { phase: "error", message: error instanceof Error ? error.message : String(error) };
-}
-
-function playbackInterval(
-  dataset: ReturnType<typeof getDataset>,
-  axis: AxisConfig,
-  currentIndex: number,
-  nextIndex: number,
-) {
-  let stepMilliseconds = NaN;
-  if (axis.kind === "time") {
-    stepMilliseconds = Math.abs(
-      axisValueAsDate(dataset, axis, nextIndex).getTime()
-      - axisValueAsDate(dataset, axis, currentIndex).getTime(),
-    );
-  } else if (axis.kind === "timedelta") {
-    stepMilliseconds = Math.abs(
-      timedeltaMilliseconds(axis, nextIndex)
-      - timedeltaMilliseconds(axis, currentIndex),
-    );
-  }
-  if (!Number.isFinite(stepMilliseconds) || stepMilliseconds <= 0) {
-    return PLAYBACK_FALLBACK_INTERVAL_MS;
-  }
-  const dataHours = stepMilliseconds / 3_600_000;
-  return Math.max(
-    100,
-    Math.min(4_000, (dataHours / PLAYBACK_DATA_HOURS_PER_SECOND) * 1_000),
-  );
-}
-
-function dataTypeByteWidth(dataType?: string) {
-  const normalized = dataType?.toLowerCase() ?? "";
-  if (normalized.includes("64") || /[fiu]8$/.test(normalized)) return 8;
-  if (normalized.includes("16") || /[fiu]2$/.test(normalized)) return 2;
-  if (normalized.includes("8") || /[iu]1$/.test(normalized)) return 1;
-  return 4;
-}
-
-function initialDatasetId() {
-  if (typeof window === "undefined") return getDataset(DEFAULT_DATASET_ID).id;
-  const requested = new URL(window.location.href).searchParams.get(
-    DATASET_PARAMETER,
-  );
-  return requested && MAP_DATASETS.some((candidate) => candidate.id === requested)
-    ? requested
-    : getDataset(DEFAULT_DATASET_ID).id;
-}
-
-function storedUnitPreferences() {
-  if (typeof window === "undefined") return {};
-  try {
-    const value = window.localStorage.getItem(UNIT_PREFERENCES_STORAGE_KEY);
-    if (!value) return {};
-    const parsed = JSON.parse(value) as unknown;
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return {};
-    }
-    return Object.fromEntries(
-      Object.entries(parsed).filter(
-        (entry): entry is [string, string] => typeof entry[1] === "string",
-      ),
-    );
-  } catch {
-    return {};
-  }
-}
-
-function playbackPrefetchProfile(
-  source: DatasetSourceConfig,
-  variable: VariableConfig,
-  axis: AxisConfig,
-) {
-  const axisIndex = variable.dimensions.indexOf(axis.id);
-  const { shape, chunkShape } = variable;
-  if (
-    axisIndex < 0
-    || !chunkShape
-    || chunkShape.length !== variable.dimensions.length
-  ) {
-    return {
-      ahead: PLAYBACK_PREFETCH_BASE_AHEAD,
-      behind: PLAYBACK_PREFETCH_BASE_BEHIND,
-      concurrency: PLAYBACK_PREFETCH_FALLBACK_CONCURRENCY,
-      directChunkReads: false,
-    };
-  }
-
-  const axisChunkLength = Math.max(1, Math.floor(chunkShape[axisIndex] ?? 1));
-  const decodedChunkBytes = chunkShape.reduce(
-    (total, length) => total * Math.max(1, length),
-    dataTypeByteWidth(variable.dataType),
-  );
-  const memoryFrameCap = Math.max(
-    1,
-    Math.floor(PLAYBACK_PREFETCH_MEMORY_BUDGET_BYTES / decodedChunkBytes),
-  );
-
-  let spatialChunksPerFrame = 1;
-  if (shape?.length === chunkShape.length) {
-    variable.dimensions.forEach((dimension, index) => {
-      const lower = dimension.toLowerCase();
-      const spatial = (
-        lower === "latitude"
-        || lower === "longitude"
-        || lower === "lat"
-        || lower === "lon"
-        || lower === "x"
-        || lower === "y"
-        || source.spatialDimensions?.lat === dimension
-        || source.spatialDimensions?.lon === dimension
-      );
-      if (spatial) {
-        spatialChunksPerFrame *= Math.ceil(
-          Math.max(1, shape[index] ?? 1) / Math.max(1, chunkShape[index] ?? 1),
-        );
-      }
-    });
-  }
-  const spatialCap = spatialChunksPerFrame <= 1
-    ? PLAYBACK_PREFETCH_MAX_CONCURRENCY
-    : spatialChunksPerFrame <= 4
-      ? 6
-      : spatialChunksPerFrame <= 16
-        ? 3
-        : 2;
-  const directChunkReads = (
-    !variable.derived
-    &&
-    source.id === "earthmover-era5-single-spatial"
-    && spatialChunksPerFrame === 1
-  );
-  const ahead = Math.min(PLAYBACK_PREFETCH_BASE_AHEAD, memoryFrameCap);
-  const temporalChunkCount = Math.max(
-    1,
-    Math.ceil(ahead / axisChunkLength),
-  );
-  const temporalCap = axisChunkLength >= 10
-    ? 1
-    : temporalChunkCount;
-
-  return {
-    ahead,
-    behind: Math.min(PLAYBACK_PREFETCH_BASE_BEHIND, memoryFrameCap),
-    concurrency: Math.max(
-      1,
-      Math.min(
-        PLAYBACK_PREFETCH_MAX_CONCURRENCY,
-        temporalCap,
-        spatialCap,
-      ),
-    ),
-    directChunkReads,
-  };
-}
-
-function playbackChunkKey(
-  variable: VariableConfig,
-  selections: AxisSelection,
-): `/${string}` | undefined {
-  const { shape, chunkShape } = variable;
-  if (
-    !shape
-    || !chunkShape
-    || shape.length !== variable.dimensions.length
-    || chunkShape.length !== variable.dimensions.length
-  ) return undefined;
-  const chunkCoordinates = variable.dimensions.map((dimension, index) => {
-    const lower = dimension.toLowerCase();
-    const spatial = (
-      lower === "latitude"
-      || lower === "longitude"
-      || lower === "lat"
-      || lower === "lon"
-      || lower === "x"
-      || lower === "y"
-    );
-    if (spatial) {
-      if ((shape[index] ?? 1) > (chunkShape[index] ?? 1)) return NaN;
-      return 0;
-    }
-    return Math.floor(
-      (selections[dimension] ?? 0) / Math.max(1, chunkShape[index] ?? 1),
-    );
-  });
-  if (chunkCoordinates.some((value) => !Number.isFinite(value))) return undefined;
-  return `/${variable.id}/c/${chunkCoordinates.join("/")}`;
-}
-
-function shortCoordinate(value: number, positive: string, negative: string) {
-  return `${Math.abs(value).toFixed(2)}°${value >= 0 ? positive : negative}`;
-}
-
-function stationFromFeature(
-  feature: StationFeatureLike,
-): AsosStation | null {
-  const coordinates = feature.geometry.type === "Point"
-    && Array.isArray(feature.geometry.coordinates)
-    ? feature.geometry.coordinates
-    : null;
-  if (!coordinates) return null;
-  const longitude = Number(coordinates[0]);
-  const latitude = Number(coordinates[1]);
-  const properties = feature.properties ?? {};
-  const station = String(properties.station ?? "");
-  if (
-    !station
-    || !Number.isFinite(longitude)
-    || !Number.isFinite(latitude)
-  ) return null;
-  return {
-    station,
-    name: String(properties.name ?? station),
-    state: String(properties.state ?? ""),
-    country: String(properties.country ?? ""),
-    elevation: Number(properties.elevation),
-    longitude,
-    latitude,
-  };
-}
-
-function formatAsosTime(date: Date) {
-  return `${date.toISOString().slice(0, 16).replace("T", " ")}Z`;
-}
-
-function formatUtcTime(date: Date) {
-  return `${date.toISOString().slice(0, 16).replace("T", " ")} UTC`;
-}
-
-function formatOptionalValue(
-  value: number | null,
-  unit: string,
-  decimals = 1,
-) {
-  return value === null ? "—" : `${value.toFixed(decimals)} ${unit}`;
-}
-
-function firstFinite(value: unknown): number | undefined {
-  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
-  if (typeof value === "bigint") return Number(value);
-  if (Array.isArray(value) || ArrayBuffer.isView(value)) {
-    for (const item of Array.from(value as ArrayLike<unknown>)) {
-      const match = firstFinite(item);
-      if (match !== undefined) return match;
-    }
-  } else if (value && typeof value === "object") {
-    for (const item of Object.values(value)) {
-      const match = firstFinite(item);
-      if (match !== undefined) return match;
-    }
-  }
-  return undefined;
-}
-
-function decimalsForRange([min, max]: readonly [number, number]) {
-  const width = Math.abs(max - min);
-  if (width >= 1000) return 0;
-  if (width >= 10) return 1;
-  if (width >= 1) return 2;
-  return 3;
-}
-
-function roundToSignificant(value: number, digits = 6) {
-  return value === 0 ? 0 : Number(value.toPrecision(digits));
-}
-
-function roundRangeToSignificant(
-  range: readonly [number, number],
-): [number, number] {
-  return [
-    roundToSignificant(range[0]),
-    roundToSignificant(range[1]),
-  ];
-}
-
-function initialDisplayRange(variable: VariableConfig): [number, number] {
-  const name = `${variable.id} ${variable.label}`.toLowerCase();
-  const unit = variable.unit.toLowerCase();
-  if (name.includes("wind direction")) return [0, 360];
-  if (name.includes("degree days")) return [0, 25];
-  if (
-    name.includes("temperature")
-    || name.includes("dew point")
-    || name.includes("heat index")
-    || name.includes("wind chill")
-  ) {
-    return unit.includes("celsius") || unit.includes("°c")
-      ? [-40, 40]
-      : [230, 320];
-  }
-  if (name.includes("relative humidity") || unit === "%") return [0, 100];
-  if (name.includes("cloud") && (unit === "1" || unit === "")) return [0, 1];
-  if (name.includes("pressure")) {
-    return unit.includes("hpa") || unit.includes("millibar")
-      ? [900, 1050]
-      : [90_000, 105_000];
-  }
-  if (name.includes("precip") || name.includes("rainfall") || name.includes("snowfall")) {
-    if (/^(?:m|meter|metre)s?$/.test(unit)) return [0, 0.025];
-    if (unit.includes("inch") || unit === "in") return [0, 1];
-    return [0, 25];
-  }
-  if (name.includes("wind") && /\b(?:u|v)\b/.test(name)) return [-30, 30];
-  if (name.includes("wind")) return [0, 30];
-  if (name.includes("geopotential height")) return [0, 6_000];
-  return [0, 1];
-}
-
-function displayRangeKey(datasetId: string, variableId: string) {
-  return `${COLOR_RANGE_ESTIMATOR_VERSION}:${datasetId}:${variableId}`;
-}
-
-function axisSummary(
-  info: StoreInfo,
-  variable: VariableConfig,
-  selections: AxisSelection,
-) {
-  return variable.dimensions.flatMap((dimension) => {
-    const axis = info.axes[dimension];
-    if (!axis) return [];
-    return [`${axis.label}: ${formatAxisValue(info.dataset, axis, selections[dimension] ?? 0)}`];
-  }).join(" · ");
-}
-
-function normalizedVariableName(variable: VariableConfig) {
-  return `${variable.id} ${variable.label}`
-    .toLowerCase()
-    .replaceAll("metre", "m")
-    .replaceAll("meter", "m")
-    .replaceAll(/[^a-z0-9]+/g, "");
-}
-
-function variableConcept(variable: VariableConfig) {
-  const name = normalizedVariableName(variable);
-  const standardName = variable.standardName?.toLowerCase() ?? "";
-  const isTwoMeter = name.includes("2m")
-    || variable.id.toLowerCase() === "t2m"
-    || variable.id.toLowerCase() === "d2m";
-  const isDewPoint = name.includes("dew")
-    || standardName.includes("dew_point")
-    || variable.id.toLowerCase() === "d2m";
-  if (isDewPoint) return isTwoMeter ? "dew_point_2m" : "dew_point";
-  const isTemperature = name.includes("temp")
-    || standardName === "air_temperature"
-    || variable.id.toLowerCase() === "t2m";
-  if (isTemperature) return isTwoMeter ? "air_temperature_2m" : "air_temperature";
-  return undefined;
-}
-
-function availableVariables(info: StoreInfo) {
-  return [...(info.derivedVariables ?? []), ...info.variables];
-}
-
-function matchingVariable(info: StoreInfo, source: VariableConfig) {
-  if (source.derived) {
-    return info.derivedVariables?.find(
-      (candidate) => candidate.derived?.key === source.derived?.key,
-    );
-  }
-  const exact = info.variables.find((candidate) => candidate.id === source.id);
-  if (exact) return exact;
-  const standardName = source.standardName?.toLowerCase();
-  const sourceName = normalizedVariableName(source);
-  const sourceConcept = variableConcept(source);
-  const ranked = info.variables.map((candidate) => {
-    const candidateName = normalizedVariableName(candidate);
-    const candidateConcept = variableConcept(candidate);
-    let semanticScore = 0;
-    if (sourceConcept && candidateConcept === sourceConcept) {
-      semanticScore += 120;
-    }
-    if (
-      (!sourceConcept || !candidateConcept || sourceConcept === candidateConcept)
-      && standardName
-      && candidate.standardName?.toLowerCase() === standardName
-    ) {
-      semanticScore += 100;
-    }
-    if (candidateName === sourceName) semanticScore += 80;
-    let score = semanticScore;
-    if (semanticScore > 0 && source.unit && candidate.unit === source.unit) score += 5;
-    score -= candidate.dimensions.filter((dimension) => {
-      const kind = info.axes[dimension]?.kind;
-      return kind !== "time"
-        && kind !== "timedelta"
-        && !["latitude", "lat", "longitude", "lon", "x", "y"].includes(
-          dimension.toLowerCase(),
-        )
-        && !["ensemble", "ensemble_member", "member", "sample", "number"].includes(
-          dimension.toLowerCase(),
-        );
-    }).length * 2;
-    return { candidate, score };
-  }).sort((a, b) => b.score - a.score);
-  return ranked[0]?.score > 0 ? ranked[0].candidate : undefined;
-}
-
-function seriesCoversDate(series: PointSeries | undefined, date?: Date) {
-  if (!series || !date || !series.dates.length) return false;
-  const target = date.getTime();
-  const first = series.dates[0].getTime();
-  const last = series.dates.at(-1)?.getTime() ?? first;
-  return target >= Math.min(first, last) && target <= Math.max(first, last);
-}
-
-function isInitializationAxis(axis: AxisConfig) {
-  return [
-    "init_time",
-    "initialization_time",
-    "forecast_reference_time",
-    "forecast_date",
-  ].includes(axis.id.toLowerCase());
-}
-
-function utcHour(date: Date) {
-  return Number.isFinite(date.getTime())
-    ? `${date.toISOString().slice(0, 13).replace("T", " ")}Z`
-    : "unknown";
-}
-
-function forecastInitTolerance(
-  info: StoreInfo,
-  axis: AxisConfig,
-  index: number,
-) {
-  const matched = axisValueAsDate(info.dataset, axis, index).getTime();
-  const neighborDistances = [index - 1, index + 1].flatMap((neighbor) => {
-    if (neighbor < 0 || neighbor >= axis.values.length) return [];
-    const distance = Math.abs(
-      axisValueAsDate(info.dataset, axis, neighbor).getTime() - matched,
-    );
-    return distance > 0 && Number.isFinite(distance) ? [distance] : [];
-  });
-  const cadence = neighborDistances.length
-    ? Math.min(...neighborDistances)
-    : 24 * 60 * 60 * 1000;
-  return Math.min(
-    24 * 60 * 60 * 1000,
-    Math.max(6 * 60 * 60 * 1000, cadence * 1.5),
-  );
-}
-
-function comparisonTimeIndex(
-  info: StoreInfo,
-  variable: VariableConfig,
-  axis: AxisConfig,
-  anchorDate: Date,
-) {
-  const match = axisDateMatch(info.dataset, axis, anchorDate);
-  const forecast = isForecastSeries(info, variable);
-  const tolerance = forecast
-    ? forecastInitTolerance(info, axis, match.index)
-    : 0;
-  const first = Math.min(match.first.getTime(), match.last.getTime());
-  const last = Math.max(match.first.getTime(), match.last.getTime());
-  const target = anchorDate.getTime();
-  const outsideRange = target < first - tolerance || target > last + tolerance;
-  if (
-    !Number.isFinite(match.date.getTime())
-    || outsideRange
-    || (forecast && match.distanceMilliseconds > tolerance)
-  ) {
-    const seriesKind = forecast ? "Forecast archive" : "Dataset";
-    throw new Error(
-      `${seriesKind} unavailable at ${utcHour(anchorDate)}`
-      + ` · available ${utcHour(match.first)}–${utcHour(match.last)}`,
-    );
-  }
-  return match.index;
-}
 
 export function ZarrViewer() {
   const mapContainerRef = useRef<HTMLDivElement>(null);
@@ -814,14 +293,7 @@ export function ZarrViewer() {
 
   useEffect(() => subscribeGoogleAuth(setGoogleAuth), []);
   useEffect(() => {
-    try {
-      window.localStorage.setItem(
-        UNIT_PREFERENCES_STORAGE_KEY,
-        JSON.stringify(unitPreferences),
-      );
-    } catch {
-      // Unit selection still works for the current session without storage.
-    }
+    storeUnitPreferences(unitPreferences);
   }, [unitPreferences]);
   const activeAxes = useMemo(() => {
     if (!info || !variable) return [];

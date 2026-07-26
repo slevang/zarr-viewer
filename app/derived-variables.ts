@@ -5,7 +5,7 @@ import {
 import type {
   DerivedVariableSpec,
   VariableConfig,
-} from "./dataset";
+} from "./data/types";
 import { unitConverter } from "./units";
 
 type OperatorDefinition = {

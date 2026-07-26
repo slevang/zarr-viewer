@@ -1,7 +1,5 @@
 import { IcechunkStore } from "icechunk-js";
-import proj4 from "proj4";
 import * as zarr from "zarrita";
-import type { Selector, TransformRequest } from "@carbonplan/zarr-layer";
 import type {
   AbsolutePath,
   GetOptions,
@@ -15,115 +13,48 @@ import {
   type DatasetSourceConfig,
   type DatasetSourceRole,
 } from "./catalog";
-import { createBoundedAsyncQueue } from "./async-queue";
+import type {
+  AxisConfig,
+  AxisKind,
+  StoreInfo,
+  VariableConfig,
+} from "./data/types";
+import {
+  hasSpatialDimensions,
+  isInitializationDimension,
+  isSpatialDimension,
+  isValidTimeDimension,
+} from "./data/dimensions";
 import { registerFixedScaleOffset } from "./codecs/fixedscaleoffset";
 import { registerGribberishCodec } from "./codecs/gribberish";
 import { registerPcodec } from "./codecs/pcodec";
 import {
   derivedVariableMatches,
-  executeDerivedPipeline,
-  nativeInputsForDerived,
 } from "./derived-variables";
 import {
   googleAuthorizedFetch,
 } from "./google-auth";
 
+export type {
+  AxisConfig,
+  AxisKind,
+  AxisSelection,
+  DerivedTransformConfig,
+  DerivedVariableSpec,
+  ForecastQuantiles,
+  PointForecastSeries,
+  PointSeries,
+  PointSeriesLoadOptions,
+  PointTimeSeries,
+  StoreInfo,
+  VariableConfig,
+} from "./data/types";
+export * from "./data/axes";
+export * from "./data/point-series";
+
 registerGribberishCodec();
 registerFixedScaleOffset();
 registerPcodec();
-
-export type AxisKind = "time" | "timedelta" | "number" | "category";
-
-export type AxisConfig = {
-  id: string;
-  label: string;
-  unit: string;
-  kind: AxisKind;
-  values: Array<number | string>;
-  defaultIndex?: number;
-  requiresStoreReload?: boolean;
-};
-
-export type DerivedTransformConfig = {
-  id: string;
-  kind: "elementwise";
-  operator: string;
-  inputs: string[];
-};
-
-export type DerivedVariableSpec = {
-  key: string;
-  inputs: Record<string, string>;
-  transforms: DerivedTransformConfig[];
-  output: string;
-};
-
-export type VariableConfig = {
-  id: string;
-  label: string;
-  unit: string;
-  standardName?: string;
-  dimensions: string[];
-  shape?: number[];
-  chunkShape?: number[];
-  innerChunkShape?: number[];
-  dataType?: string;
-  derived?: DerivedVariableSpec;
-};
-
-export type StoreInfo = {
-  dataset: DatasetConfig;
-  source: DatasetSourceConfig;
-  role: DatasetSourceRole;
-  variables: VariableConfig[];
-  derivedVariables?: VariableConfig[];
-  axes: Record<string, AxisConfig>;
-  store?: Readable;
-  layerOptions: {
-    source?: string;
-    store?: Readable;
-    zarrVersion: 2 | 3;
-    crs: string;
-    bounds?: [number, number, number, number];
-    latIsAscending?: boolean;
-    spatialDimensions?: { lat: string; lon: string };
-    proj4?: string;
-    transformRequest?: TransformRequest;
-  };
-};
-
-export type PointTimeSeries = {
-  kind: "history";
-  values: number[];
-  dates: Date[];
-  unit: string;
-  variableLabel: string;
-  latitude: number;
-  longitude: number;
-};
-
-export type ForecastQuantiles = {
-  min: number;
-  q10: number;
-  q25: number;
-  q50: number;
-  q75: number;
-  q90: number;
-  max: number;
-};
-
-export type PointForecastSeries = {
-  kind: "forecast";
-  quantiles: ForecastQuantiles[];
-  dates: Date[];
-  unit: string;
-  variableLabel: string;
-  latitude: number;
-  longitude: number;
-  memberCount: number;
-};
-
-export type PointSeries = PointTimeSeries | PointForecastSeries;
 
 type ZarrMetadata = {
   node_type?: string;
@@ -189,16 +120,11 @@ type WeatherZarrCatalog = {
   models?: Record<string, WeatherZarrCatalogRun[]>;
 };
 
-export type AxisSelection = Record<string, number>;
-
 const GOOGLE_TIME_ORIGIN_MS = Date.UTC(1900, 0, 1);
 const HOUR_MS = 60 * 60 * 1000;
 const STORE_READ_CONCURRENCY = 32;
 const STORE_READ_CACHE_BYTES = 1024 * 1024 * 1024;
-const SERIES_CHUNK_CONCURRENCY = 6;
 const GOOGLE_FETCH_ATTEMPTS = 3;
-export const SERIES_LOOKAHEAD_MS = 15 * 24 * HOUR_MS;
-export const SERIES_LOOKAHEAD_HOURS = SERIES_LOOKAHEAD_MS / HOUR_MS;
 const GOOGLE_LEVELS = [
   1, 2, 3, 5, 7, 10, 20, 30, 50, 70, 100, 125, 150, 175, 200, 225,
   250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 775, 800, 825,
@@ -228,8 +154,8 @@ function axisKind(name: string, attrs: Record<string, unknown>, dataType = ""): 
     || standardName === "forecast_reference_time"
     || units.includes(" since ")
     || lowerName === "time"
-    || lowerName === "init_time"
-    || lowerName === "valid_time"
+    || isInitializationDimension(name)
+    || isValidTimeDimension(name)
   ) return "time";
 
   if (
@@ -249,21 +175,6 @@ function axisLabel(name: string, attrs: Record<string, unknown>) {
   return longName || name.replaceAll("_", " ");
 }
 
-function isSpatialDimension(name: string, source: DatasetSourceConfig) {
-  const lowerName = name.toLowerCase();
-  const configured = source.spatialDimensions;
-  return (
-    lowerName === "latitude"
-    || lowerName === "longitude"
-    || lowerName === "lat"
-    || lowerName === "lon"
-    || lowerName === "x"
-    || lowerName === "y"
-    || configured?.lat === name
-    || configured?.lon === name
-  );
-}
-
 function defaultLayerOptions(
   source: DatasetSourceConfig,
   store?: Readable,
@@ -277,6 +188,21 @@ function defaultLayerOptions(
     spatialDimensions: source.spatialDimensions,
     proj4: source.proj4,
   };
+}
+
+function recordDimensionLengths(
+  lengths: Map<string, number>,
+  dimensions: string[],
+  shape: number[] | undefined,
+  source: DatasetSourceConfig,
+) {
+  dimensions.forEach((dimension, index) => {
+    if (isSpatialDimension(dimension, source)) return;
+    lengths.set(
+      dimension,
+      Math.max(lengths.get(dimension) ?? 0, shape?.[index] ?? 0),
+    );
+  });
 }
 
 function cacheStoreReads(
@@ -410,22 +336,14 @@ async function loadIcechunkStoreInfo(
     const dimensions = metadata.dimension_names?.filter(
       (dimension): dimension is string => typeof dimension === "string",
     ) ?? [];
-    const hasLatitude = dimensions.some((dimension) =>
-      ["latitude", "lat", "y", source.spatialDimensions?.lat].includes(dimension),
-    );
-    const hasLongitude = dimensions.some((dimension) =>
-      ["longitude", "lon", "x", source.spatialDimensions?.lon].includes(dimension),
-    );
-    if (!hasLatitude || !hasLongitude) continue;
+    if (!hasSpatialDimensions(dimensions, source)) continue;
 
-    dimensions.forEach((dimension, index) => {
-      if (!isSpatialDimension(dimension, source)) {
-        dimensionLengths.set(
-          dimension,
-          Math.max(dimensionLengths.get(dimension) ?? 0, metadata.shape?.[index] ?? 0),
-        );
-      }
-    });
+    recordDimensionLengths(
+      dimensionLengths,
+      dimensions,
+      metadata.shape,
+      source,
+    );
 
     const attrs = metadata.attributes ?? {};
     const longName = typeof attrs.long_name === "string" ? attrs.long_name.trim() : "";
@@ -482,25 +400,14 @@ function variablesFromV3Metadata(
     const dimensions = arrayMetadata.dimension_names?.filter(
       (dimension): dimension is string => typeof dimension === "string",
     ) ?? [];
-    const hasLatitude = dimensions.some((dimension) =>
-      ["latitude", "lat", "y", source.spatialDimensions?.lat].includes(dimension),
-    );
-    const hasLongitude = dimensions.some((dimension) =>
-      ["longitude", "lon", "x", source.spatialDimensions?.lon].includes(dimension),
-    );
-    if (!hasLatitude || !hasLongitude) continue;
+    if (!hasSpatialDimensions(dimensions, source)) continue;
 
-    dimensions.forEach((dimension, index) => {
-      if (!isSpatialDimension(dimension, source)) {
-        dimensionLengths.set(
-          dimension,
-          Math.max(
-            dimensionLengths.get(dimension) ?? 0,
-            arrayMetadata.shape?.[index] ?? 0,
-          ),
-        );
-      }
-    });
+    recordDimensionLengths(
+      dimensionLengths,
+      dimensions,
+      arrayMetadata.shape,
+      source,
+    );
 
     const attrs = arrayMetadata.attributes ?? {};
     const longName = typeof attrs.long_name === "string" ? attrs.long_name.trim() : "";
@@ -831,29 +738,18 @@ function variablesFromV2Metadata(
       || !dimensions.every((value) => typeof value === "string")
     ) continue;
     const typedDimensions = dimensions as string[];
-    const hasLatitude = typedDimensions.some((dimension) =>
-      ["latitude", "lat", "y", source.spatialDimensions?.lat].includes(dimension)
-    );
-    const hasLongitude = typedDimensions.some((dimension) =>
-      ["longitude", "lon", "x", source.spatialDimensions?.lon].includes(dimension)
-    );
-    if (!hasLatitude || !hasLongitude) continue;
+    if (!hasSpatialDimensions(typedDimensions, source)) continue;
 
     const arrayMetadata = metadata[`${id}/.zarray`] as
       | ZarrV2ArrayMetadata
       | undefined;
     const shape = numericArray(arrayMetadata?.shape);
-    typedDimensions.forEach((dimension, index) => {
-      if (!isSpatialDimension(dimension, source)) {
-        dimensionLengths.set(
-          dimension,
-          Math.max(
-            dimensionLengths.get(dimension) ?? 0,
-            shape?.[index] ?? 0,
-          ),
-        );
-      }
-    });
+    recordDimensionLengths(
+      dimensionLengths,
+      typedDimensions,
+      shape,
+      source,
+    );
     const longName = typeof attrs.long_name === "string"
       ? attrs.long_name.trim()
       : "";
@@ -1362,6 +1258,21 @@ async function loadGoogleStoreInfo(
   };
 }
 
+type StoreInfoLoader = (
+  dataset: DatasetConfig,
+  source: DatasetSourceConfig,
+  role: DatasetSourceRole,
+  targetDate?: Date,
+) => Promise<StoreInfo>;
+
+const STORE_INFO_LOADERS = {
+  zarr: loadV3StoreInfo,
+  icechunk: loadIcechunkStoreInfo,
+  weatherzarr: loadWeatherZarrStoreInfo,
+  weathernext: loadWeatherNextStoreInfo,
+  "google-arco": loadGoogleStoreInfo,
+} satisfies Record<DatasetSourceConfig["kind"], StoreInfoLoader>;
+
 const storeInfoPromises = new Map<string, Promise<StoreInfo>>();
 
 export function loadStoreInfo(
@@ -1385,16 +1296,11 @@ export function loadStoreInfo(
   const cached = storeInfoPromises.get(cacheKey);
   if (cached) return cached;
 
-  const promise = Promise.resolve(
-    source.kind === "icechunk"
-      ? loadIcechunkStoreInfo(dataset, source, role)
-      : source.kind === "weatherzarr"
-        ? loadWeatherZarrStoreInfo(dataset, source, role, targetDate)
-        : source.kind === "weathernext"
-          ? loadWeatherNextStoreInfo(dataset, source, role, targetDate)
-        : dataset.id === "google-arco-era5"
-          ? loadGoogleStoreInfo(dataset, source, role)
-          : loadV3StoreInfo(dataset, source, role)
+  const promise = STORE_INFO_LOADERS[source.kind](
+    dataset,
+    source,
+    role,
+    targetDate,
   ).then((info) => ({
     ...info,
     derivedVariables: derivedVariableMatches(info.variables),
@@ -1406,910 +1312,5 @@ export function loadStoreInfo(
   return promise;
 }
 
-export function defaultSelections(info: StoreInfo, variable: VariableConfig): AxisSelection {
-  const selections: AxisSelection = {};
-  const hasLeadAxis = variable.dimensions.some(
-    (candidate) => info.axes[candidate]?.kind === "timedelta",
-  );
-  for (const dimension of variable.dimensions) {
-    const axis = info.axes[dimension];
-    if (!axis) continue;
-    const historicalSeries = info.role === "series"
-      && !hasLeadAxis;
-    const forecastValidTime = info.dataset.category === "forecast"
-      && axis.kind === "time"
-      && (
-        dimension.toLowerCase().includes("valid")
-        || info.source.kind === "weathernext"
-      )
-      && !hasLeadAxis;
-    selections[dimension] = axis.kind === "time"
-      ? forecastValidTime
-        ? 0
-        : Math.max(
-        0,
-        axis.values.length - (historicalSeries ? SERIES_LOOKAHEAD_HOURS : 1),
-      )
-      : 0;
-  }
-  for (const axis of Object.values(info.axes)) {
-    if (axis.requiresStoreReload) {
-      selections[axis.id] = axis.defaultIndex ?? 0;
-    }
-  }
-  return selections;
-}
-
-export function reconcileSelections(
-  info: StoreInfo,
-  variable: VariableConfig,
-  current: AxisSelection,
-) {
-  const next = defaultSelections(info, variable);
-  const selectableDimensions = new Set([
-    ...variable.dimensions,
-    ...Object.values(info.axes)
-      .filter((axis) => axis.requiresStoreReload)
-      .map((axis) => axis.id),
-  ]);
-  for (const dimension of selectableDimensions) {
-    const axis = info.axes[dimension];
-    const selected = current[dimension];
-    if (!axis || selected === undefined) continue;
-    next[dimension] = Math.max(0, Math.min(axis.values.length - 1, selected));
-  }
-  return next;
-}
-
-function temporalDimensions(info: StoreInfo, variable: VariableConfig) {
-  const dimensions = [
-    ...variable.dimensions,
-    ...Object.values(info.axes)
-      .filter((axis) => axis.requiresStoreReload)
-      .map((axis) => axis.id),
-  ];
-  const time = dimensions.filter(
-    (dimension) => info.axes[dimension]?.kind === "time",
-  );
-  const valid = time.find((dimension) =>
-    dimension.toLowerCase().includes("valid"),
-  );
-  const initialization = valid
-    ?? time.find((dimension) =>
-      ["init_time", "forecast_reference_time", "forecast_date"].includes(
-        dimension.toLowerCase(),
-      ),
-    )
-    ?? time[0];
-  const lead = dimensions.find(
-    (dimension) => info.axes[dimension]?.kind === "timedelta",
-  );
-  return { valid, initialization, lead };
-}
-
-export function validDateRange(
-  info: StoreInfo,
-  variable: VariableConfig,
-): { first: Date; last: Date } | undefined {
-  const { valid, initialization, lead } = temporalDimensions(info, variable);
-  if (!initialization) return undefined;
-  const timeAxis = info.axes[initialization];
-  if (!timeAxis?.values.length) return undefined;
-  const endpointDates = [
-    axisValueAsDate(info.dataset, timeAxis, 0).getTime(),
-    axisValueAsDate(
-      info.dataset,
-      timeAxis,
-      timeAxis.values.length - 1,
-    ).getTime(),
-  ];
-  if (!endpointDates.every(Number.isFinite)) return undefined;
-  let first = Math.min(...endpointDates);
-  let last = Math.max(...endpointDates);
-  if (!valid && lead) {
-    const leadAxis = info.axes[lead];
-    const leadOffsets = leadAxis.values.map((_, index) =>
-      timedeltaMilliseconds(leadAxis, index)
-    ).filter(Number.isFinite);
-    if (leadOffsets.length) {
-      first += Math.min(...leadOffsets);
-      last += Math.max(...leadOffsets);
-    }
-  }
-  return {
-    first: new Date(first),
-    last: new Date(last),
-  };
-}
-
-export function selectedValidDate(
-  info: StoreInfo,
-  variable: VariableConfig,
-  selections: AxisSelection,
-) {
-  const { valid, initialization, lead } = temporalDimensions(info, variable);
-  if (!initialization) return undefined;
-  const base = axisValueAsDate(
-    info.dataset,
-    info.axes[initialization],
-    selections[initialization] ?? 0,
-  );
-  if (valid || !lead) return base;
-  return new Date(
-    base.getTime()
-    + timedeltaMilliseconds(info.axes[lead], selections[lead] ?? 0),
-  );
-}
-
-export function seriesStartDate(
-  info: StoreInfo,
-  variable: VariableConfig,
-  selections: AxisSelection,
-) {
-  const { lead } = temporalDimensions(info, variable);
-  return selectedValidDate(
-    info,
-    variable,
-    lead ? { ...selections, [lead]: 0 } : selections,
-  );
-}
-
-function latestTimeIndexAtOrBefore(
-  info: StoreInfo,
-  axis: AxisConfig,
-  date: Date,
-) {
-  const match = axisDateMatch(info.dataset, axis, date);
-  let index = match.index;
-  if (match.date.getTime() > date.getTime()) {
-    const ascending = match.first.getTime() <= match.last.getTime();
-    index += ascending ? -1 : 1;
-  }
-  return Math.max(0, Math.min(axis.values.length - 1, index));
-}
-
-function nearestTimedeltaIndex(axis: AxisConfig, milliseconds: number) {
-  let nearest = 0;
-  let distance = Number.POSITIVE_INFINITY;
-  for (let index = 0; index < axis.values.length; index += 1) {
-    const candidate = Math.abs(timedeltaMilliseconds(axis, index) - milliseconds);
-    if (candidate < distance) {
-      nearest = index;
-      distance = candidate;
-    }
-  }
-  return nearest;
-}
-
-function matchLeadToValidDate(
-  info: StoreInfo,
-  variable: VariableConfig,
-  selections: AxisSelection,
-  validDate: Date,
-) {
-  const { valid, initialization, lead } = temporalDimensions(info, variable);
-  if (valid || !initialization || !lead) return selections;
-  const initializationDate = axisValueAsDate(
-    info.dataset,
-    info.axes[initialization],
-    selections[initialization] ?? 0,
-  );
-  return {
-    ...selections,
-    [lead]: nearestTimedeltaIndex(
-      info.axes[lead],
-      validDate.getTime() - initializationDate.getTime(),
-    ),
-  };
-}
-
-export function selectionsForValidDate(
-  info: StoreInfo,
-  variable: VariableConfig,
-  validDate: Date,
-  initial = defaultSelections(info, variable),
-) {
-  const next = { ...initial };
-  const { valid, initialization } = temporalDimensions(info, variable);
-  if (!initialization || !Number.isFinite(validDate.getTime())) return next;
-  if (!info.axes[initialization].requiresStoreReload) {
-    next[initialization] = valid
-      ? axisIndexForDate(info.dataset, info.axes[initialization], validDate)
-      : latestTimeIndexAtOrBefore(info, info.axes[initialization], validDate);
-  }
-  return matchLeadToValidDate(info, variable, next, validDate);
-}
-
-export function selectionsAfterAxisChange(
-  info: StoreInfo,
-  variable: VariableConfig,
-  current: AxisSelection,
-  axis: AxisConfig,
-  nextIndex: number,
-) {
-  const validDate = selectedValidDate(info, variable, current);
-  const next = { ...current, [axis.id]: nextIndex };
-  return axis.kind === "time" && validDate
-    ? matchLeadToValidDate(info, variable, next, validDate)
-    : next;
-}
-
-export function selectorFor(
-  variable: VariableConfig,
-  selections: AxisSelection,
-): Selector {
-  const selector: Selector = {};
-  for (const dimension of variable.dimensions) {
-    if (dimension in selections) {
-      selector[dimension] = { selected: selections[dimension], type: "index" };
-    }
-  }
-  return selector;
-}
-
-function cfTimeOriginMilliseconds(origin: string) {
-  const trimmed = origin.trim();
-  const normalized = trimmed
-    .replace(/\s+(UTC|GMT)$/i, "Z")
-    .replace(/^(\d{4}-\d{2}-\d{2})\s+/, "$1T");
-  if (/^\d{4}-\d{2}-\d{2}$/.test(normalized)) {
-    return Date.parse(`${normalized}T00:00:00Z`);
-  }
-  const hasTimezone = (
-    /Z$/i.test(normalized)
-    || /[+-]\d{2}(?::?\d{2})?$/.test(normalized)
-  );
-  return Date.parse(hasTimezone ? normalized : `${normalized}Z`);
-}
-
-export function axisValueAsDate(dataset: DatasetConfig, axis: AxisConfig, index: number) {
-  const value = Number(axis.values[index]);
-  if (dataset.id === "google-arco-era5") {
-    return new Date(GOOGLE_TIME_ORIGIN_MS + value * HOUR_MS);
-  }
-  const unit = axis.unit.toLowerCase();
-  const multiplier = unit.startsWith("nanosecond") ? 1 / 1_000_000
-    : unit.startsWith("microsecond") ? 1 / 1_000
-      : unit.startsWith("millisecond") ? 1
-        : unit.startsWith("minute") ? 60_000
-          : unit.startsWith("hour") ? HOUR_MS
-            : unit.startsWith("day") ? 24 * HOUR_MS
-              : 1_000;
-  const sinceMatch = axis.unit.match(/since\s+(.+)$/i);
-  const origin = sinceMatch ? cfTimeOriginMilliseconds(sinceMatch[1]) : 0;
-  return new Date(origin + value * multiplier);
-}
-
-export function axisDateInputValue(
-  dataset: DatasetConfig,
-  axis: AxisConfig,
-  index: number,
-) {
-  const date = axisValueAsDate(dataset, axis, index);
-  return Number.isNaN(date.getTime()) ? "" : date.toISOString().slice(0, 16);
-}
-
-export function axisIndexForDate(
-  dataset: DatasetConfig,
-  axis: AxisConfig,
-  date: Date,
-) {
-  return axisDateMatch(dataset, axis, date).index;
-}
-
-export type AxisDateMatch = {
-  index: number;
-  date: Date;
-  first: Date;
-  last: Date;
-  distanceMilliseconds: number;
-};
-
-export function axisDateMatch(
-  dataset: DatasetConfig,
-  axis: AxisConfig,
-  date: Date,
-): AxisDateMatch {
-  const target = date.getTime();
-  if (!Number.isFinite(target) || axis.values.length === 0) {
-    const invalid = new Date(NaN);
-    return {
-      index: 0,
-      date: invalid,
-      first: invalid,
-      last: invalid,
-      distanceMilliseconds: Number.POSITIVE_INFINITY,
-    };
-  }
-  let low = 0;
-  let high = axis.values.length - 1;
-  const first = axisValueAsDate(dataset, axis, low);
-  const last = axisValueAsDate(dataset, axis, high);
-  const ascending = first.getTime() <= last.getTime();
-
-  while (low < high) {
-    const middle = Math.floor((low + high) / 2);
-    const value = axisValueAsDate(dataset, axis, middle).getTime();
-    const moveRight = ascending ? value < target : value > target;
-    if (moveRight) low = middle + 1;
-    else high = middle;
-  }
-
-  let index = low;
-  if (low > 0) {
-    const previous = low - 1;
-    const currentDistance = Math.abs(
-      axisValueAsDate(dataset, axis, low).getTime() - target,
-    );
-    const previousDistance = Math.abs(
-      axisValueAsDate(dataset, axis, previous).getTime() - target,
-    );
-    index = currentDistance < previousDistance ? low : previous;
-  }
-  const matchedDate = axisValueAsDate(dataset, axis, index);
-  return {
-    index,
-    date: matchedDate,
-    first,
-    last,
-    distanceMilliseconds: Math.abs(matchedDate.getTime() - target),
-  };
-}
-
-export function formatAxisValue(
-  dataset: DatasetConfig,
-  axis: AxisConfig,
-  index: number,
-) {
-  const value = axis.values[index];
-  if (axis.kind === "time") {
-    const date = axisValueAsDate(dataset, axis, index);
-    return Number.isNaN(date.getTime())
-      ? String(value)
-      : date.toISOString().replace("T", " ").slice(0, 16) + " UTC";
-  }
-  if (axis.kind === "timedelta") {
-    const numeric = Number(value);
-    const seconds = axis.unit.toLowerCase().startsWith("hour")
-      ? numeric * 3600
-      : axis.unit.toLowerCase().startsWith("day")
-        ? numeric * 86400
-        : numeric;
-    const hours = seconds / 3600;
-    return Number.isInteger(hours) ? `+${hours} h` : `+${hours.toFixed(1)} h`;
-  }
-  return `${value}${axis.unit ? ` ${axis.unit}` : ""}`;
-}
-
-export function toDataCoordinates(
-  dataset: DatasetConfig,
-  longitude: number,
-  latitude: number,
-): [number, number] {
-  const source = getDatasetSource(dataset, "map");
-  if (
-    source?.crs === "EPSG:4326"
-    && source.bounds
-    && source.bounds[0] >= 0
-    && source.bounds[2] > 180
-  ) {
-    return [((longitude % 360) + 360) % 360, latitude];
-  }
-  return [longitude, latitude];
-}
-
-function nearestCoordinateIndex(values: ArrayLike<number>, target: number) {
-  let low = 0;
-  let high = values.length - 1;
-  const ascending = values[0] <= values[high];
-  while (low < high) {
-    const middle = Math.floor((low + high) / 2);
-    const moveRight = ascending
-      ? values[middle] < target
-      : values[middle] > target;
-    if (moveRight) low = middle + 1;
-    else high = middle;
-  }
-  if (low === 0) return 0;
-  const previous = low - 1;
-  return Math.abs(values[low] - target) < Math.abs(values[previous] - target)
-    ? low
-    : previous;
-}
-
-function nearestLongitudeIndex(values: ArrayLike<number>, target: number) {
-  let nearestIndex = 0;
-  let nearestDistance = Infinity;
-  for (let index = 0; index < values.length; index += 1) {
-    const difference = ((Number(values[index]) - target + 540) % 360) - 180;
-    const distance = Math.abs(difference);
-    if (distance < nearestDistance) {
-      nearestDistance = distance;
-      nearestIndex = index;
-    }
-  }
-  return nearestIndex;
-}
-
-function spatialDimension(
-  info: StoreInfo,
-  variable: VariableConfig,
-  axis: "lat" | "lon",
-) {
-  const configured = info.source.spatialDimensions?.[axis];
-  if (configured && variable.dimensions.includes(configured)) return configured;
-  const aliases = axis === "lat"
-    ? ["latitude", "lat", "y"]
-    : ["longitude", "lon", "x"];
-  return variable.dimensions.find((dimension) =>
-    aliases.includes(dimension.toLowerCase()),
-  );
-}
-
-function pointInSourceCoordinates(
-  source: DatasetSourceConfig,
-  longitude: number,
-  latitude: number,
-  xValues: ArrayLike<number>,
-) {
-  if (source.proj4) {
-    const [x, y] = proj4("EPSG:4326", source.proj4, [longitude, latitude]);
-    return [x, y] as const;
-  }
-  const x = xValues[0] >= 0
-    ? ((longitude % 360) + 360) % 360
-    : longitude;
-  return [x, latitude] as const;
-}
-
-async function pointSpatialSelection(
-  info: StoreInfo,
-  variable: VariableConfig,
-  longitude: number,
-  latitude: number,
-  options: PointSeriesLoadOptions = {},
-) {
-  if (!info.store) return null;
-  const latitudeDimension = spatialDimension(info, variable, "lat");
-  const longitudeDimension = spatialDimension(info, variable, "lon");
-  if (!latitudeDimension || !longitudeDimension) return null;
-
-  const root = zarr.root(info.store);
-  const [latitudeArray, longitudeArray] = await Promise.all([
-    zarr.open(root.resolve(latitudeDimension), { kind: "array" }),
-    zarr.open(root.resolve(longitudeDimension), { kind: "array" }),
-  ]);
-  const [latitudeData, longitudeData] = await Promise.all([
-    zarr.get(latitudeArray, null, zarrReadOptions(options)),
-    zarr.get(longitudeArray, null, zarrReadOptions(options)),
-  ]);
-  const latitudeValues = Array.from(
-    latitudeData.data as ArrayLike<number | bigint>,
-    Number,
-  );
-  const longitudeValues = Array.from(
-    longitudeData.data as ArrayLike<number | bigint>,
-    Number,
-  );
-  const [sourceLongitude, sourceLatitude] = pointInSourceCoordinates(
-    info.source,
-    longitude,
-    latitude,
-    longitudeValues,
-  );
-  return {
-    latitudeDimension,
-    longitudeDimension,
-    latitudeIndex: nearestCoordinateIndex(latitudeValues, sourceLatitude),
-    longitudeIndex: info.source.proj4
-      ? nearestCoordinateIndex(longitudeValues, sourceLongitude)
-      : nearestLongitudeIndex(longitudeValues, sourceLongitude),
-  };
-}
-
-export type PointSeriesLoadOptions = {
-  signal?: AbortSignal;
-  concurrency?: number;
-};
-
-function zarrReadOptions(options: PointSeriesLoadOptions) {
-  return {
-    signal: options.signal,
-    createQueue: () => createBoundedAsyncQueue(
-      options.concurrency ?? SERIES_CHUNK_CONCURRENCY,
-    ),
-  };
-}
-
-export async function loadPointTimeSeries(
-  info: StoreInfo,
-  variable: VariableConfig,
-  selections: AxisSelection,
-  longitude: number,
-  latitude: number,
-  options: PointSeriesLoadOptions = {},
-): Promise<PointTimeSeries | null> {
-  if (info.role !== "series" || !info.store) return null;
-  const timeDimension = variable.dimensions.find(
-    (dimension) => info.axes[dimension]?.kind === "time",
-  );
-  if (!timeDimension) return null;
-  const spatial = await pointSpatialSelection(
-    info,
-    variable,
-    longitude,
-    latitude,
-    options,
-  );
-  if (!spatial) return null;
-  const {
-    latitudeDimension,
-    longitudeDimension,
-    latitudeIndex,
-    longitudeIndex,
-  } = spatial;
-  const dataArray = await zarr.open(
-    zarr.root(info.store).resolve(variable.id),
-    { kind: "array" },
-  );
-  const timeAxis = info.axes[timeDimension];
-  const start = selections[timeDimension] ?? 0;
-  const stop = Math.min(timeAxis.values.length, start + SERIES_LOOKAHEAD_HOURS);
-  const request = variable.dimensions.map((dimension) => {
-    if (dimension === timeDimension) return zarr.slice(start, stop);
-    if (dimension === latitudeDimension) return latitudeIndex;
-    if (dimension === longitudeDimension) return longitudeIndex;
-    return selections[dimension] ?? 0;
-  });
-  const result = await zarr.get(dataArray, request, zarrReadOptions(options));
-  const values = Array.from(result.data as ArrayLike<number | bigint>, Number);
-  return {
-    kind: "history",
-    values,
-    dates: Array.from(
-      { length: values.length },
-      (_, offset) => axisValueAsDate(info.dataset, timeAxis, start + offset),
-    ),
-    unit: variable.unit,
-    variableLabel: variable.label,
-    latitude,
-    longitude,
-  };
-}
-
-function quantile(sorted: number[], probability: number) {
-  if (!sorted.length) return NaN;
-  const position = (sorted.length - 1) * probability;
-  const lower = Math.floor(position);
-  const upper = Math.ceil(position);
-  if (lower === upper) return sorted[lower];
-  const weight = position - lower;
-  return sorted[lower] * (1 - weight) + sorted[upper] * weight;
-}
-
-type RawPointForecast = {
-  values: Float64Array;
-  dates: Date[];
-  leadCount: number;
-  memberCount: number;
-  latitude: number;
-  longitude: number;
-};
-
-export function timedeltaMilliseconds(axis: AxisConfig, index: number) {
-  const value = Number(axis.values[index]);
-  const unit = axis.unit.toLowerCase();
-  if (unit.startsWith("nanosecond")) return value / 1_000_000;
-  if (unit.startsWith("microsecond")) return value / 1_000;
-  if (unit.startsWith("day")) return value * 86_400_000;
-  if (unit.startsWith("hour")) return value * HOUR_MS;
-  if (unit.startsWith("minute")) return value * 60_000;
-  if (unit.startsWith("millisecond")) return value;
-  return value * 1_000;
-}
-
-async function loadRawPointForecast(
-  info: StoreInfo,
-  variable: VariableConfig,
-  selections: AxisSelection,
-  longitude: number,
-  latitude: number,
-  options: PointSeriesLoadOptions = {},
-): Promise<RawPointForecast | null> {
-  if (info.role !== "series" || !info.store) return null;
-  const initDimension = [
-    ...variable.dimensions,
-    ...Object.values(info.axes)
-      .filter((axis) => axis.requiresStoreReload)
-      .map((axis) => axis.id),
-  ].find(
-    (dimension) =>
-      info.axes[dimension]?.kind === "time"
-      && ["init_time", "forecast_reference_time", "forecast_date"].includes(
-        dimension.toLowerCase(),
-      ),
-  );
-  const leadDimension = variable.dimensions.find(
-    (dimension) => info.axes[dimension]?.kind === "timedelta",
-  );
-  const memberDimension = variable.dimensions.find((dimension) =>
-    ["ensemble_member", "ensemble", "member", "sample", "number"].includes(
-      dimension.toLowerCase(),
-    ),
-  );
-  if (!initDimension || !leadDimension) {
-    return null;
-  }
-
-  const spatial = await pointSpatialSelection(
-    info,
-    variable,
-    longitude,
-    latitude,
-    options,
-  );
-  if (!spatial) return null;
-  const {
-    latitudeDimension,
-    longitudeDimension,
-    latitudeIndex,
-    longitudeIndex,
-  } = spatial;
-  const dataArray = await zarr.open(
-    zarr.root(info.store).resolve(variable.id),
-    { kind: "array" },
-  );
-  const leadAxis = info.axes[leadDimension];
-  const initAxis = info.axes[initDimension];
-  const memberCount = memberDimension
-    ? info.axes[memberDimension]?.values.length ?? 1
-    : 1;
-  const leadCount = Math.max(
-    1,
-    leadAxis.values.findLastIndex(
-      (_, index) => timedeltaMilliseconds(leadAxis, index) <= SERIES_LOOKAHEAD_MS,
-    ) + 1,
-  );
-  const request = variable.dimensions.map((dimension) => {
-    if (dimension === leadDimension) return zarr.slice(0, leadCount);
-    if (dimension === memberDimension) return zarr.slice(0, memberCount);
-    if (dimension === latitudeDimension) return latitudeIndex;
-    if (dimension === longitudeDimension) return longitudeIndex;
-    return selections[dimension] ?? 0;
-  });
-  const result = await zarr.get(dataArray, request, zarrReadOptions(options));
-  const remainingDimensions = variable.dimensions.filter(
-    (dimension) => dimension === leadDimension || dimension === memberDimension,
-  );
-  const leadPosition = remainingDimensions.indexOf(leadDimension);
-  const memberPosition = memberDimension
-    ? remainingDimensions.indexOf(memberDimension)
-    : -1;
-  const sourceValues = result.data as ArrayLike<number | bigint>;
-  const values = new Float64Array(leadCount * memberCount);
-  for (let leadIndex = 0; leadIndex < leadCount; leadIndex += 1) {
-    for (let memberIndex = 0; memberIndex < memberCount; memberIndex += 1) {
-      let offset = leadIndex * result.stride[leadPosition];
-      if (memberPosition >= 0) {
-        offset += memberIndex * result.stride[memberPosition];
-      }
-      values[leadIndex * memberCount + memberIndex] = Number(
-        sourceValues[offset],
-      );
-    }
-  }
-  const initDate = axisValueAsDate(
-    info.dataset,
-    initAxis,
-    selections[initDimension] ?? 0,
-  );
-  return {
-    values,
-    dates: leadAxis.values.slice(0, leadCount).map(
-      (_, index) => new Date(
-        initDate.getTime() + timedeltaMilliseconds(leadAxis, index),
-      ),
-    ),
-    leadCount,
-    memberCount,
-    latitude,
-    longitude,
-  };
-}
-
-function pointForecastFromRaw(
-  raw: RawPointForecast,
-  variable: VariableConfig,
-  values: ArrayLike<number | bigint>,
-  unit = variable.unit,
-): PointForecastSeries {
-  const allQuantiles = Array.from(
-    { length: raw.leadCount },
-    (_, leadIndex) => {
-      const members = Array.from(
-        { length: raw.memberCount },
-        (_, memberIndex) => Number(
-          values[leadIndex * raw.memberCount + memberIndex],
-        ),
-      ).filter(Number.isFinite).sort((a, b) => a - b);
-      return {
-      min: members[0] ?? NaN,
-      q10: quantile(members, 0.1),
-      q25: quantile(members, 0.25),
-      q50: quantile(members, 0.5),
-      q75: quantile(members, 0.75),
-      q90: quantile(members, 0.9),
-      max: members.at(-1) ?? NaN,
-      };
-    },
-  );
-  const lastFiniteIndex = allQuantiles.findLastIndex((item) =>
-    Number.isFinite(item.q50),
-  );
-  const quantiles = allQuantiles.slice(0, Math.max(1, lastFiniteIndex + 1));
-  return {
-    kind: "forecast",
-    quantiles,
-    dates: raw.dates.slice(0, quantiles.length),
-    unit,
-    variableLabel: variable.label,
-    latitude: raw.latitude,
-    longitude: raw.longitude,
-    memberCount: raw.memberCount,
-  };
-}
-
-export async function loadPointForecast(
-  info: StoreInfo,
-  variable: VariableConfig,
-  selections: AxisSelection,
-  longitude: number,
-  latitude: number,
-  options: PointSeriesLoadOptions = {},
-): Promise<PointForecastSeries | null> {
-  const raw = await loadRawPointForecast(
-    info,
-    variable,
-    selections,
-    longitude,
-    latitude,
-    options,
-  );
-  return raw
-    ? pointForecastFromRaw(raw, variable, raw.values)
-    : null;
-}
-
-function sameDates(first: Date[], second: Date[]) {
-  return first.length === second.length
-    && first.every(
-      (date, index) => date.getTime() === second[index]?.getTime(),
-    );
-}
-
-async function loadDerivedPointTimeSeries(
-  info: StoreInfo,
-  variable: VariableConfig,
-  selections: AxisSelection,
-  longitude: number,
-  latitude: number,
-  options: PointSeriesLoadOptions,
-): Promise<PointTimeSeries | null> {
-  const inputs = nativeInputsForDerived(variable, info.variables);
-  const loaded = await Promise.all(inputs.map(
-    ({ variable: input }) => loadPointTimeSeries(
-      info,
-      input,
-      selections,
-      longitude,
-      latitude,
-      options,
-    ),
-  ));
-  const first = loaded[0];
-  if (
-    !first
-    || loaded.some((series) => !series || !sameDates(first.dates, series.dates))
-  ) return null;
-  const derived = executeDerivedPipeline(
-    variable,
-    info.variables,
-    Object.fromEntries(inputs.map(({ key }, index) => [
-      key,
-      loaded[index]?.values ?? [],
-    ])),
-  );
-  return {
-    ...first,
-    values: Array.from(derived.values),
-    unit: derived.unit,
-    variableLabel: variable.label,
-  };
-}
-
-async function loadDerivedPointForecast(
-  info: StoreInfo,
-  variable: VariableConfig,
-  selections: AxisSelection,
-  longitude: number,
-  latitude: number,
-  options: PointSeriesLoadOptions,
-): Promise<PointForecastSeries | null> {
-  const inputs = nativeInputsForDerived(variable, info.variables);
-  const loaded = await Promise.all(inputs.map(
-    ({ variable: input }) => loadRawPointForecast(
-      info,
-      input,
-      selections,
-      longitude,
-      latitude,
-      options,
-    ),
-  ));
-  const first = loaded[0];
-  if (
-    !first
-    || loaded.some((series) => (
-      !series
-      || series.memberCount !== first.memberCount
-      || !sameDates(first.dates, series.dates)
-    ))
-  ) return null;
-  const derived = executeDerivedPipeline(
-    variable,
-    info.variables,
-    Object.fromEntries(inputs.map(({ key }, index) => [
-      key,
-      loaded[index]?.values ?? [],
-    ])),
-  );
-  return pointForecastFromRaw(
-    first,
-    variable,
-    derived.values,
-    derived.unit,
-  );
-}
-
-export function isForecastSeries(
-  info: StoreInfo,
-  variable: VariableConfig,
-) {
-  return variable.dimensions.some(
-    (dimension) => info.axes[dimension]?.kind === "timedelta",
-  );
-}
-
-export function loadPointSeries(
-  info: StoreInfo,
-  variable: VariableConfig,
-  selections: AxisSelection,
-  longitude: number,
-  latitude: number,
-  options: PointSeriesLoadOptions = {},
-) {
-  if (variable.derived) {
-    return isForecastSeries(info, variable)
-      ? loadDerivedPointForecast(
-        info,
-        variable,
-        selections,
-        longitude,
-        latitude,
-        options,
-      )
-      : loadDerivedPointTimeSeries(
-        info,
-        variable,
-        selections,
-        longitude,
-        latitude,
-        options,
-      );
-  }
-  return isForecastSeries(info, variable)
-    ? loadPointForecast(info, variable, selections, longitude, latitude, options)
-    : loadPointTimeSeries(info, variable, selections, longitude, latitude, options);
-}
 
 export { transformGoogleRequest };

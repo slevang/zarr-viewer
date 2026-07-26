@@ -12,9 +12,11 @@ import {
 } from "../app/derived-store";
 import {
   loadPointSeries,
-  type StoreInfo,
-  type VariableConfig,
-} from "../app/dataset";
+} from "../app/data/point-series";
+import type {
+  StoreInfo,
+  VariableConfig,
+} from "../app/data/types";
 
 function close(actual: number, expected: number, tolerance = 1e-5) {
   if (Math.abs(actual - expected) > tolerance) {
@@ -215,9 +217,12 @@ for (const [id, entry] of Object.entries(sourceMetadata)) {
     new TextEncoder().encode(JSON.stringify(entry)),
   );
 }
+const sourceReadCounts = new Map<string, number>();
 const sourceStore: Readable = {
   get(key) {
-    return Promise.resolve(sourceChunks.get(String(key)));
+    const path = String(key);
+    sourceReadCounts.set(path, (sourceReadCounts.get(path) ?? 0) + 1);
+    return Promise.resolve(sourceChunks.get(path));
   },
 };
 const dataset = getDataset("weatherzarr-ecmwf-ifs");
@@ -263,6 +268,7 @@ Array.from(windSpeedValues.data as ArrayLike<number>).forEach(
   (value, index) => close(value, expectedWindSpeed[index]),
 );
 
+sourceReadCounts.clear();
 const windSpeedSeries = await loadPointSeries(
   info,
   windSpeedVariable,
@@ -276,6 +282,15 @@ if (!windSpeedSeries || windSpeedSeries.kind !== "history") {
 close(windSpeedSeries.values[0], 5);
 if (windSpeedSeries.unit !== "m/s") {
   throw new Error(`Unexpected derived series unit ${windSpeedSeries.unit}`);
+}
+await loadPointSeries(info, windSpeedVariable, { time: 0 }, 1, 1);
+for (const dimension of ["latitude", "longitude"]) {
+  const reads = sourceReadCounts.get(`/${dimension}/c/0`) ?? 0;
+  if (reads !== 1) {
+    throw new Error(
+      `Expected one cached ${dimension} coordinate read; received ${reads}`,
+    );
+  }
 }
 
 console.log("Derived variable checks passed");

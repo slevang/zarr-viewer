@@ -1,4 +1,4 @@
-import type { PointTimeSeries } from "./dataset";
+import type { PointTimeSeries } from "./data/types";
 
 export const ASOS_SERIES_ID = "asos-observations";
 export const ASOS_SERIES_COLOR = "#ff5f57";

@@ -5,7 +5,7 @@ import {
   type FileMetaData,
 } from "hyparquet";
 import { compressors } from "hyparquet-compressors";
-import type { VariableConfig } from "./dataset";
+import type { VariableConfig } from "./data/types";
 import { executeDerivedPipeline } from "./derived-variables";
 import type {
   AsosRecord,

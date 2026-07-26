@@ -12,11 +12,18 @@ import {
   seriesStartDate,
   toDataCoordinates,
   validDateRange,
-  weatherNextStoreUrl,
-  type AxisConfig,
-  type StoreInfo,
-  type VariableConfig,
-} from "../app/dataset";
+} from "../app/data/axes";
+import {
+  hasSpatialDimensions,
+  isEnsembleDimension,
+  isInitializationDimension,
+} from "../app/data/dimensions";
+import type {
+  AxisConfig,
+  StoreInfo,
+  VariableConfig,
+} from "../app/data/types";
+import { weatherNextStoreUrl } from "../app/dataset";
 
 const weatherNextRoot =
   "https://storage.googleapis.com/weathernext/weathernext_2_0_0/zarr";
@@ -32,6 +39,15 @@ assert.equal(
   weatherNextStoreUrl(weatherNextRoot, new Date("2024-02-03T07:59:00Z")),
   `${weatherNextRoot}/2024_to_2025/20240203_06hr_01_preds/predictions.zarr`,
 );
+assert.equal(
+  hasSpatialDimensions(
+    ["time", "northing", "easting"],
+    { spatialDimensions: { lat: "northing", lon: "easting" } },
+  ),
+  true,
+);
+assert.equal(isInitializationDimension("Forecast_Date"), true);
+assert.equal(isEnsembleDimension("number"), true);
 
 assert.deepEqual(
   toDataCoordinates(getDataset("google-arco-era5"), -98, 38.5),
@@ -93,6 +109,14 @@ assert.equal(
     0,
   ).toISOString(),
   "1970-01-01T00:00:01.000Z",
+);
+assert.equal(
+  axisValueAsDate(
+    getDataset("google-arco-era5"),
+    timeAxis("hours since 1900-01-01", 24),
+    0,
+  ).toISOString(),
+  "1900-01-02T00:00:00.000Z",
 );
 
 const ascendingAxis: AxisConfig = {

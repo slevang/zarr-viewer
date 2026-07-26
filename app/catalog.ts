@@ -4,7 +4,7 @@ export type DatasetCategory = "forecast" | "analysis";
 
 export type DatasetSourceConfig = {
   id: string;
-  kind: "zarr" | "icechunk" | "weatherzarr" | "weathernext";
+  kind: "zarr" | "icechunk" | "weatherzarr" | "weathernext" | "google-arco";
   url: string;
   s3Url?: string;
   group?: string;
@@ -15,6 +15,8 @@ export type DatasetSourceConfig = {
   crs?: string;
   proj4?: string;
   latIsAscending?: boolean;
+  layout?: "spatial" | "timeseries";
+  directChunkReads?: boolean;
 };
 
 export type DatasetConfig = {
@@ -129,6 +131,7 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
         url: "https://dynamical-noaa-hrrr.s3.us-west-2.amazonaws.com/noaa-hrrr-forecast-48-hour-virtual/v0.5.0.icechunk",
         s3Url: "s3://dynamical-noaa-hrrr/noaa-hrrr-forecast-48-hour-virtual/v0.5.0.icechunk/",
         zarrVersion: 3,
+        layout: "spatial",
         ...HRRR_GRID,
       },
       series: {
@@ -244,6 +247,7 @@ export const DATASETS: DatasetConfig[] = [
         kind: "weathernext",
         url: "https://storage.googleapis.com/weathernext/weathernext_2_0_0/zarr",
         zarrVersion: 2,
+        layout: "spatial",
         auth: "google",
         spatialDimensions: { lat: "lat", lon: "lon" },
         bounds: [0, -90, 360, 90],
@@ -267,6 +271,7 @@ export const DATASETS: DatasetConfig[] = [
         kind: "weatherzarr",
         url: "https://weatherzarr.com/data/ecmwf-ifs025/latest.json",
         zarrVersion: 3,
+        layout: "spatial",
         spatialDimensions: { lat: "latitude", lon: "longitude" },
         bounds: [-180, -90, 180, 90],
         crs: "EPSG:4326",
@@ -295,9 +300,10 @@ export const DATASETS: DatasetConfig[] = [
     description: "Global hourly ERA5, spatially chunked for map reads.",
     sources: sharedSource({
       id: "google-arco-era5-spatial",
-      kind: "zarr",
+      kind: "google-arco",
       url: "https://storage.googleapis.com/gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3",
       zarrVersion: 2,
+      layout: "spatial",
       spatialDimensions: { lat: "latitude", lon: "longitude" },
       bounds: [0, -90, 360, 90],
       crs: "EPSG:4326",
@@ -321,6 +327,8 @@ export const DATASETS: DatasetConfig[] = [
         s3Url: "s3://earthmover-icechunk-era5/icechunkV2",
         group: "single/spatial",
         zarrVersion: 3,
+        layout: "spatial",
+        directChunkReads: true,
       },
       series: {
         id: "earthmover-era5-single-temporal",
@@ -370,23 +378,14 @@ export const DATASET_CATEGORY_GROUPS = [
   { id: "analysis", label: "Analysis/Reanalysis" },
 ] as const satisfies Array<{ id: DatasetCategory; label: string }>;
 
-const DUAL_CHUNKED_DATASET_IDS = new Set([
-  "noaa-hrrr-forecast-48-hour",
-  "weatherzarr-ecmwf-ifs",
-  "earthmover-era5",
-]);
-
-const SPATIALLY_CHUNKED_DATASET_IDS = new Set([
-  "google-arco-era5",
-  "google-weathernext-2",
-]);
-
 export function datasetChunkingLabel(dataset: DatasetConfig) {
-  if (DUAL_CHUNKED_DATASET_IDS.has(dataset.id)) return "Dual-chunked";
-  if (SPATIALLY_CHUNKED_DATASET_IDS.has(dataset.id)) {
-    return "Spatially-chunked";
-  }
-  return "Timeseries-chunked";
+  const layouts = new Set(
+    Object.values(dataset.sources).flatMap((source) =>
+      source ? [source.layout ?? "timeseries"] : []
+    ),
+  );
+  if (layouts.size > 1) return "Dual-chunked";
+  return layouts.has("spatial") ? "Spatially-chunked" : "Timeseries-chunked";
 }
 
 export function datasetOptionLabel(dataset: DatasetConfig) {

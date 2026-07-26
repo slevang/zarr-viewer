@@ -8,7 +8,7 @@ import type {
 import type {
   StoreInfo,
   VariableConfig,
-} from "./dataset";
+} from "./data/types";
 import {
   executeDerivedPipeline,
   nativeInputsForDerived,

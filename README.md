@@ -95,9 +95,15 @@ npm test
 
 ## Project structure
 
-- `app/ZarrViewer.tsx` — map, layer, interaction, and playback state
+- `app/ZarrViewer.tsx` — React and MapLibre orchestration
+- `app/data/types.ts` — shared axis, variable, store, and series model
+- `app/data/dimensions.ts` — canonical spatial and forecast dimension roles
+- `app/data/axes.ts` — pure time, coordinate, and selection logic
+- `app/data/point-series.ts` — native and derived point extraction
+- `app/viewer/` — playback, display, matching, persistence, and station policy
+- `app/components/` — reusable viewer controls
 - `app/catalog.ts` — pinned public dataset endpoints and compatibility flags
-- `app/dataset.ts` — generic metadata, coordinate, and selector adapter
+- `app/dataset.ts` — store discovery and metadata compatibility façade
 - `app/asos.ts` — lazy browser Parquet queries for point observations
 - `app/asos-types.ts` — station, observation, and map-overlay types
 - `app/units.ts` — CF-unit normalization and JS-Quantities conversion layer
@@ -108,6 +114,9 @@ npm test
 - `packages/zarrita-pcodec` — Rust/WASM PCodec decoder for Earthmover ERA5 and GemAI v3
 - `scripts/build-coastline.mjs` — generates the bundled Natural Earth coastline
 - `scripts/build-asos-manifest.ts` — refreshes the checked-in active-station GeoJSON
+
+See [`docs/architecture.md`](docs/architecture.md) for dependency boundaries,
+change guidance, and the verification contract.
 
 This remains a prototype rather than a universal Zarr reader. Regular
 latitude/longitude Icechunk stores are the most complete path. HRRR has an

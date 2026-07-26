@@ -3,7 +3,7 @@ import {
   datasetChunkingLabel,
   getDataset,
 } from "../app/catalog";
-import type { VariableConfig } from "../app/dataset";
+import type { VariableConfig } from "../app/data/types";
 
 function variable(
   id: string,

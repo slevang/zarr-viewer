@@ -10,7 +10,7 @@ import {
   datasetOptionLabel,
   type DatasetConfig,
 } from "./catalog";
-import type { PointSeries } from "./dataset";
+import type { PointSeries } from "./data/types";
 import {
   convertPointSeries,
   type UnitOption,

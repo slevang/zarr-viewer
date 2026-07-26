@@ -1,4 +1,4 @@
-import type { VariableConfig } from "./dataset";
+import type { VariableConfig } from "./data/types";
 
 export type FiniteValueSample = {
   values: number[];

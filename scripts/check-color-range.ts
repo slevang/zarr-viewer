@@ -3,7 +3,7 @@ import {
   createFiniteValueSample,
   robustColorRange,
 } from "../app/color-range";
-import type { VariableConfig } from "../app/dataset";
+import type { VariableConfig } from "../app/data/types";
 
 function variable(
   id: string,

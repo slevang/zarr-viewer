@@ -1,5 +1,5 @@
 import Qty from "js-quantities";
-import type { PointSeries } from "./dataset";
+import type { PointSeries } from "./data/types";
 
 export type UnitOption = {
   id: string;

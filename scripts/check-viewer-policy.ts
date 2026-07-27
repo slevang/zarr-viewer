@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
-import { getDataset, getDatasetSource } from "../app/catalog";
+import {
+  DATASETS,
+  getDataset,
+  getDatasetSource,
+} from "../app/catalog";
 import type { AxisConfig, VariableConfig } from "../app/data/types";
 import {
   initialDisplayRange,
@@ -10,6 +14,10 @@ import {
   playbackInterval,
   playbackPrefetchProfile,
 } from "../app/viewer/playback";
+import {
+  datasetPreloadRequests,
+  runDatasetPreloads,
+} from "../app/viewer/dataset-preload";
 import { stationFromFeature } from "../app/viewer/stations";
 
 const dataset = getDataset("google-arco-era5");
@@ -81,5 +89,64 @@ assert.equal(
   }),
   null,
 );
+
+const preloadTargetDate = new Date("2026-07-20T12:00:00Z");
+const activePreloadTargetDate = new Date("2026-07-20T00:00:00Z");
+const preloadRequests = datasetPreloadRequests(DATASETS, {
+  activeDatasetId: "weatherzarr-ecmwf-ifs",
+  targetDate: preloadTargetDate,
+  activeDatasetTargetDate: activePreloadTargetDate,
+});
+assert.equal(preloadRequests[0]?.role, "series");
+assert.equal(
+  preloadRequests.find(
+    (request) =>
+      request.datasetId === "weatherzarr-ecmwf-ifs"
+      && request.role === "series",
+  )?.targetDate,
+  activePreloadTargetDate,
+);
+assert.equal(
+  preloadRequests.some(
+    (request) =>
+      request.datasetId === "weatherzarr-ecmwf-ifs"
+      && request.role === "map",
+  ),
+  false,
+);
+assert.equal(
+  preloadRequests.some(
+    (request) => getDataset(request.datasetId).sources[request.role]?.auth,
+  ),
+  false,
+);
+assert.equal(
+  datasetPreloadRequests(DATASETS, {
+    activeDatasetId: "weatherzarr-ecmwf-ifs",
+    includeAuthenticated: true,
+  }).some(
+    (request) => getDataset(request.datasetId).sources[request.role]?.auth,
+  ),
+  true,
+);
+
+let activePreloads = 0;
+let maximumActivePreloads = 0;
+let completedPreloads = 0;
+const preloadFailures = await runDatasetPreloads(
+  preloadRequests.slice(0, 5),
+  async () => {
+    activePreloads += 1;
+    maximumActivePreloads = Math.max(maximumActivePreloads, activePreloads);
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    activePreloads -= 1;
+    completedPreloads += 1;
+    if (completedPreloads === 2) throw new Error("expected preload failure");
+  },
+  2,
+);
+assert.equal(maximumActivePreloads, 2);
+assert.equal(completedPreloads, 5);
+assert.equal(preloadFailures.length, 1);
 
 console.log("Viewer policy checks passed");

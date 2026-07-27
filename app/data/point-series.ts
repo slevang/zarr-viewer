@@ -10,6 +10,7 @@ import {
 import {
   isEnsembleDimension,
   isInitializationDimension,
+  isSpatialDimension,
   spatialDimension,
 } from "./dimensions";
 import type {
@@ -159,6 +160,26 @@ function coordinateValues(
   });
   cache.set(dimension, promise);
   return promise;
+}
+
+export async function preloadPointSeriesCoordinates(
+  info: StoreInfo,
+  concurrency = 2,
+) {
+  if (info.role !== "series" || !info.store) return;
+  const dimensions = new Set(
+    info.variables.flatMap((variable) =>
+      variable.dimensions.filter(
+        (dimension) => isSpatialDimension(dimension, info.source),
+      )
+    ),
+  );
+  await Promise.all(
+    Array.from(
+      dimensions,
+      (dimension) => coordinateValues(info, dimension, concurrency),
+    ),
+  );
 }
 
 export async function loadPointTimeSeries(

@@ -1,7 +1,10 @@
 import {
   asyncBufferFromUrl,
   parquetMetadataAsync,
+  parquetRead,
   parquetReadObjects,
+  parquetSchema,
+  type AsyncBuffer,
   type FileMetaData,
 } from "hyparquet";
 import { compressors } from "hyparquet-compressors";
@@ -20,8 +23,10 @@ const ASOS_BASE_URL = [
 ].join("/");
 const ASOS_WINDOW_MS = 15 * 24 * 60 * 60 * 1000;
 const ASOS_FETCH_TIMEOUT_MS = 15_000;
-const ASOS_COLUMNS = [
-  "station",
+const ASOS_RANGE_CACHE_BYTES = 64 * 1024 * 1024;
+const ASOS_STATION_CACHE_ENTRIES = 32;
+const ASOS_STATION_CACHE_ROWS = 100_000;
+const ASOS_RECORD_COLUMNS = [
   "valid",
   "tmpc",
   "dwpc",
@@ -47,10 +52,28 @@ type YearFile = {
   metadata: FileMetaData;
 };
 
+type RowRange = {
+  start: number;
+  stop: number;
+};
+
+type CachedRange = {
+  data: ArrayBuffer;
+  size: number;
+};
+
 const yearFiles = new Map<
   number,
   { expires: number; promise: Promise<YearFile> }
 >();
+const stationIndexes = new WeakMap<
+  FileMetaData,
+  Map<number, Map<string, RowRange[]>>
+>();
+const rangeCache = new Map<string, CachedRange>();
+const stationRecordCache = new Map<string, AsosRecord[]>();
+let rangeCacheBytes = 0;
+let stationRecordCacheRows = 0;
 
 async function retryingFetch(
   input: RequestInfo | URL,
@@ -99,6 +122,63 @@ async function remoteByteLength(url: string) {
   };
 }
 
+function rememberRange(key: string, data: ArrayBuffer) {
+  if (data.byteLength > ASOS_RANGE_CACHE_BYTES) return;
+  const existing = rangeCache.get(key);
+  if (existing) rangeCacheBytes -= existing.size;
+  rangeCache.delete(key);
+  rangeCache.set(key, { data, size: data.byteLength });
+  rangeCacheBytes += data.byteLength;
+  while (rangeCacheBytes > ASOS_RANGE_CACHE_BYTES) {
+    const oldestKey = rangeCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    const oldest = rangeCache.get(oldestKey);
+    rangeCache.delete(oldestKey);
+    rangeCacheBytes -= oldest?.size ?? 0;
+  }
+}
+
+async function yearBuffer(
+  {
+    url,
+    byteLength,
+    etag,
+  }: Pick<YearFile, "url" | "byteLength" | "etag">,
+  signal?: AbortSignal,
+): Promise<AsyncBuffer> {
+  const remote = await asyncBufferFromUrl({
+    url,
+    byteLength,
+    fetch: (input, init) => retryingFetch(input, {
+      ...init,
+      signal: init?.signal && signal
+        ? AbortSignal.any([init.signal, signal])
+        : init?.signal ?? signal,
+    }),
+    requestInit: etag
+      ? { headers: { "If-Match": etag } }
+      : undefined,
+  });
+  const namespace = `${url}:${etag ?? `length-${byteLength}`}`;
+  return {
+    byteLength,
+    async slice(start, end = byteLength) {
+      signal?.throwIfAborted();
+      const key = `${namespace}:${start}:${end}`;
+      const cached = rangeCache.get(key);
+      if (cached) {
+        rangeCache.delete(key);
+        rangeCache.set(key, cached);
+        return cached.data;
+      }
+      const data = await remote.slice(start, end);
+      signal?.throwIfAborted();
+      rememberRange(key, data);
+      return data;
+    },
+  };
+}
+
 async function openYear(year: number): Promise<YearFile> {
   const now = Date.now();
   const cached = yearFiles.get(year);
@@ -110,18 +190,14 @@ async function openYear(year: number): Promise<YearFile> {
     if (remote === null) {
       throw new Error(`No ASOS archive is available for ${year}`);
     }
-    const file = await asyncBufferFromUrl({
-      url,
-      byteLength: remote.byteLength,
-      fetch: retryingFetch,
-      requestInit: remote.etag
-        ? { headers: { "If-Match": remote.etag } }
-        : undefined,
-    });
-    return {
+    const fileInfo = {
       url,
       byteLength: remote.byteLength,
       etag: remote.etag,
+    };
+    const file = await yearBuffer(fileInfo);
+    return {
+      ...fileInfo,
       metadata: await parquetMetadataAsync(file),
     };
   })();
@@ -148,6 +224,163 @@ function asDate(value: unknown) {
   if (value instanceof Date) return value;
   const date = new Date(String(value));
   return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function normalizeRecord(row: Record<string, unknown>): AsosRecord | null {
+  const valid = asDate(row.valid);
+  if (!valid) return null;
+  return {
+    valid,
+    tmpc: finiteOrNull(row.tmpc),
+    dwpc: finiteOrNull(row.dwpc),
+    relh: finiteOrNull(row.relh),
+    drct: finiteOrNull(row.drct),
+    sknt: finiteOrNull(row.sknt),
+    gust: finiteOrNull(row.gust),
+    mslp: finiteOrNull(row.mslp),
+    vsby: finiteOrNull(row.vsby),
+    p01m: finiteOrNull(row.p01m),
+  };
+}
+
+function stationCacheKey(file: YearFile, station: string) {
+  return `${file.url}:${file.etag ?? `length-${file.byteLength}`}:${station}`;
+}
+
+function cachedStationRecords(key: string) {
+  const cached = stationRecordCache.get(key);
+  if (!cached) return null;
+  stationRecordCache.delete(key);
+  stationRecordCache.set(key, cached);
+  return cached;
+}
+
+function rememberStationRecords(key: string, records: AsosRecord[]) {
+  if (records.length > ASOS_STATION_CACHE_ROWS) return;
+  const existing = stationRecordCache.get(key);
+  if (existing) stationRecordCacheRows -= existing.length;
+  stationRecordCache.delete(key);
+  stationRecordCache.set(key, records);
+  stationRecordCacheRows += records.length;
+  while (
+    stationRecordCacheRows > ASOS_STATION_CACHE_ROWS
+    || stationRecordCache.size > ASOS_STATION_CACHE_ENTRIES
+  ) {
+    const oldestKey = stationRecordCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    const oldest = stationRecordCache.get(oldestKey);
+    stationRecordCache.delete(oldestKey);
+    stationRecordCacheRows -= oldest?.length ?? 0;
+  }
+}
+
+const statisticsDecoder = new TextDecoder();
+
+function statisticString(value: unknown) {
+  if (value === null || value === undefined) return null;
+  return value instanceof Uint8Array
+    ? statisticsDecoder.decode(value)
+    : String(value);
+}
+
+function candidateStationGroups(metadata: FileMetaData, station: string) {
+  const stationColumn = parquetSchema(metadata).children.findIndex(
+    ({ element }) => element.name === "station",
+  );
+  if (stationColumn < 0) throw new Error("ASOS archive has no station column");
+
+  let groupStart = 0;
+  return metadata.row_groups.flatMap((group, groupIndex) => {
+    const start = groupStart;
+    const stop = start + Number(group.num_rows);
+    groupStart = stop;
+    const statistics = group.columns[stationColumn]?.meta_data?.statistics;
+    const minimum = statisticString(
+      statistics?.min_value ?? statistics?.min,
+    );
+    const maximum = statisticString(
+      statistics?.max_value ?? statistics?.max,
+    );
+    return (
+      (!minimum || !maximum || (station >= minimum && station <= maximum))
+        ? [{ groupIndex, start, stop }]
+        : []
+    );
+  });
+}
+
+async function stationIndexForGroup(
+  file: AsyncBuffer,
+  metadata: FileMetaData,
+  groupIndex: number,
+  start: number,
+  stop: number,
+  signal?: AbortSignal,
+) {
+  let indexes = stationIndexes.get(metadata);
+  if (!indexes) {
+    indexes = new Map();
+    stationIndexes.set(metadata, indexes);
+  }
+  const cached = indexes.get(groupIndex);
+  if (cached) return cached;
+
+  // The archive is station-sorted. Streaming this one compact column lets the
+  // observation read select a few thousand rows instead of materializing the
+  // entire million-row group as objects.
+  const index = new Map<string, RowRange[]>();
+  await parquetRead({
+    file,
+    metadata,
+    compressors,
+    columns: ["station"],
+    rowStart: start,
+    rowEnd: stop,
+    onChunk: ({ columnData, rowStart }) => {
+      for (let offset = 0; offset < columnData.length; offset += 1) {
+        const value = columnData[offset];
+        if (value === null || value === undefined) continue;
+        const station = String(value);
+        const row = rowStart + offset;
+        const ranges = index.get(station) ?? [];
+        const previous = ranges.at(-1);
+        if (previous?.stop === row) {
+          previous.stop = row + 1;
+        } else {
+          ranges.push({ start: row, stop: row + 1 });
+        }
+        index.set(station, ranges);
+      }
+    },
+  });
+  signal?.throwIfAborted();
+  indexes.set(groupIndex, index);
+  return index;
+}
+
+async function stationRowRanges(
+  file: AsyncBuffer,
+  metadata: FileMetaData,
+  station: string,
+  signal?: AbortSignal,
+) {
+  const groups = candidateStationGroups(metadata, station);
+  const ranges = await Promise.all(groups.map(async ({
+    groupIndex,
+    start,
+    stop,
+  }) => {
+    const index = await stationIndexForGroup(
+      file,
+      metadata,
+      groupIndex,
+      start,
+      stop,
+      signal,
+    );
+    return index.get(station) ?? [];
+  }));
+  return ranges.flat();
 }
 
 type DirectAsosColumn = keyof Pick<
@@ -283,38 +516,41 @@ async function readYear(
   signal?: AbortSignal,
 ) {
   const read = async () => {
-    const {
-      url,
-      byteLength,
-      etag,
-      metadata,
-    } = await openYear(year);
+    const yearFile = await openYear(year);
     signal?.throwIfAborted();
-    const file = await asyncBufferFromUrl({
-      url,
-      byteLength,
-      fetch: (input, init) => retryingFetch(input, {
-        ...init,
-        signal: init?.signal && signal
-          ? AbortSignal.any([init.signal, signal])
-          : init?.signal ?? signal,
-      }),
-      requestInit: etag
-        ? { headers: { "If-Match": etag } }
-        : undefined,
-    });
-    return parquetReadObjects({
-      file,
-      metadata,
-      compressors,
-      columns: ASOS_COLUMNS,
-      filter: {
-        $and: [
-          { station: { $eq: station } },
-          { valid: { $gte: start, $lt: stop } },
-        ],
-      },
-      useOffsetIndex: true,
+    const cacheKey = stationCacheKey(yearFile, station);
+    let records = cachedStationRecords(cacheKey);
+    if (!records) {
+      const file = await yearBuffer(yearFile, signal);
+      const ranges = await stationRowRanges(
+        file,
+        yearFile.metadata,
+        station,
+        signal,
+      );
+      const rows = (await Promise.all(ranges.map((range) =>
+        parquetReadObjects({
+          file,
+          metadata: yearFile.metadata,
+          compressors,
+          columns: ASOS_RECORD_COLUMNS,
+          rowStart: range.start,
+          rowEnd: range.stop,
+          useOffsetIndex: true,
+        })
+      ))).flat();
+      signal?.throwIfAborted();
+      records = rows.flatMap((row) => {
+        const record = normalizeRecord(row);
+        return record ? [record] : [];
+      }).sort((a, b) => a.valid.getTime() - b.valid.getTime());
+      rememberStationRecords(cacheKey, records);
+    }
+    const startTime = start.getTime();
+    const stopTime = stop.getTime();
+    return records.filter((record) => {
+      const valid = record.valid.getTime();
+      return valid >= startTime && valid < stopTime;
     });
   };
   try {
@@ -355,7 +591,7 @@ export async function loadAsosWindow(
     year <= stop.getUTCFullYear();
     year += 1
   ) years.push(year);
-  const rows = (await Promise.all(
+  const records = (await Promise.all(
     years.map(async (year) => {
       try {
         return await readYear(
@@ -373,24 +609,7 @@ export async function loadAsosWindow(
         throw error;
       }
     }),
-  )).flat();
-
-  const records = rows.flatMap((row) => {
-    const valid = asDate(row.valid);
-    if (!valid) return [];
-    return [{
-      valid,
-      tmpc: finiteOrNull(row.tmpc),
-      dwpc: finiteOrNull(row.dwpc),
-      relh: finiteOrNull(row.relh),
-      drct: finiteOrNull(row.drct),
-      sknt: finiteOrNull(row.sknt),
-      gust: finiteOrNull(row.gust),
-      mslp: finiteOrNull(row.mslp),
-      vsby: finiteOrNull(row.vsby),
-      p01m: finiteOrNull(row.p01m),
-    } satisfies AsosRecord];
-  }).sort((a, b) => a.valid.getTime() - b.valid.getTime());
+  )).flat().sort((a, b) => a.valid.getTime() - b.valid.getTime());
 
   const observedValues = observedVariable.values(records);
   const values = records.flatMap((record, index) => {

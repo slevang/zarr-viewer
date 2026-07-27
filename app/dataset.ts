@@ -130,6 +130,9 @@ const GOOGLE_LEVELS = [
   250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 775, 800, 825,
   850, 875, 900, 925, 950, 975, 1000,
 ];
+const storeReadCache = new Map<string, Uint8Array>();
+let storeReadCacheBytes = 0;
+let nextStoreCacheId = 1;
 
 function product(values: number[]) {
   return values.reduce((result, value) => result * value, 1);
@@ -208,13 +211,12 @@ function recordDimensionLengths(
 function cacheStoreReads(
   store: Readable,
   limit = STORE_READ_CONCURRENCY,
-  maxBytes = STORE_READ_CACHE_BYTES,
 ): Readable {
   let active = 0;
-  let cachedBytes = 0;
   const queue: Array<() => void> = [];
-  const cache = new Map<string, Uint8Array>();
   const pending = new Map<string, Promise<Uint8Array | undefined>>();
+  const namespace = `store-${nextStoreCacheId}`;
+  nextStoreCacheId += 1;
 
   const drain = () => {
     while (active < limit && queue.length > 0) {
@@ -234,18 +236,18 @@ function cacheStoreReads(
   });
 
   const remember = (key: string, value: Uint8Array) => {
-    if (value.byteLength > maxBytes) return;
-    const existing = cache.get(key);
-    if (existing) cachedBytes -= existing.byteLength;
-    cache.delete(key);
-    cache.set(key, value);
-    cachedBytes += value.byteLength;
-    while (cachedBytes > maxBytes) {
-      const oldestKey = cache.keys().next().value;
+    if (value.byteLength > STORE_READ_CACHE_BYTES) return;
+    const existing = storeReadCache.get(key);
+    if (existing) storeReadCacheBytes -= existing.byteLength;
+    storeReadCache.delete(key);
+    storeReadCache.set(key, value);
+    storeReadCacheBytes += value.byteLength;
+    while (storeReadCacheBytes > STORE_READ_CACHE_BYTES) {
+      const oldestKey = storeReadCache.keys().next().value;
       if (oldestKey === undefined) break;
-      const oldest = cache.get(oldestKey);
-      cache.delete(oldestKey);
-      cachedBytes -= oldest?.byteLength ?? 0;
+      const oldest = storeReadCache.get(oldestKey);
+      storeReadCache.delete(oldestKey);
+      storeReadCacheBytes -= oldest?.byteLength ?? 0;
     }
   };
 
@@ -253,21 +255,22 @@ function cacheStoreReads(
     cacheKey: string,
     task: () => Promise<Uint8Array | undefined>,
   ) => {
-    const cached = cache.get(cacheKey);
+    const namespacedKey = `${namespace}:${cacheKey}`;
+    const cached = storeReadCache.get(namespacedKey);
     if (cached) {
-      cache.delete(cacheKey);
-      cache.set(cacheKey, cached);
+      storeReadCache.delete(namespacedKey);
+      storeReadCache.set(namespacedKey, cached);
       return Promise.resolve(cached);
     }
-    const inProgress = pending.get(cacheKey);
+    const inProgress = pending.get(namespacedKey);
     if (inProgress) return inProgress;
     const promise = schedule(task).then((value) => {
-      if (value) remember(cacheKey, value);
+      if (value) remember(namespacedKey, value);
       return value;
     }).finally(() => {
-      pending.delete(cacheKey);
+      pending.delete(namespacedKey);
     });
-    pending.set(cacheKey, promise);
+    pending.set(namespacedKey, promise);
     return promise;
   };
 
@@ -376,6 +379,7 @@ async function loadIcechunkStoreInfo(
   variables.sort((a, b) =>
     a.label.localeCompare(b.label, undefined, { sensitivity: "base" }),
   );
+  const cachedStore = cacheStoreReads(store);
 
   return {
     dataset,
@@ -383,8 +387,8 @@ async function loadIcechunkStoreInfo(
     role,
     variables,
     axes,
-    store,
-    layerOptions: defaultLayerOptions(source, cacheStoreReads(store)),
+    store: cachedStore,
+    layerOptions: defaultLayerOptions(source, cachedStore),
   };
 }
 
@@ -1008,7 +1012,7 @@ async function loadWeatherZarrStoreInfo(
     source.url,
     targetDate,
   );
-  const layout = role === "map" ? "spatial" : "timeseries";
+  const layout = source.layout ?? "timeseries";
   const entries = manifest.stores.filter((entry) => entry.layout === layout);
   if (!entries.length) {
     throw new Error(`WeatherZarr run ${manifest.run} has no ${layout} stores`);
@@ -1273,6 +1277,7 @@ const STORE_INFO_LOADERS = {
   "google-arco": loadGoogleStoreInfo,
 } satisfies Record<DatasetSourceConfig["kind"], StoreInfoLoader>;
 
+const sourceInfoPromises = new Map<string, Promise<StoreInfo>>();
 const storeInfoPromises = new Map<string, Promise<StoreInfo>>();
 
 export function loadStoreInfo(
@@ -1292,23 +1297,42 @@ export function loadStoreInfo(
   ) && targetDate
     ? `:${targetDate.toISOString().slice(0, 13)}`
     : "";
-  const cacheKey = `${dataset.id}:${role}:${source.id}${targetKey}`;
-  const cached = storeInfoPromises.get(cacheKey);
+  const sourceKey = [
+    dataset.id,
+    source.id,
+    source.url,
+    source.group ?? "",
+    source.layout ?? "",
+    targetKey,
+  ].join(":");
+  const requestKey = `${sourceKey}:${role}`;
+  const cached = storeInfoPromises.get(requestKey);
   if (cached) return cached;
 
-  const promise = STORE_INFO_LOADERS[source.kind](
-    dataset,
-    source,
-    role,
-    targetDate,
-  ).then((info) => ({
-    ...info,
-    derivedVariables: derivedVariableMatches(info.variables),
-  })).catch((error) => {
-    storeInfoPromises.delete(cacheKey);
+  let sourcePromise = sourceInfoPromises.get(sourceKey);
+  if (!sourcePromise) {
+    sourcePromise = STORE_INFO_LOADERS[source.kind](
+      dataset,
+      source,
+      role,
+      targetDate,
+    ).then((info) => ({
+      ...info,
+      derivedVariables: derivedVariableMatches(info.variables),
+    })).catch((error) => {
+      sourceInfoPromises.delete(sourceKey);
+      throw error;
+    });
+    sourceInfoPromises.set(sourceKey, sourcePromise);
+  }
+
+  const promise = sourcePromise.then((info) =>
+    info.role === role ? info : { ...info, role }
+  ).catch((error) => {
+    storeInfoPromises.delete(requestKey);
     throw error;
   });
-  storeInfoPromises.set(cacheKey, promise);
+  storeInfoPromises.set(requestKey, promise);
   return promise;
 }
 

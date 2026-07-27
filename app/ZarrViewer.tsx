@@ -59,7 +59,10 @@ import type {
 import {
   loadStoreInfo,
 } from "./dataset";
-import { loadPointSeries } from "./data/point-series";
+import {
+  loadPointSeries,
+  preloadPointSeriesCoordinates,
+} from "./data/point-series";
 import { temporalNeighborIndices } from "./temporal-prefetch";
 import {
   decimalsForRange,
@@ -80,6 +83,10 @@ import {
   playbackPrefetchProfile,
   type PlaybackPrefetchQueue,
 } from "./viewer/playback";
+import {
+  datasetPreloadRequests,
+  runDatasetPreloads,
+} from "./viewer/dataset-preload";
 import {
   initialDatasetId,
   storeUnitPreferences,
@@ -175,6 +182,8 @@ export function ZarrViewer() {
   const playbackViewportMovingRef = useRef(false);
   const rememberedValidDateRef = useRef<Date | undefined>(undefined);
   const weatherNextStoreGenerationRef = useRef(0);
+  const publicDatasetPreloadStartedRef = useRef(false);
+  const authenticatedDatasetPreloadStartedRef = useRef(false);
   const resetPlaybackPrefetchRef = useRef<() => void>(() => {});
   const startSeriesComparisonRef = useRef<(
     point: InspectionPoint,
@@ -213,6 +222,7 @@ export function ZarrViewer() {
   );
   const [loadState, setLoadState] = useState<LoadState>(() => loadingState());
   const [mapReady, setMapReady] = useState(false);
+  const [firstDatasetFrameReady, setFirstDatasetFrameReady] = useState(false);
   const [stationsVisible, setStationsVisible] = useState(false);
   const [stationsPhase, setStationsPhase] = useState<
     "idle" | "loading" | "ready" | "error"
@@ -1242,7 +1252,10 @@ export function ZarrViewer() {
         onLoadingStateChange: (loading) => {
           if (loading.error) setLoadState(errorState(loading.error));
           else if (loading.loading) setLoadState(loadingState());
-          else setLoadState(READY_STATE);
+          else {
+            setLoadState(READY_STATE);
+            setFirstDatasetFrameReady(true);
+          }
         },
       });
       infoRef.current = nextInfo;
@@ -1303,6 +1316,60 @@ export function ZarrViewer() {
     googleConnected,
     mapInstallRevision,
     mapReady,
+  ]);
+
+  useEffect(() => {
+    if (!firstDatasetFrameReady || !info) return;
+    const includeAuthenticated = googleConnected;
+    const startedRef = includeAuthenticated
+      ? authenticatedDatasetPreloadStartedRef
+      : publicDatasetPreloadStartedRef;
+    if (startedRef.current) return;
+    startedRef.current = true;
+
+    const initializationAxis = Object.values(info.axes).find(
+      (axis) => axis.kind === "time" && axis.requiresStoreReload,
+    );
+    const activeDatasetTargetDate = initializationAxis
+      ? axisValueAsDate(
+        info.dataset,
+        initializationAxis,
+        selections[initializationAxis.id]
+          ?? initializationAxis.defaultIndex
+          ?? 0,
+      )
+      : rememberedValidDateRef.current;
+    const requests = datasetPreloadRequests(DATASETS, {
+      activeDatasetId: info.dataset.id,
+      targetDate: rememberedValidDateRef.current,
+      activeDatasetTargetDate,
+      includeAuthenticated,
+    });
+    void runDatasetPreloads(
+      requests,
+      async ({ datasetId: preloadDatasetId, role, targetDate }) => {
+        const preloadInfo = await loadStoreInfo(
+          preloadDatasetId,
+          role,
+          targetDate,
+        );
+        if (role === "series") {
+          await preloadPointSeriesCoordinates(preloadInfo);
+        }
+      },
+    ).then((failures) => {
+      if (failures.length) {
+        console.debug(
+          `Background dataset preload skipped ${failures.length} store(s)`,
+          failures,
+        );
+      }
+    });
+  }, [
+    firstDatasetFrameReady,
+    googleConnected,
+    info,
+    selections,
   ]);
 
   useEffect(() => {

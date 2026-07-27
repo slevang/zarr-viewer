@@ -12,6 +12,7 @@ import {
 } from "../app/derived-store";
 import {
   loadPointSeries,
+  preloadPointSeriesCoordinates,
 } from "../app/data/point-series";
 import type {
   StoreInfo,
@@ -269,6 +270,7 @@ Array.from(windSpeedValues.data as ArrayLike<number>).forEach(
 );
 
 sourceReadCounts.clear();
+await preloadPointSeriesCoordinates(info);
 const windSpeedSeries = await loadPointSeries(
   info,
   windSpeedVariable,

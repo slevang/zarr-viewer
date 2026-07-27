@@ -41,6 +41,7 @@ MapLibre resources and coordinates async requests. Logic that does not require a
 hook or a live map belongs elsewhere:
 
 - `viewer/playback.ts` — cadence, chunk keys, and prefetch sizing
+- `viewer/dataset-preload.ts` — background store ordering and concurrency
 - `viewer/variables.ts` — cross-dataset variable and time matching
 - `viewer/display.ts` — status, formatting, and initial display ranges
 - `viewer/preferences.ts` — URL and local-storage persistence
@@ -56,7 +57,17 @@ reading store-backend implementations.
 Catalog entries describe logical datasets with independent `map` and `series`
 sources. `loadStoreInfo` dispatches to the adapter for the configured source
 kind, decorates native variables with derived-variable matches, and caches the
-result by dataset, role, source, and target initialization date.
+result by dataset, source, and target initialization date. Role-specific
+`StoreInfo` views share the same physical open when map and series roles point
+to the same source. Failed opens are removed from the cache so a foreground
+request can retry them.
+
+After the first dataset frame is ready, the viewer opens the remaining stores
+through a single-worker background queue. Series sources are prioritized and
+their spatial coordinate arrays are warmed before map-only sources. Sources
+that require authentication are deferred until credentials are available.
+Store byte reads share one process-wide bounded LRU, while opened `StoreInfo`
+objects remain cached for the lifetime of the page.
 
 Source capabilities also describe physical layout and direct-chunk support.
 Chunking labels and playback behavior derive from those capabilities, never

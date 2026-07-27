@@ -282,6 +282,7 @@ export const DATASETS: DatasetConfig[] = [
         kind: "weatherzarr",
         url: "https://weatherzarr.com/data/ecmwf-ifs025/latest.json",
         zarrVersion: 3,
+        layout: "timeseries",
         spatialDimensions: { lat: "latitude", lon: "longitude" },
         bounds: [-180, -90, 180, 90],
         crs: "EPSG:4326",

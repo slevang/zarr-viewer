@@ -126,6 +126,13 @@ const OPERATORS: Record<string, OperatorDefinition> = Object.fromEntries(
         Math.max(0, DEGREE_DAY_BASE_K - temperatureK),
     },
     {
+      id: "relative_humidity",
+      inputUnits: ["tempK", "tempK"],
+      outputUnit: "%",
+      evaluate: (temperatureK: number, dewPointK = NaN) =>
+        relativeHumidityFromDewPoint(temperatureK, dewPointK),
+    },
+    {
       id: "heat_index",
       inputUnits: ["tempK", "tempK"],
       outputUnit: "tempK",
@@ -176,6 +183,16 @@ const DERIVED_CATALOG: DerivedCatalogDefinition[] = [
     label: "Heating degree days (65°F base)",
     inputs: [{ key: "temperature", common: "t2m" }],
     operator: "heating_degree_days",
+  },
+  {
+    key: "relative_humidity_2m",
+    label: "2 metre relative humidity",
+    standardName: "relative_humidity",
+    inputs: [
+      { key: "temperature", common: "t2m" },
+      { key: "dew_point", common: "d2m" },
+    ],
+    operator: "relative_humidity",
   },
   {
     key: "heat_index",

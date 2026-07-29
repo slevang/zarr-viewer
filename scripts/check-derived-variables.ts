@@ -53,6 +53,7 @@ const expectedDerived = [
   "wind_direction_10m",
   "cdd_65f",
   "hdd_65f",
+  "relative_humidity_2m",
   "heat_index",
   "wind_chill",
 ];
@@ -86,6 +87,14 @@ close(calculate("cdd_65f", {
 close(calculate("hdd_65f", {
   temperature: [0],
 }).values[0], (65 - 32) * 5 / 9);
+close(calculate("relative_humidity_2m", {
+  temperature: [30],
+  dew_point: [20],
+}).values[0], 55.08, 0.1);
+close(calculate("relative_humidity_2m", {
+  temperature: [20],
+  dew_point: [25],
+}).values[0], 100);
 
 const heatIndex = calculate("heat_index", {
   temperature: [(90 - 32) * 5 / 9],
@@ -132,6 +141,13 @@ close(
   stationDerived("cdd_65f").value ?? NaN,
   30 - (65 - 32) * 5 / 9,
 );
+const stationRelativeHumidity = stationDerived("relative_humidity_2m");
+close(stationRelativeHumidity.value ?? NaN, 55.08, 0.1);
+if (stationRelativeHumidity.unit !== "%") {
+  throw new Error(
+    `Unexpected station relative-humidity unit ${stationRelativeHumidity.unit}`,
+  );
+}
 if (!Number.isFinite(stationDerived("heat_index").value)) {
   throw new Error("ASOS heat index was not derived");
 }

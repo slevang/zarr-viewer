@@ -3,6 +3,8 @@ import {
   convertUnitRange,
   convertUnitValue,
   nativeUnitOption,
+  precipitationRateConverter,
+  precipitationRateUnitOption,
   unitKind,
   unitOptions,
 } from "../app/units";
@@ -42,6 +44,68 @@ if (
   || unitKind("m", "total_precipitation") !== "precipitation"
 ) {
   throw new Error("Precipitation did not receive m, mm, and inch display units");
+}
+const hrrrPrecipitationOptions = unitOptions(
+  "kg m-2",
+  "total_precipitation_surface Total precipitation",
+);
+if (
+  hrrrPrecipitationOptions.map((option) => option.id).join(",")
+    !== "kg/m2,m,mm,in"
+  || unitKind(
+    "kg m-2",
+    "total_precipitation_surface Total precipitation",
+  ) !== "precipitation"
+) {
+  throw new Error("Water-equivalent precipitation did not expose mm and inches");
+}
+close(
+  convertUnitValue(
+    25.4,
+    "kg m-2",
+    "in",
+    "total_precipitation_surface Total precipitation",
+  ),
+  1,
+);
+close(
+  convertUnitValue(
+    0.1,
+    "mm",
+    "kg m-2",
+    "total_precipitation_surface Total precipitation",
+  ),
+  0.1,
+);
+const hrrrRateConverter = precipitationRateConverter(
+  "kg m-2 s-1",
+  "precipitation_surface Precipitation rate precipitation_flux",
+);
+if (!hrrrRateConverter) {
+  throw new Error("HRRR precipitation flux did not expose a step converter");
+}
+close(hrrrRateConverter(1e-5, 3600), 0.036);
+const precipitationRateOptions = unitOptions(
+  "mm/h",
+  "Precipitation rate",
+);
+if (
+  precipitationRateOptions.map((option) => option.id).join(",")
+    !== "mm/h,in/h"
+  || unitKind("mm/h", "Precipitation rate") !== "precipitation_rate"
+) {
+  throw new Error("Precipitation rate did not expose mm/hr and in/hr");
+}
+close(
+  convertUnitValue(25.4, "mm/h", "in/h", "Precipitation rate"),
+  1,
+);
+if (
+  precipitationRateUnitOption("mm").id !== "mm/h"
+  || precipitationRateUnitOption("in").id !== "in/h"
+  || precipitationRateUnitOption("in/h").id !== "in/h"
+) {
+  throw new Error("Precipitation amount preferences did not map to rate units");
 }
 close(convertUnitValue(273.15, "K", "tempC"), 0);
 close(convertUnitValue(0, "degree_Celsius", "tempF"), 32);

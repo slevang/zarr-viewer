@@ -69,6 +69,20 @@ if (
   throw new Error("An all-dry frame should not replace the precipitation fallback");
 }
 
+const smoke = createFiniteValueSample();
+addFiniteValues(smoke, [
+  ...Array.from({ length: 9_000 }, () => 0),
+  ...Array.from({ length: 1_000 }, (_, index) => (index + 1) * 1e-9),
+  1,
+]);
+const smokeRange = robustColorRange(
+  smoke,
+  variable("mass_density_8m", "Mass density", "kg m-3"),
+);
+if (!smokeRange || smokeRange[0] !== 0 || smokeRange[1] >= 2e-6) {
+  throw new Error(`Smoke zero mass or right tail controlled the range: ${smokeRange}`);
+}
+
 const direction = createFiniteValueSample();
 addFiniteValues(direction, [45, 90, 180]);
 const directionRange = robustColorRange(

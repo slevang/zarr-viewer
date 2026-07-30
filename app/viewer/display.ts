@@ -49,6 +49,24 @@ export function decimalsForRange([min, max]: readonly [number, number]) {
   return 3;
 }
 
+export function formatRangeValue(
+  value: number,
+  range: readonly [number, number],
+) {
+  if (!Number.isFinite(value)) return "—";
+  if (value === 0) return "0";
+  const magnitude = Math.abs(value);
+  const width = Math.abs(range[1] - range[0]);
+  if (
+    magnitude < 0.001
+    || magnitude >= 1_000_000
+    || (width > 0 && width < 0.001)
+  ) {
+    return value.toExponential(2);
+  }
+  return value.toFixed(decimalsForRange(range));
+}
+
 export function roundToSignificant(value: number, digits = 6) {
   return value === 0 ? 0 : Number(value.toPrecision(digits));
 }

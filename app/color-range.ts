@@ -1,4 +1,5 @@
 import type { VariableConfig } from "./data/types";
+import { isHrrrSmokeVariable } from "./viewer/smoke";
 
 export type FiniteValueSample = {
   values: number[];
@@ -128,7 +129,7 @@ export function robustColorRange(
 
   let lower: number;
   let upper: number;
-  if (isPrecipitation(variable)) {
+  if (isPrecipitation(variable) || isHrrrSmokeVariable(variable)) {
     const positive = sorted.filter((value) => value > 0);
     if (!positive.length) return null;
     lower = 0;

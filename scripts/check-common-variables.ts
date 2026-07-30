@@ -1,5 +1,6 @@
 import { commonVariableMatches } from "../app/common-variables";
 import {
+  DATASETS,
   datasetChunkingLabel,
   getDataset,
 } from "../app/catalog";
@@ -125,6 +126,18 @@ for (const [datasetId, expected] of expectedChunking) {
   const actual = datasetChunkingLabel(getDataset(datasetId));
   if (actual !== expected) {
     throw new Error(`${datasetId}: expected ${expected}; received ${actual}`);
+  }
+}
+
+for (const dataset of DATASETS) {
+  const defaultVariable = dataset.defaultVariable;
+  const match = defaultVariable
+    ? commonVariableMatches([variable(defaultVariable)])[0]
+    : undefined;
+  if (match?.key !== "tp") {
+    throw new Error(
+      `${dataset.id}: expected a precipitation default; received ${defaultVariable ?? "none"}`,
+    );
   }
 }
 

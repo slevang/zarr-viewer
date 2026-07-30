@@ -9,6 +9,7 @@ import {
   isInitializationDimension,
   isSpatialDimension,
 } from "../data/dimensions";
+import { commonVariableMatches } from "../common-variables";
 import type {
   AxisConfig,
   AxisSelection,
@@ -66,6 +67,13 @@ export function matchingVariable(info: StoreInfo, source: VariableConfig) {
   }
   const exact = info.variables.find((candidate) => candidate.id === source.id);
   if (exact) return exact;
+  const commonKey = commonVariableMatches([source])[0]?.key;
+  const commonMatch = commonKey
+    ? commonVariableMatches(info.variables).find(
+      (candidate) => candidate.key === commonKey,
+    )?.variable
+    : undefined;
+  if (commonMatch) return commonMatch;
   const standardName = source.standardName?.toLowerCase();
   const sourceName = normalizedVariableName(source);
   const sourceConcept = variableConcept(source);

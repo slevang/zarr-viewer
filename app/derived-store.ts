@@ -9,6 +9,7 @@ import type {
   StoreInfo,
   VariableConfig,
 } from "./data/types";
+import { commonVariableMatches } from "./common-variables";
 import {
   executeDerivedPipeline,
   nativeInputsForDerived,
@@ -347,26 +348,213 @@ async function buildDerivedStore(
   return createVirtualStore(staticBytes, readDerivedChunk);
 }
 
-export function derivedLayerOptions(
+export function accumulatedToStepValues(
+  values: ArrayLike<number | bigint>,
+  shape: number[],
+  leadDimension: number,
+  leadStart: number,
+) {
+  const stride = cStride(shape);
+  const outputShape = [...shape];
+  const includesPreviousLead = leadStart > 0;
+  if (includesPreviousLead) outputShape[leadDimension] -= 1;
+  const output = new Float32Array(product(outputShape));
+  const outputStride = cStride(outputShape);
+
+  for (let outputIndex = 0; outputIndex < output.length; outputIndex += 1) {
+    let remainder = outputIndex;
+    let currentIndex = 0;
+    let previousIndex = 0;
+    let localLead = 0;
+    for (let dimension = 0; dimension < outputShape.length; dimension += 1) {
+      const coordinate = Math.floor(remainder / outputStride[dimension]);
+      remainder %= outputStride[dimension];
+      const sourceCoordinate = dimension === leadDimension
+        ? coordinate + (includesPreviousLead ? 1 : 0)
+        : coordinate;
+      currentIndex += sourceCoordinate * stride[dimension];
+      previousIndex += (
+        dimension === leadDimension
+          ? Math.max(0, sourceCoordinate - 1)
+          : sourceCoordinate
+      ) * stride[dimension];
+      if (dimension === leadDimension) localLead = coordinate;
+    }
+    const current = Number(values[currentIndex]);
+    const globalLead = leadStart + localLead;
+    const previous = globalLead === 0 ? 0 : Number(values[previousIndex]);
+    output[outputIndex] = Number.isFinite(current) && Number.isFinite(previous)
+      ? Math.max(0, current - previous)
+      : NaN;
+  }
+  return output;
+}
+
+async function buildStepPrecipitationStore(
+  info: StoreInfo,
+  variable: VariableConfig,
+): Promise<Readable> {
+  if (!info.store || !variable.shape) {
+    throw new Error(`Step precipitation map data is unavailable for ${variable.id}`);
+  }
+  const chunks = variable.chunkShape;
+  if (!chunks || chunks.length !== variable.shape.length) {
+    throw new Error(
+      `Precipitation variable ${variable.id} has no compatible chunk grid`,
+    );
+  }
+  const leadDimension = variable.dimensions.findIndex(
+    (dimension) => info.axes[dimension]?.kind === "timedelta",
+  );
+  if (leadDimension < 0) {
+    throw new Error(
+      `Cumulative precipitation variable ${variable.id} has no lead-time axis`,
+    );
+  }
+  const sourceArray = await zarr.open(
+    zarr.root(info.store).resolve(variable.id),
+    { kind: "array" },
+  );
+  const coordinateEntries = await Promise.all(
+    variable.dimensions.map(async (dimension, index) => ({
+      dimension,
+      values: await coordinateValues(
+        info,
+        dimension,
+        variable.shape?.[index] ?? 0,
+      ),
+    })),
+  );
+  const metadata: Record<string, unknown> = {
+    [variable.id]: arrayMetadata(
+      variable.shape,
+      chunks,
+      variable.dimensions,
+      "float32",
+      {
+        long_name: variable.label,
+        units: variable.unit,
+        standard_name: variable.standardName,
+        precipitation_accumulation: "step",
+      },
+    ),
+  };
+  const staticBytes = new Map<string, Uint8Array>();
+  for (const { dimension, values } of coordinateEntries) {
+    metadata[dimension] = arrayMetadata(
+      [values.length],
+      [Math.max(1, values.length)],
+      [dimension],
+      "float64",
+    );
+    staticBytes.set(`/${dimension}/c/0`, bytesOf(values));
+  }
+  staticBytes.set(
+    "/zarr.json",
+    textEncoder.encode(JSON.stringify({
+      attributes: { precipitation_accumulation: "step" },
+      zarr_format: 3,
+      consolidated_metadata: {
+        kind: "inline",
+        must_understand: false,
+        metadata,
+      },
+      node_type: "group",
+    })),
+  );
+  for (const [id, entry] of Object.entries(metadata)) {
+    staticBytes.set(
+      `/${id}/zarr.json`,
+      textEncoder.encode(JSON.stringify(entry)),
+    );
+  }
+
+  const readStepChunk = async (
+    key: string,
+    options?: GetOptions,
+  ): Promise<Uint8Array | undefined> => {
+    const prefix = `/${variable.id}/c/`;
+    if (!key.startsWith(prefix)) return undefined;
+    const coordinates = key.slice(prefix.length).split("/").map(Number);
+    if (
+      coordinates.length !== variable.shape?.length
+      || coordinates.some((value) => !Number.isInteger(value) || value < 0)
+    ) return undefined;
+    const starts = coordinates.map(
+      (coordinate, index) => coordinate * chunks[index],
+    );
+    if (starts.some((start, index) => start >= (variable.shape?.[index] ?? 0))) {
+      return undefined;
+    }
+    const stops = starts.map(
+      (start, index) => Math.min(
+        start + chunks[index],
+        variable.shape?.[index] ?? 0,
+      ),
+    );
+    const sourceStarts = [...starts];
+    sourceStarts[leadDimension] = Math.max(0, starts[leadDimension] - 1);
+    const result = await zarr.get(
+      sourceArray,
+      sourceStarts.map(
+        (start, index) => zarr.slice(start, stops[index]),
+      ),
+      { signal: options?.signal },
+    );
+    const stepValues = accumulatedToStepValues(
+      contiguousValues(result as ZarrResult),
+      stops.map((stop, index) => stop - sourceStarts[index]),
+      leadDimension,
+      starts[leadDimension],
+    );
+    return bytesOf(padChunk(
+      stepValues,
+      stops.map((stop, index) => stop - starts[index]),
+      chunks,
+    ));
+  };
+
+  return createVirtualStore(staticBytes, readStepChunk);
+}
+
+function usesCumulativePrecipitation(
+  info: StoreInfo,
+  variable: VariableConfig,
+) {
+  return info.source.precipitationAccumulation === "cumulative"
+    && commonVariableMatches([variable]).some((match) => match.key === "tp");
+}
+
+export function variableLayerOptions(
   info: StoreInfo,
   variable: VariableConfig,
 ): Promise<StoreInfo["layerOptions"]> {
-  if (!variable.derived) return Promise.resolve(info.layerOptions);
+  const cumulativePrecipitation = usesCumulativePrecipitation(info, variable);
+  if (!variable.derived && !cumulativePrecipitation) {
+    return Promise.resolve(info.layerOptions);
+  }
   let byVariable = storeCache.get(info);
   if (!byVariable) {
     byVariable = new Map();
     storeCache.set(info, byVariable);
   }
-  let store = byVariable.get(variable.id);
+  const cacheKey = variable.derived
+    ? `derived:${variable.id}`
+    : `step-precipitation:${variable.id}`;
+  let store = byVariable.get(cacheKey);
   if (!store) {
-    store = buildDerivedStore(info, variable);
-    byVariable.set(variable.id, store);
+    store = variable.derived
+      ? buildDerivedStore(info, variable)
+      : buildStepPrecipitationStore(info, variable);
+    byVariable.set(cacheKey, store);
   }
-  return store.then((derivedStore) => ({
+  return store.then((virtualStore) => ({
     ...info.layerOptions,
     source: undefined,
-    store: derivedStore,
+    store: virtualStore,
     zarrVersion: 3,
     transformRequest: undefined,
   }));
 }
+
+export const derivedLayerOptions = variableLayerOptions;

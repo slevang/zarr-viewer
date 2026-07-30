@@ -29,8 +29,13 @@ export const COLORMAPS: readonly Colormap[] = [
   },
   {
     id: "rain",
-    label: "Greens",
-    colors: ["#f7fcfd", "#e5f5f9", "#ccece6", "#99d8c9", "#66c2a4", "#41ae76", "#238b45", "#006d2c", "#00441b"],
+    label: "Radar",
+    colors: ["#20a83a", "#58c43d", "#9bd33c", "#d8e43b", "#fff23a", "#ffc334", "#ff8a30", "#ef482d", "#cc2027", "#8f1238"],
+  },
+  {
+    id: "smoke",
+    label: "Smoke",
+    colors: ["#fff7bc", "#fee391", "#fec44f", "#fe9929", "#ec7014", "#cc4c02", "#993404", "#7f0000"],
   },
   {
     id: "ice",
@@ -52,9 +57,11 @@ export const COLORMAPS: readonly Colormap[] = [
 export const DEFAULT_COLORMAP = COLORMAPS[0];
 
 const DEFAULT_RULES: readonly { id: string; pattern: RegExp }[] = [
+  { id: "smoke", pattern: /\b(?:smoke|aerosol|aot|aotk|mass density|colmd|mdens)\b/ },
   { id: "balance", pattern: /\b(?:u|v)\s+(?:component\s+of\s+wind|wind\s+component)\b|\b(?:eastward|northward)\s+wind\b/ },
   { id: "solar", pattern: /\b(?:solar|sunshine|ultraviolet|uv|short\s+wave|shortwave|toa\s+incident)\b/ },
   { id: "greys", pattern: /\b(?:cloud|clouds|fog)\b/ },
+  { id: "rain", pattern: /\b(?:tp|pr|precipitation|precip|rain|rainfall|shower|drizzle)\b/ },
   { id: "ice", pattern: /\b(?:ice|snow|snowfall|snowmelt|frost|frozen|glacier)\b/ },
   { id: "thermal", pattern: /\b(?:temperature|temperatures|dewpoint|heat index|wind chill|degree days)\b/ },
 ];

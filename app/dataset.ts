@@ -34,6 +34,9 @@ import {
 import {
   googleAuthorizedFetch,
 } from "./google-auth";
+import {
+  ecmwfAuthorizedFetch,
+} from "./ecmwf-auth";
 
 export type {
   AxisConfig,
@@ -536,6 +539,115 @@ async function loadV3StoreInfo(
   }
   const cachedStore = cacheStoreReads(store);
 
+  return {
+    dataset,
+    source,
+    role,
+    variables,
+    axes,
+    store: cachedStore,
+    layerOptions: defaultLayerOptions(source, cachedStore),
+  };
+}
+
+type ConsolidatedReadable = Readable & {
+  contents: () => Array<{
+    path: AbsolutePath;
+    kind: "array" | "group";
+  }>;
+};
+
+async function variablesFromConsolidatedStore(
+  store: ConsolidatedReadable,
+  source: DatasetSourceConfig,
+) {
+  const variables: VariableConfig[] = [];
+  const dimensionLengths = new Map<string, number>();
+
+  await Promise.all(store.contents().map(async (entry) => {
+    const id = entry.path.replace(/^\/+/, "");
+    if (entry.kind !== "array" || !id || id.includes("/")) return;
+    const array = await zarr.open(zarr.root(store).resolve(id), {
+      kind: "array",
+    });
+    const dimensions = array.dimensionNames ?? [];
+    if (!hasSpatialDimensions(dimensions, source)) return;
+    recordDimensionLengths(dimensionLengths, dimensions, array.shape, source);
+    const attrs = array.attrs as Record<string, unknown>;
+    const longName = typeof attrs.long_name === "string"
+      ? attrs.long_name.trim()
+      : "";
+    variables.push({
+      id,
+      label: longName || id.replaceAll("_", " "),
+      unit: metadataUnit(attrs, source, id),
+      standardName: typeof attrs.standard_name === "string"
+        ? attrs.standard_name
+        : undefined,
+      dimensions,
+      shape: array.shape,
+      chunkShape: array.chunks,
+      dataType: array.dtype,
+    });
+  }));
+
+  variables.sort((first, second) =>
+    first.label.localeCompare(second.label, undefined, { sensitivity: "base" })
+  );
+  return { variables, dimensionLengths };
+}
+
+async function readConsolidatedCoordinate(
+  store: ConsolidatedReadable,
+  dimension: string,
+  expectedLength: number,
+): Promise<AxisConfig> {
+  const array = await zarr.open(zarr.root(store).resolve(dimension), {
+    kind: "array",
+  });
+  const attrs = array.attrs as Record<string, unknown>;
+  const values = product(array.shape) <= 1_000_000
+    ? Array.from(
+      (await zarr.get(array)).data as ArrayLike<unknown>,
+      normalizeValue,
+    )
+    : Array.from({ length: expectedLength }, (_, index) => index);
+  return {
+    id: dimension,
+    label: axisLabel(dimension, attrs),
+    unit: typeof attrs.units === "string" ? attrs.units : "",
+    kind: axisKind(dimension, attrs, array.dtype),
+    values,
+  };
+}
+
+async function loadEcmwfArcoStoreInfo(
+  dataset: DatasetConfig,
+  source: DatasetSourceConfig,
+  role: DatasetSourceRole,
+): Promise<StoreInfo> {
+  const rawStore = new zarr.FetchStore(source.url, {
+    fetch: ecmwfAuthorizedFetch,
+  });
+  const consolidatedStore = await zarr.withConsolidatedMetadata(rawStore, {
+    format: "v2",
+  }) as ConsolidatedReadable;
+  const { variables, dimensionLengths } = await variablesFromConsolidatedStore(
+    consolidatedStore,
+    source,
+  );
+  if (!variables.length) {
+    throw new Error("ECMWF ARCO did not report any compatible spatial variables");
+  }
+  const axes: Record<string, AxisConfig> = {};
+  await Promise.all(Array.from(dimensionLengths, async ([dimension, length]) => {
+    axes[dimension] = await readConsolidatedCoordinate(
+      consolidatedStore,
+      dimension,
+      length,
+    );
+  }));
+  const cachedStore = cacheStoreReads(consolidatedStore);
   return {
     dataset,
     source,
@@ -1275,6 +1387,7 @@ const STORE_INFO_LOADERS = {
   weatherzarr: loadWeatherZarrStoreInfo,
   weathernext: loadWeatherNextStoreInfo,
   "google-arco": loadGoogleStoreInfo,
+  "ecmwf-arco": loadEcmwfArcoStoreInfo,
 } satisfies Record<DatasetSourceConfig["kind"], StoreInfoLoader>;
 
 const sourceInfoPromises = new Map<string, Promise<StoreInfo>>();

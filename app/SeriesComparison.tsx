@@ -10,11 +10,28 @@ import {
   datasetOptionLabel,
   type DatasetConfig,
 } from "./catalog";
+import { HorizontalScrollWindow } from "./components/HorizontalScrollWindow";
 import type { PointSeries } from "./data/types";
 import {
   convertPointSeries,
+  precipitationRateUnitOption,
+  unitKind,
   type UnitOption,
 } from "./units";
+import {
+  FORECAST_WINDOW_DAYS,
+  timelineRangeDays,
+  timelineWidthPercent,
+} from "./viewer/timeline";
+import {
+  meteogramDayTicks,
+  nearestTimestamp,
+} from "./viewer/meteogram";
+import {
+  formatLocalTimestamp,
+  formatUtcTick,
+  formatUtcTimestamp,
+} from "./viewer/time-zone";
 
 export type ComparisonSeriesEntry = {
   datasetId: string;
@@ -35,6 +52,7 @@ type SeriesComparisonProps = {
   onAdd: () => void;
   onRemove: (datasetId: string) => void;
   displayUnit: UnitOption | null;
+  timeZone: string;
 };
 
 const SERIES_COLORS = [
@@ -108,22 +126,6 @@ function decimalsForSpan(min: number, max: number) {
   return 3;
 }
 
-function formatUtcTick(date: Date, span: number) {
-  const month = date.toLocaleString("en-US", {
-    month: "short",
-    timeZone: "UTC",
-  });
-  const day = date.getUTCDate();
-  if (span <= 3 * 24 * 60 * 60 * 1000) {
-    return `${month} ${day} ${String(date.getUTCHours()).padStart(2, "0")}Z`;
-  }
-  return `${month} ${day}`;
-}
-
-function formatUtcRangeDate(date: Date) {
-  return `${date.toISOString().slice(0, 16).replace("T", " ")}Z`;
-}
-
 function interpolatedValueAtTime(
   dates: Date[],
   values: number[],
@@ -162,21 +164,6 @@ function valueAtTime(series: PointSeries, timestamp: number) {
   );
 }
 
-function nearestTimestamp(timestamps: number[], target: number) {
-  if (!timestamps.length) return target;
-  let low = 0;
-  let high = timestamps.length - 1;
-  while (low < high) {
-    const middle = Math.floor((low + high) / 2);
-    if (timestamps[middle] < target) low = middle + 1;
-    else high = middle;
-  }
-  if (low === 0) return timestamps[0];
-  const previous = timestamps[low - 1];
-  const next = timestamps[low];
-  return target - previous <= next - target ? previous : next;
-}
-
 export function SeriesComparison({
   entries,
   availableDatasets,
@@ -186,8 +173,10 @@ export function SeriesComparison({
   onAdd,
   onRemove,
   displayUnit,
+  timeZone,
 }: SeriesComparisonProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [canvasSize, setCanvasSize] = useState({ width: 0, height: 0 });
   const [hover, setHover] = useState<{
     timestamp: number;
     x: number;
@@ -198,7 +187,13 @@ export function SeriesComparison({
       entry.series
         ? [{
           ...entry,
-          series: convertPointSeries(entry.series, displayUnit),
+          series: convertPointSeries(
+            entry.series,
+            unitKind(entry.series.unit, entry.series.variableLabel)
+                === "precipitation_rate"
+              ? precipitationRateUnitOption(displayUnit?.id)
+              : displayUnit,
+          ),
         }]
         : []
     ) as Array<ComparisonSeriesEntry & { series: PointSeries }>,
@@ -212,12 +207,11 @@ export function SeriesComparison({
     if (!dates.length || !limits.length) return null;
     const min = Math.min(...limits);
     const max = Math.max(...limits);
-    const padding = (max - min || Math.abs(min) || 1) * 0.05;
     return {
       start: Math.min(...dates),
       stop: Math.max(...dates),
-      min: min - padding,
-      max: max + padding,
+      min,
+      max,
     };
   }, [plottedEntries]);
   const chartTimestamps = useMemo(
@@ -237,6 +231,12 @@ export function SeriesComparison({
   const decimals = chartBounds
     ? decimalsForSpan(chartBounds.min, chartBounds.max)
     : 1;
+  const chartRangeDays = chartBounds
+    ? timelineRangeDays(chartBounds.start, chartBounds.stop)
+    : FORECAST_WINDOW_DAYS;
+  const chartWidthPercent = chartBounds
+    ? timelineWidthPercent(chartBounds.start, chartBounds.stop)
+    : 100;
   const cursorTimestamp = cursorDate?.getTime();
   const cursorInRange = Boolean(
     chartBounds
@@ -291,13 +291,14 @@ export function SeriesComparison({
   const updateHover = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     if (!chartBounds) return;
     const rect = event.currentTarget.getBoundingClientRect();
-    const chartWidth = Math.max(320, rect.width);
+    const chartWidth = canvasSize.width || rect.width;
+    const chartHeight = canvasSize.height || rect.height;
     const logicalX = (event.clientX - rect.left) * (chartWidth / rect.width);
-    const logicalY = (event.clientY - rect.top) * (204 / rect.height);
+    const logicalY = (event.clientY - rect.top) * (chartHeight / rect.height);
     const plotLeft = 56;
     const plotRight = chartWidth - 8;
     const plotTop = 24;
-    const plotBottom = 204 - 28;
+    const plotBottom = chartHeight - 28;
     if (
       logicalX < plotLeft
       || logicalX > plotRight
@@ -327,8 +328,36 @@ export function SeriesComparison({
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || !chartBounds) return;
-    const width = Math.max(320, canvas.clientWidth);
-    const height = 204;
+    const updateSize = () => {
+      const rect = canvas.getBoundingClientRect();
+      const nextSize = {
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+      };
+      setCanvasSize((current) =>
+        current.width === nextSize.width && current.height === nextSize.height
+          ? current
+          : nextSize
+      );
+    };
+    updateSize();
+    const observer = typeof ResizeObserver === "undefined"
+      ? null
+      : new ResizeObserver(updateSize);
+    observer?.observe(canvas);
+    window.addEventListener("resize", updateSize);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", updateSize);
+    };
+  }, [chartBounds]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !chartBounds) return;
+    const width = canvasSize.width || canvas.clientWidth;
+    const height = canvasSize.height || canvas.clientHeight;
+    if (!width || !height) return;
     const scale = window.devicePixelRatio || 1;
     canvas.width = Math.round(width * scale);
     canvas.height = Math.round(height * scale);
@@ -339,10 +368,12 @@ export function SeriesComparison({
 
     const plot = { left: 56, right: width - 8, top: 24, bottom: height - 28 };
     const xSpan = chartBounds.stop - chartBounds.start || 1;
-    const ySpan = chartBounds.max - chartBounds.min || 1;
+    const ySpan = chartBounds.max - chartBounds.min;
+    const yScaleSpan = ySpan || 1;
     const point = (date: Date, value: number): [number, number] => [
       plot.left + ((date.getTime() - chartBounds.start) / xSpan) * (plot.right - plot.left),
-      plot.bottom - ((value - chartBounds.min) / ySpan) * (plot.bottom - plot.top),
+      plot.bottom - ((value - chartBounds.min) / yScaleSpan)
+        * (plot.bottom - plot.top),
     ];
 
     context.font = '10px "Geist Variable", ui-sans-serif, system-ui, sans-serif';
@@ -366,19 +397,22 @@ export function SeriesComparison({
       context.lineTo(plot.right, y);
       context.stroke();
     }
-    for (const fraction of [0, 0.25, 0.5, 0.75, 1]) {
-      const timestamp = chartBounds.start + fraction * xSpan;
+    const dayTicks = meteogramDayTicks(chartBounds.start, chartBounds.stop);
+    context.font = '9px "Geist Variable", ui-sans-serif, system-ui, sans-serif';
+    for (const { timestamp, showLabel } of dayTicks) {
+      const fraction = (timestamp - chartBounds.start) / xSpan;
       const x = plot.left + fraction * (plot.right - plot.left);
-      context.strokeStyle = "rgba(255,255,255,0.12)";
+      context.strokeStyle = "rgba(255,255,255,0.075)";
       context.beginPath();
-      context.moveTo(x, plot.bottom);
-      context.lineTo(x, plot.bottom + 4);
+      context.moveTo(x, plot.top);
+      context.lineTo(x, plot.bottom);
       context.stroke();
-      context.fillStyle = "rgba(219,232,255,0.72)";
-      context.textAlign = fraction === 0 ? "left" : fraction === 1 ? "right" : "center";
+      if (!showLabel) continue;
+      context.fillStyle = "rgba(219,232,255,0.62)";
+      context.textAlign = "center";
       context.textBaseline = "top";
       context.fillText(
-        formatUtcTick(new Date(timestamp), xSpan),
+        formatUtcTick(new Date(timestamp), false),
         x,
         plot.bottom + 7,
       );
@@ -528,6 +562,7 @@ export function SeriesComparison({
   }, [
     availableDatasets,
     chartBounds,
+    canvasSize,
     cursorInRange,
     cursorTimestamp,
     decimals,
@@ -542,97 +577,80 @@ export function SeriesComparison({
 
   return (
     <section className="series-comparison" aria-label="Model time-series comparison">
-      <div className="series-picker">
-        <label>
-          <span>Comparison dataset</span>
-          <select
-            aria-label="Comparison dataset"
-            value={pickerId}
-            disabled={!addableDatasets.length}
-            onChange={(event) => onPickerChange(event.target.value)}
-          >
-            {DATASET_CATEGORY_GROUPS.map((group) => {
-              const datasets = addableDatasets.filter(
-                (dataset) => dataset.category === group.id,
-              );
-              return datasets.length ? (
-                <optgroup key={group.id} label={group.label}>
-                  {datasets.map((dataset) => (
-                    <option key={dataset.id} value={dataset.id}>
-                      {datasetOptionLabel(dataset)}
-                    </option>
-                  ))}
-                </optgroup>
-              ) : null;
-            })}
-          </select>
-        </label>
-        <button
-          className="series-add"
-          type="button"
-          disabled={!addableDatasets.some((dataset) => dataset.id === pickerId)}
-          onClick={onAdd}
-        >
-          Add
-        </button>
-      </div>
-
       {chartBounds ? (
         <>
           <div className="series-heading">
-            <span>15-day timeseries</span>
-            <strong>
+            <span>Forecast detail</span>
+            <strong className="series-time-pair">
               {cursorInRange && cursorDate
-                ? `Map ${formatUtcRangeDate(cursorDate)}`
+                ? (
+                  <>
+                    <span>Map {formatUtcTimestamp(cursorDate)}</span>
+                    <small title={timeZone}>
+                      {formatLocalTimestamp(cursorDate, timeZone)}
+                    </small>
+                  </>
+                )
                 : "Map time outside range"}
             </strong>
           </div>
-          <div className="series-chart">
-            <canvas
-              ref={canvasRef}
-              aria-label={cursorInRange && cursorDate
-                ? `Overlaid model time series with map tracer at ${formatUtcRangeDate(cursorDate)}`
-                : "Overlaid model time series"}
-              onPointerMove={updateHover}
-              onPointerLeave={() => setHover(null)}
-            />
-            {hover && hoverValues.length ? (
-              <div
-                className={`series-tooltip ${hover.alignRight ? "right" : ""}`}
-                style={{ left: hover.x }}
-                aria-hidden="true"
-              >
-                <time>{formatUtcRangeDate(new Date(hover.timestamp))}</time>
-                {hoverValues.map((item) => (
-                  <div className="series-tooltip-row" key={item.datasetId}>
-                    <i style={{ background: item.color }} />
-                    <span>
-                      <strong>{item.label}</strong>
-                      {item.ranges
-                        && item.ranges.q10 !== null
-                        && item.ranges.q25 !== null
-                        && item.ranges.q75 !== null
-                        && item.ranges.q90 !== null ? (
-                          <small>
-                            25–75% {item.ranges.q25.toFixed(decimals)}
-                            –{item.ranges.q75.toFixed(decimals)}
-                            {" · "}10–90% {item.ranges.q10.toFixed(decimals)}
-                            –{item.ranges.q90.toFixed(decimals)}
-                          </small>
-                        ) : null}
-                    </span>
-                    <b>
-                      {item.value.toFixed(decimals)} {item.unit}
-                    </b>
+          <HorizontalScrollWindow
+            ariaLabel={`${FORECAST_WINDOW_DAYS}-day time-series window; scroll horizontally for later forecast dates`}
+            className="series-chart-window"
+            contentWidthPercent={chartWidthPercent}
+            label={`${FORECAST_WINDOW_DAYS}-day view · ${chartRangeDays}-day range`}
+            resetKey={`${chartBounds.start}:${chartBounds.stop}`}
+          >
+            <div className="series-chart">
+              <canvas
+                ref={canvasRef}
+                aria-label={cursorInRange && cursorDate
+                  ? `Overlaid model time series with map tracer at ${
+                    formatUtcTimestamp(cursorDate)
+                  }, ${formatLocalTimestamp(cursorDate, timeZone)}`
+                  : "Overlaid model time series"}
+                onPointerMove={updateHover}
+                onPointerLeave={() => setHover(null)}
+              />
+              {hover && hoverValues.length ? (
+                <div
+                  className={`series-tooltip ${hover.alignRight ? "right" : ""}`}
+                  style={{ left: hover.x }}
+                  aria-hidden="true"
+                >
+                  <div className="series-tooltip-times">
+                    <time>{formatUtcTimestamp(new Date(hover.timestamp))}</time>
+                    <time title={timeZone}>
+                      {formatLocalTimestamp(new Date(hover.timestamp), timeZone)}
+                    </time>
                   </div>
-                ))}
-              </div>
-            ) : null}
-          </div>
-          <div className="series-dates">
-            <span>{formatUtcRangeDate(new Date(chartBounds.start))}</span>
-            <span>{formatUtcRangeDate(new Date(chartBounds.stop))}</span>
-          </div>
+                  {hoverValues.map((item) => (
+                    <div className="series-tooltip-row" key={item.datasetId}>
+                      <i style={{ background: item.color }} />
+                      <span>
+                        <strong>{item.label}</strong>
+                        {item.ranges
+                          && item.ranges.q10 !== null
+                          && item.ranges.q25 !== null
+                          && item.ranges.q75 !== null
+                          && item.ranges.q90 !== null ? (
+                            <small>
+                              25–75% {item.ranges.q25.toFixed(decimals)}
+                              –{item.ranges.q75.toFixed(decimals)}
+                              {" · "}10–90% {item.ranges.q10.toFixed(decimals)}
+                              –{item.ranges.q90.toFixed(decimals)}
+                            </small>
+                          ) : null}
+                      </span>
+                      <b>
+                        {item.value.toFixed(decimals)} {item.unit}
+                      </b>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          </HorizontalScrollWindow>
         </>
       ) : (
         <span className="series-empty">
@@ -677,6 +695,41 @@ export function SeriesComparison({
             </div>
           );
         })}
+      </div>
+
+      <div className="series-picker">
+        <label>
+          <span>Add comparison dataset</span>
+          <select
+            aria-label="Comparison dataset"
+            value={pickerId}
+            disabled={!addableDatasets.length}
+            onChange={(event) => onPickerChange(event.target.value)}
+          >
+            {DATASET_CATEGORY_GROUPS.map((group) => {
+              const datasets = addableDatasets.filter(
+                (dataset) => dataset.category === group.id,
+              );
+              return datasets.length ? (
+                <optgroup key={group.id} label={group.label}>
+                  {datasets.map((dataset) => (
+                    <option key={dataset.id} value={dataset.id}>
+                      {datasetOptionLabel(dataset)}
+                    </option>
+                  ))}
+                </optgroup>
+              ) : null;
+            })}
+          </select>
+        </label>
+        <button
+          className="series-add"
+          type="button"
+          disabled={!addableDatasets.some((dataset) => dataset.id === pickerId)}
+          onClick={onAdd}
+        >
+          Add
+        </button>
       </div>
     </section>
   );

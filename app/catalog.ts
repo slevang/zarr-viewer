@@ -4,12 +4,18 @@ export type DatasetCategory = "forecast" | "analysis";
 
 export type DatasetSourceConfig = {
   id: string;
-  kind: "zarr" | "icechunk" | "weatherzarr" | "weathernext" | "google-arco";
+  kind:
+    | "zarr"
+    | "icechunk"
+    | "weatherzarr"
+    | "weathernext"
+    | "google-arco"
+    | "ecmwf-arco";
   url: string;
   s3Url?: string;
   group?: string;
   zarrVersion: 2 | 3;
-  auth?: "google";
+  auth?: "google" | "cds-api-key";
   spatialDimensions?: { lat: string; lon: string };
   bounds?: [number, number, number, number];
   crs?: string;
@@ -17,6 +23,13 @@ export type DatasetSourceConfig = {
   latIsAscending?: boolean;
   layout?: "spatial" | "timeseries";
   directChunkReads?: boolean;
+  precipitationAccumulation?: "cumulative";
+  geographicBounds?: [west: number, south: number, east: number, north: number];
+  meteogram?: {
+    kind: "regional" | "global-ensemble" | "global-control";
+    comparisonPriority?: number;
+    firstLeadHour?: number;
+  };
 };
 
 export type DatasetConfig = {
@@ -44,9 +57,16 @@ const HRRR_GRID = {
   crs: "HRRR Lambert conformal",
   proj4: "+proj=lcc +lat_1=38.5 +lat_2=38.5 +lat_0=38.5 +lon_0=-97.5 +x_0=0 +y_0=0 +R=6371229 +units=m +no_defs",
   latIsAscending: false,
+  geographicBounds: [-125, 21, -66, 50] as [
+    west: number,
+    south: number,
+    east: number,
+    north: number,
+  ],
 } satisfies Pick<
   DatasetSourceConfig,
   "spatialDimensions" | "bounds" | "crs" | "proj4" | "latIsAscending"
+  | "geographicBounds"
 >;
 
 const DYNAMICAL_DATASETS: DatasetConfig[] = [
@@ -66,7 +86,7 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
       },
     },
     support: "ready",
-    defaultVariable: "temperature_2m",
+    defaultVariable: "precipitation_surface",
   },
   {
     id: "noaa-gfs-forecast",
@@ -82,7 +102,7 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
       zarrVersion: 3,
     }),
     support: "ready",
-    defaultVariable: "temperature_2m",
+    defaultVariable: "precipitation_surface",
   },
   {
     id: "noaa-gefs-forecast-35-day",
@@ -98,7 +118,7 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
       zarrVersion: 3,
     }),
     support: "ready",
-    defaultVariable: "temperature_2m",
+    defaultVariable: "precipitation_surface",
   },
   {
     id: "noaa-gefs-analysis",
@@ -116,7 +136,7 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
       },
     },
     support: "ready",
-    defaultVariable: "temperature_2m",
+    defaultVariable: "precipitation_surface",
   },
   {
     id: "noaa-hrrr-forecast-48-hour",
@@ -132,6 +152,10 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
         s3Url: "s3://dynamical-noaa-hrrr/noaa-hrrr-forecast-48-hour-virtual/v0.5.0.icechunk/",
         zarrVersion: 3,
         layout: "spatial",
+        meteogram: {
+          kind: "regional",
+          firstLeadHour: 1,
+        },
         ...HRRR_GRID,
       },
       series: {
@@ -140,12 +164,17 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
         url: "https://dynamical-noaa-hrrr.s3.us-west-2.amazonaws.com/noaa-hrrr-forecast-48-hour/v0.1.0.icechunk",
         s3Url: "s3://dynamical-noaa-hrrr/noaa-hrrr-forecast-48-hour/v0.1.0.icechunk/",
         zarrVersion: 3,
+        meteogram: {
+          kind: "regional",
+          comparisonPriority: 10,
+          firstLeadHour: 1,
+        },
         ...HRRR_GRID,
       },
     },
     support: "experimental",
     supportNote: "Map frames use the GRIB-backed store; point forecasts use the time-optimized store.",
-    defaultVariable: "temperature_2m",
+    defaultVariable: "total_precipitation_surface",
   },
   {
     id: "noaa-hrrr-analysis",
@@ -165,7 +194,7 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
     },
     support: "experimental",
     supportNote: "Uses the available time-oriented store for maps until a spatial store exists.",
-    defaultVariable: "temperature_2m",
+    defaultVariable: "precipitation_surface",
   },
   {
     id: "ecmwf-aifs-single-forecast",
@@ -181,7 +210,7 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
       zarrVersion: 3,
     }),
     support: "ready",
-    defaultVariable: "temperature_2m",
+    defaultVariable: "precipitation_surface",
   },
   {
     id: "ecmwf-aifs-ens-forecast",
@@ -197,7 +226,7 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
       zarrVersion: 3,
     }),
     support: "ready",
-    defaultVariable: "temperature_2m",
+    defaultVariable: "precipitation_surface",
   },
   {
     id: "ecmwf-ifs-ens-forecast-15-day-0-25-degree",
@@ -211,9 +240,15 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
       url: "https://dynamical-ecmwf-ifs-ens.s3.us-west-2.amazonaws.com/ecmwf-ifs-ens-forecast-15-day-0-25-degree/v0.1.0.icechunk",
       s3Url: "s3://dynamical-ecmwf-ifs-ens/ecmwf-ifs-ens-forecast-15-day-0-25-degree/v0.1.0.icechunk/",
       zarrVersion: 3,
+      geographicBounds: [-180, -90, 180, 90],
+      meteogram: {
+        kind: "global-ensemble",
+        comparisonPriority: 20,
+        firstLeadHour: 3,
+      },
     }),
     support: "ready",
-    defaultVariable: "temperature_2m",
+    defaultVariable: "precipitation_surface",
   },
   {
     id: "dwd-icon-eu-forecast-5-day",
@@ -227,10 +262,16 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
       url: "https://dynamical-dwd-icon-eu.s3.us-west-2.amazonaws.com/dwd-icon-eu-forecast-5-day/v0.2.0.icechunk",
       s3Url: "s3://dynamical-dwd-icon-eu/dwd-icon-eu-forecast-5-day/v0.2.0.icechunk/",
       zarrVersion: 3,
+      geographicBounds: [-25, 29, 45, 72],
+      meteogram: {
+        kind: "regional",
+        comparisonPriority: 11,
+        firstLeadHour: 1,
+      },
     }),
     support: "experimental",
     supportNote: "Regional projected-grid rendering is experimental.",
-    defaultVariable: "temperature_2m",
+    defaultVariable: "precipitation_surface",
   },
 ];
 
@@ -257,7 +298,7 @@ export const DATASETS: DatasetConfig[] = [
     },
     support: "experimental",
     supportNote: "Requires Google authorization; each map chunk contains one global ensemble-member field.",
-    defaultVariable: "2m_temperature",
+    defaultVariable: "total_precipitation_6hr",
   },
   {
     id: "weatherzarr-ecmwf-ifs",
@@ -276,6 +317,12 @@ export const DATASETS: DatasetConfig[] = [
         bounds: [-180, -90, 180, 90],
         crs: "EPSG:4326",
         latIsAscending: false,
+        precipitationAccumulation: "cumulative",
+        geographicBounds: [-180, -90, 180, 90],
+        meteogram: {
+          kind: "global-control",
+          firstLeadHour: 3,
+        },
       },
       series: {
         id: "weatherzarr-ecmwf-ifs-timeseries",
@@ -287,11 +334,16 @@ export const DATASETS: DatasetConfig[] = [
         bounds: [-180, -90, 180, 90],
         crs: "EPSG:4326",
         latIsAscending: false,
+        precipitationAccumulation: "cumulative",
+        geographicBounds: [-180, -90, 180, 90],
+        meteogram: {
+          kind: "global-control",
+        },
       },
     },
     support: "experimental",
     supportNote: "WeatherZarr retains a rolling set of recent operational runs.",
-    defaultVariable: "2t",
+    defaultVariable: "tp",
   },
   {
     id: "google-arco-era5",
@@ -311,7 +363,43 @@ export const DATASETS: DatasetConfig[] = [
       latIsAscending: false,
     }),
     support: "ready",
-    defaultVariable: "2m_temperature",
+    defaultVariable: "total_precipitation",
+  },
+  {
+    id: "ecmwf-arco-era5",
+    label: "ECMWF ERA5 reanalysis",
+    provider: "ECMWF ARCO",
+    category: "analysis",
+    description: "Global hourly ERA5 with official map- and point-optimized Zarr stores.",
+    sources: {
+      map: {
+        id: "ecmwf-arco-era5-time-chunked",
+        kind: "ecmwf-arco",
+        url: "https://arco.datastores.ecmwf.int/cadl-arco-time-002/arco/reanalysis_era5_single_levels/sfc/timeChunked.zarr",
+        zarrVersion: 2,
+        auth: "cds-api-key",
+        layout: "spatial",
+        spatialDimensions: { lat: "latitude", lon: "longitude" },
+        bounds: [-180, -90, 180, 90],
+        crs: "EPSG:4326",
+        latIsAscending: true,
+      },
+      series: {
+        id: "ecmwf-arco-era5-geo-chunked",
+        kind: "ecmwf-arco",
+        url: "https://arco.datastores.ecmwf.int/cadl-arco-geo-002/arco/reanalysis_era5_single_levels/sfc/geoChunked.zarr",
+        zarrVersion: 2,
+        auth: "cds-api-key",
+        layout: "timeseries",
+        spatialDimensions: { lat: "latitude", lon: "longitude" },
+        bounds: [-180, -90, 180, 90],
+        crs: "EPSG:4326",
+        latIsAscending: true,
+      },
+    },
+    support: "experimental",
+    supportNote: "Requires a CDS API key; ECMWF currently describes tokenized ARCO access as a beta service.",
+    defaultVariable: "tp",
   },
   ...DYNAMICAL_DATASETS,
   {
@@ -342,7 +430,7 @@ export const DATASETS: DatasetConfig[] = [
     },
     support: "experimental",
     supportNote: "Uses the read-only PCodec WASM decoder.",
-    defaultVariable: "t2m",
+    defaultVariable: "tp",
   },
   {
     id: "salient-gemai-v3-reforecast",
@@ -362,7 +450,7 @@ export const DATASETS: DatasetConfig[] = [
     }),
     support: "experimental",
     supportNote: "Uses sharded PCodec chunks spanning seven leads and all 50 members.",
-    defaultVariable: "2m_temperature",
+    defaultVariable: "mean_total_precipitation_rate",
   },
 ];
 

@@ -12,7 +12,8 @@ import {
 } from "./color-range";
 import { commonVariableMatches } from "./common-variables";
 import { DeferredCalendarInput } from "./components/DeferredCalendarInput";
-import { derivedLayerOptions } from "./derived-store";
+import { ViewerOptions } from "./components/ViewerOptions";
+import { variableLayerOptions } from "./derived-store";
 import { derivedDisplayId } from "./derived-variables";
 import {
   DATASETS,
@@ -27,6 +28,10 @@ import {
   SeriesComparison,
   type ComparisonSeriesEntry,
 } from "./SeriesComparison";
+import {
+  Meteogram,
+  type MeteogramFields,
+} from "./Meteogram";
 import {
   ASOS_MANIFEST_URL,
   ASOS_SERIES_COLOR,
@@ -53,14 +58,17 @@ import {
 import type {
   AxisConfig,
   AxisSelection,
+  PointSeries,
   StoreInfo,
   VariableConfig,
 } from "./data/types";
+import { isSpatialDimension } from "./data/dimensions";
 import {
   loadStoreInfo,
 } from "./dataset";
 import {
   loadPointSeries,
+  loadPointPrecipitationForecast,
   preloadPointSeriesCoordinates,
 } from "./data/point-series";
 import { temporalNeighborIndices } from "./temporal-prefetch";
@@ -70,6 +78,7 @@ import {
   errorState,
   firstFinite,
   formatOptionalValue,
+  formatRangeValue,
   formatUtcTime,
   initialDisplayRange,
   loadingState,
@@ -77,6 +86,7 @@ import {
   roundToSignificant,
   type LoadState,
 } from "./viewer/display";
+import { VIEWER_DATA_ATTRIBUTION } from "./viewer/attribution";
 import {
   playbackChunkKey,
   playbackInterval,
@@ -88,16 +98,36 @@ import {
   runDatasetPreloads,
 } from "./viewer/dataset-preload";
 import {
+  baseViewerUrl,
+  hasRequestedDataset,
   initialDatasetId,
+  initialViewerLocation,
   storeUnitPreferences,
   storedUnitPreferences,
+  viewerShareUrl,
 } from "./viewer/preferences";
+import {
+  meteogramComparisonDatasets,
+  meteogramStartSelections,
+  normalizeMeteogramPercentSeries,
+  primaryMeteogramDataset,
+  preferredRegionalMeteogramDataset,
+  stitchMeteogramSeries,
+  trimMeteogramSeries,
+  type MeteogramViewMode,
+} from "./viewer/meteogram";
 import {
   formatAsosTime,
   shortCoordinate,
   stationFromFeature,
   type StationFeatureLike,
 } from "./viewer/stations";
+import { timeZoneAt } from "./viewer/time-zone";
+import {
+  variableFragmentShader,
+  variableRenderingOptions,
+} from "./viewer/rendering";
+import { hrrrSmokeVariables } from "./viewer/smoke";
 import {
   availableVariables,
   axisSummary,
@@ -111,6 +141,7 @@ import {
   convertUnitRange,
   convertUnitValue,
   nativeUnitOption,
+  precipitationRateUnitOption,
   unitKind,
   unitOptions,
   type UnitOption,
@@ -122,6 +153,13 @@ import {
   requestGoogleAuthorization,
   subscribeGoogleAuth,
 } from "./google-auth";
+import {
+  disconnectEcmwf,
+  ecmwfAuthSnapshot,
+  hasCdsApiKey,
+  setCdsApiKey,
+  subscribeEcmwfAuth,
+} from "./ecmwf-auth";
 
 type Projection = "globe" | "mercator";
 type SeriesComparisonOptions = {
@@ -130,14 +168,17 @@ type SeriesComparisonOptions = {
 type InspectionPoint = { lng: number; lat: number };
 type Inspector = InspectionPoint & { value: number | null };
 type Limit = "min" | "max";
+type ShareStatus = "idle" | "copied" | "error";
 
 const MAP_STYLE = "https://tiles.openfreemap.org/styles/liberty";
 const ZARR_LAYER_ID = "zarr-data";
+const MOBILE_MAP_BOTTOM_PADDING = 160;
 const ASOS_SOURCE_ID = "asos-stations";
 const ASOS_DOT_LAYER_ID = "asos-station-dots";
 const ASOS_HIT_LAYER_ID = "asos-station-hits";
 const DEFAULT_CENTER: [number, number] = [-98, 38.5];
 const DEFAULT_ZOOM = 1.75;
+const MOBILE_DEFAULT_ZOOM = 1.25;
 const READY_STATE: LoadState = { phase: "ready", message: "Ready" };
 const MAP_DATASETS = DATASETS.filter(hasMapSource);
 const TIME_SERIES_DATASETS = DATASETS.filter(hasSeriesSource);
@@ -155,8 +196,30 @@ const FULL_IMAGE_GEOMETRIES = [
   ]],
 }));
 
+async function copyTextToClipboard(text: string) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      // Fall through for browsers that deny the async clipboard API.
+    }
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.readOnly = true;
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.append(textarea);
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  if (!copied) throw new Error("Clipboard copy was rejected");
+}
+
 export function ZarrViewer() {
   const mapContainerRef = useRef<HTMLDivElement>(null);
+  const forecastWorkbenchRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<import("maplibre-gl").Map | null>(null);
   const layerRef = useRef<import("@carbonplan/zarr-layer").ZarrLayer | null>(null);
   const infoRef = useRef<StoreInfo | null>(null);
@@ -174,16 +237,26 @@ export function ZarrViewer() {
   const stationSearchInputRef = useRef<HTMLInputElement>(null);
   const seriesRequestGeneration = useRef(0);
   const seriesRequestControllerRef = useRef<AbortController | null>(null);
+  const meteogramRequestControllerRef = useRef<AbortController | null>(null);
+  const meteogramRequestGenerationRef = useRef(0);
+  const pendingMobileForecastStationRef = useRef(false);
+  const deepLinkAppliedRef = useRef(false);
+  const urlSelectionsAppliedRef = useRef(false);
+  const urlDisplayAppliedRef = useRef(false);
   const seriesDatasetIdsRef = useRef<string[]>([]);
   const asosStationRef = useRef<AsosStation | null>(null);
   const stationsVisibleRef = useRef(false);
+  const viewModeRef = useRef<MeteogramViewMode>("series");
+  const projectionRef = useRef<Projection>("globe");
+  const shareStatusTimerRef = useRef<number | null>(null);
   const playbackPrefetchRef = useRef<PlaybackPrefetchQueue | null>(null);
   const playbackPrefetchGenerationRef = useRef(0);
   const playbackViewportMovingRef = useRef(false);
   const rememberedValidDateRef = useRef<Date | undefined>(undefined);
   const weatherNextStoreGenerationRef = useRef(0);
+  const useDatasetDefaultsRef = useRef(false);
   const publicDatasetPreloadStartedRef = useRef(false);
-  const authenticatedDatasetPreloadStartedRef = useRef(false);
+  const datasetPreloadAuthKeysRef = useRef(new Set<string>());
   const resetPlaybackPrefetchRef = useRef<() => void>(() => {});
   const startSeriesComparisonRef = useRef<(
     point: InspectionPoint,
@@ -195,35 +268,54 @@ export function ZarrViewer() {
     station: AsosStation | null,
   ) => void>(() => {});
 
-  const [datasetId, setDatasetId] = useState(
-    initialDatasetId,
+  const [initialLocation] = useState(initialViewerLocation);
+  const [hasExplicitDataset] = useState(hasRequestedDataset);
+  const [datasetId, setDatasetId] = useState(initialDatasetId);
+  const [viewMode, setViewMode] = useState<MeteogramViewMode>(
+    initialLocation.mode,
+  );
+  const [mobileScreen, setMobileScreen] = useState<"map" | "forecast">(
+    initialLocation.screen,
   );
   const [mapInstallRevision, setMapInstallRevision] = useState(0);
   const [unavailableMapDate, setUnavailableMapDate] = useState<Date | null>(null);
   const [googleAuth, setGoogleAuth] = useState(googleAuthSnapshot);
+  const [ecmwfAuth, setEcmwfAuth] = useState(ecmwfAuthSnapshot);
+  const [cdsKeyDraft, setCdsKeyDraft] = useState("");
   const [info, setInfo] = useState<StoreInfo | null>(null);
   const [variable, setVariable] = useState<VariableConfig | null>(null);
   const [selections, setSelections] = useState<AxisSelection>({});
-  const [opacity, setOpacity] = useState(1);
+  const [opacity, setOpacity] = useState(initialLocation.opacity ?? 1);
   const [activeDisplayRange, setActiveDisplayRange] = useState<[number, number]>([0, 1]);
   const [unitPreferences, setUnitPreferences] = useState<Record<string, string>>(
     storedUnitPreferences,
   );
-  const [colormapId, setColormapId] = useState(DEFAULT_COLORMAP.id);
+  const [colormapId, setColormapId] = useState(
+    () => COLORMAPS.some((candidate) => candidate.id === initialLocation.colormapId)
+      ? initialLocation.colormapId!
+      : DEFAULT_COLORMAP.id,
+  );
+  const [urlDisplayUnit, setUrlDisplayUnit] = useState(
+    initialLocation.displayUnit,
+  );
   const [colormapOpen, setColormapOpen] = useState(false);
   const [editingLimit, setEditingLimit] = useState<Limit | null>(null);
   const [limitDraft, setLimitDraft] = useState("");
   const [playingAxis, setPlayingAxis] = useState<string | null>(null);
   const [playbackViewportRevision, setPlaybackViewportRevision] = useState(0);
-  const [projection, setProjection] = useState<Projection>("globe");
+  const [projection, setProjection] = useState<Projection>(
+    initialLocation.projection ?? "globe",
+  );
   const [mobileControlsCollapsed, setMobileControlsCollapsed] = useState(
     () => typeof window !== "undefined"
-      && window.matchMedia("(max-width: 580px)").matches,
+      && window.matchMedia("(max-width: 960px)").matches,
   );
   const [loadState, setLoadState] = useState<LoadState>(() => loadingState());
   const [mapReady, setMapReady] = useState(false);
   const [firstDatasetFrameReady, setFirstDatasetFrameReady] = useState(false);
-  const [stationsVisible, setStationsVisible] = useState(false);
+  const [stationsVisible, setStationsVisible] = useState(
+    Boolean(initialLocation.station),
+  );
   const [stationsPhase, setStationsPhase] = useState<
     "idle" | "loading" | "ready" | "error"
   >("idle");
@@ -237,13 +329,48 @@ export function ZarrViewer() {
   const [seriesPickerId, setSeriesPickerId] = useState(
     TIME_SERIES_DATASETS[0]?.id ?? "",
   );
+  const [meteogramEntries, setMeteogramEntries] = useState<
+    ComparisonSeriesEntry[]
+  >([]);
+  const [meteogramFields, setMeteogramFields] = useState<MeteogramFields>({});
+  const [meteogramPhase, setMeteogramPhase] = useState<
+    "idle" | "loading" | "ready" | "error"
+  >("idle");
+  const [meteogramMessage, setMeteogramMessage] = useState(
+    "Select a station or point to load an hourly forecast.",
+  );
+  const [shareStatus, setShareStatus] = useState<ShareStatus>("idle");
+  useEffect(() => {
+    const restoreMobileScreen = () => {
+      setMobileScreen(initialViewerLocation().screen);
+    };
+    window.addEventListener("popstate", restoreMobileScreen);
+    return () => window.removeEventListener("popstate", restoreMobileScreen);
+  }, []);
+  useEffect(() => {
+    window.history.replaceState(
+      window.history.state,
+      "",
+      baseViewerUrl(window.location.href),
+    );
+    return () => {
+      if (shareStatusTimerRef.current !== null) {
+        window.clearTimeout(shareStatusTimerRef.current);
+      }
+    };
+  }, []);
 
   const dataset = getDataset(datasetId);
+  viewModeRef.current = viewMode;
+  opacityRef.current = opacity;
+  projectionRef.current = projection;
   const googleAuthRequired = dataset.sources.map?.auth === "google";
   const googleConnected = googleAuth.phase === "connected"
     && hasGoogleAccessToken();
+  const ecmwfAuthRequired = dataset.sources.map?.auth === "cds-api-key";
+  const ecmwfConnected = hasCdsApiKey();
   const variableUnitContext = variable
-    ? `${variable.id} ${variable.label}`
+    ? `${variable.id} ${variable.label} ${variable.standardName ?? ""}`
     : "";
   const availableUnitOptions = useMemo(
     () => variable ? unitOptions(variable.unit, variableUnitContext) : [],
@@ -257,7 +384,8 @@ export function ZarrViewer() {
     const preferred = currentUnitKind
       ? unitPreferences[currentUnitKind]
       : undefined;
-    return availableUnitOptions.find((option) => option.id === preferred)
+    return availableUnitOptions.find((option) => option.id === urlDisplayUnit)
+      ?? availableUnitOptions.find((option) => option.id === preferred)
       ?? nativeUnitOption(variable.unit, variableUnitContext)
       ?? availableUnitOptions[0]
       ?? null;
@@ -265,9 +393,26 @@ export function ZarrViewer() {
     availableUnitOptions,
     currentUnitKind,
     unitPreferences,
+    urlDisplayUnit,
     variable,
     variableUnitContext,
   ]);
+  const meteogramTemperatureUnit = useMemo(() => {
+    const options = unitOptions("K", "2 metre temperature");
+    const preferred = unitPreferences.temperature;
+    return options.find((option) => option.id === preferred)
+      ?? options.find((option) => option.id === "tempC")
+      ?? options[0]
+      ?? null;
+  }, [unitPreferences.temperature]);
+  const meteogramPrecipitationUnit = useMemo(
+    () => precipitationRateUnitOption(
+      currentUnitKind === "precipitation"
+        ? selectedUnit?.id
+        : unitPreferences.precipitation,
+    ),
+    [currentUnitKind, selectedUnit?.id, unitPreferences.precipitation],
+  );
   const stationSearchResults = useMemo(() => {
     const query = stationSearchQuery.trim().toLocaleLowerCase();
     if (!query) return [];
@@ -302,6 +447,7 @@ export function ZarrViewer() {
   );
 
   useEffect(() => subscribeGoogleAuth(setGoogleAuth), []);
+  useEffect(() => subscribeEcmwfAuth(setEcmwfAuth), []);
   useEffect(() => {
     storeUnitPreferences(unitPreferences);
   }, [unitPreferences]);
@@ -593,7 +739,9 @@ export function ZarrViewer() {
       if (signal.aborted || generation !== seriesRequestGeneration.current) return;
       const comparisonVariable = matchingVariable(comparisonInfo, sourceVariable);
       if (!comparisonVariable) {
-        throw new Error("No compatible variable was found");
+        throw new Error(
+          "Point time series unavailable for this map variable",
+        );
       }
       const comparisonSelections = defaultSelections(
         comparisonInfo,
@@ -822,6 +970,318 @@ export function ZarrViewer() {
   }, []);
   startAsosComparisonRef.current = startAsosComparison;
 
+  const loadMeteogram = useCallback(async (point: InspectionPoint) => {
+    meteogramRequestControllerRef.current?.abort();
+    const controller = new AbortController();
+    meteogramRequestControllerRef.current = controller;
+    const generation = ++meteogramRequestGenerationRef.current;
+    const datasets = meteogramComparisonDatasets(
+      TIME_SERIES_DATASETS,
+      point.lng,
+      point.lat,
+    );
+    const primary = primaryMeteogramDataset(datasets);
+    setMeteogramPhase("loading");
+    setMeteogramMessage("Opening the latest regional and ensemble forecasts…");
+    setMeteogramFields({});
+    setMeteogramEntries(datasets.map((candidate) => ({
+      datasetId: candidate.id,
+      label: candidate.label,
+      phase: "loading",
+      message: "Opening latest run…",
+      removable: false,
+    })));
+
+    const loaded = new Map<string, {
+      info: StoreInfo;
+      selections: AxisSelection;
+      temperature: VariableConfig;
+      series: PointSeries;
+    }>();
+    await Promise.all(datasets.map(async (candidate) => {
+      try {
+        const nextInfo = await loadStoreInfo(candidate.id, "series");
+        controller.signal.throwIfAborted();
+        const temperature = commonVariableMatches(nextInfo.variables).find(
+          (match) => match.key === "t2m",
+        )?.variable;
+        if (!temperature) throw new Error("2 m temperature is unavailable");
+        const nextSelections = defaultSelections(nextInfo, temperature);
+        const series = await loadPointSeries(
+          nextInfo,
+          temperature,
+          nextSelections,
+          point.lng,
+          point.lat,
+          { signal: controller.signal },
+        );
+        if (!series) throw new Error("No compatible point forecast");
+        const displaySeries = trimMeteogramSeries(
+          series,
+          candidate.sources.series?.meteogram?.firstLeadHour,
+        );
+        loaded.set(candidate.id, {
+          info: nextInfo,
+          selections: nextSelections,
+          temperature,
+          series: displaySeries,
+        });
+        if (
+          controller.signal.aborted
+          || generation !== meteogramRequestGenerationRef.current
+        ) return;
+        setMeteogramEntries((current) => current.map((entry) =>
+          entry.datasetId === candidate.id
+            ? {
+              ...entry,
+              phase: "ready",
+              message: displaySeries.kind === "forecast"
+                && displaySeries.memberCount > 1
+                ? `${displaySeries.memberCount} members`
+                : temperature.label,
+              series: displaySeries,
+            }
+            : entry
+        ));
+      } catch (error) {
+        if (
+          controller.signal.aborted
+          || generation !== meteogramRequestGenerationRef.current
+        ) return;
+        setMeteogramEntries((current) => current.map((entry) =>
+          entry.datasetId === candidate.id
+            ? {
+              ...entry,
+              phase: "error",
+              message: error instanceof Error ? error.message : String(error),
+            }
+            : entry
+        ));
+      }
+    }));
+
+    if (
+      controller.signal.aborted
+      || generation !== meteogramRequestGenerationRef.current
+    ) return;
+    if (!loaded.size) {
+      setMeteogramPhase(loaded.size ? "ready" : "error");
+      setMeteogramMessage("No compatible forecast could be loaded for this location.");
+      return;
+    }
+
+    setMeteogramMessage("Loading regional detail and ensemble guidance…");
+    const fieldsByDataset = new Map<string, MeteogramFields>();
+    await Promise.all(datasets.map(async (candidate) => {
+      const candidateLoaded = loaded.get(candidate.id);
+      if (!candidateLoaded) return;
+      const { info: candidateInfo } = candidateLoaded;
+      const common = new Map(
+        commonVariableMatches(candidateInfo.variables).map((match) => [
+          match.key,
+          match.variable,
+        ]),
+      );
+      const derived = new Map(
+        (candidateInfo.derivedVariables ?? []).flatMap((field) =>
+          field.derived
+            ? [[field.derived.key, field] as const]
+            : []
+        ),
+      );
+      const candidateFields: MeteogramFields = {};
+      const firstLeadHour =
+        candidate.sources.series?.meteogram?.firstLeadHour;
+      const loadField = async (
+        key: keyof MeteogramFields,
+        fieldVariable: VariableConfig | undefined,
+      ) => {
+        if (!fieldVariable) return;
+        try {
+          const series = await loadPointSeries(
+            candidateInfo,
+            fieldVariable,
+            defaultSelections(candidateInfo, fieldVariable),
+            point.lng,
+            point.lat,
+            { signal: controller.signal },
+          );
+          if (series) {
+            candidateFields[key] = trimMeteogramSeries(
+              series,
+              firstLeadHour,
+            );
+          }
+        } catch (error) {
+          if (!(error instanceof DOMException && error.name === "AbortError")) {
+            console.debug(
+              `Meteogram ${candidate.id} field ${key} unavailable`,
+              error,
+            );
+          }
+        }
+      };
+      await Promise.all([
+        (async () => {
+          const precipitation = common.get("tp");
+          if (!precipitation) return;
+          try {
+            const result = await loadPointPrecipitationForecast(
+              candidateInfo,
+              precipitation,
+              defaultSelections(candidateInfo, precipitation),
+              point.lng,
+              point.lat,
+              { signal: controller.signal },
+            );
+            if (result) {
+              candidateFields.precipitationRate = trimMeteogramSeries(
+                result.rate,
+                firstLeadHour,
+              );
+              candidateFields.precipitationProbability = trimMeteogramSeries(
+                result.probability,
+                firstLeadHour,
+              );
+            }
+          } catch (error) {
+            if (!(error instanceof DOMException && error.name === "AbortError")) {
+              console.debug(
+                `Meteogram ${candidate.id} precipitation unavailable`,
+                error,
+              );
+            }
+          }
+        })(),
+        loadField("cloudCover", common.get("tcc")),
+        loadField("windSpeed", derived.get("wind_speed_10m")),
+        loadField("windDirection", derived.get("wind_direction_10m")),
+        loadField("heatIndex", derived.get("heat_index")),
+        loadField("windChill", derived.get("wind_chill")),
+      ]);
+      candidateFields.cloudCover = normalizeMeteogramPercentSeries(
+        candidateFields.cloudCover,
+      );
+      candidateFields.precipitationProbability =
+        normalizeMeteogramPercentSeries(
+          candidateFields.precipitationProbability,
+        );
+      fieldsByDataset.set(candidate.id, candidateFields);
+    }));
+    if (
+      controller.signal.aborted
+      || generation !== meteogramRequestGenerationRef.current
+    ) return;
+    const orderedFields = datasets.flatMap((candidate) => {
+      const fields = fieldsByDataset.get(candidate.id);
+      return fields ? [fields] : [];
+    });
+    const ensembleFields = primary
+      ? fieldsByDataset.get(primary.id)
+      : undefined;
+    const bestField = (
+      key: Exclude<keyof MeteogramFields, "windSpeedDistribution">,
+    ) => orderedFields.reduceRight<PointSeries | undefined>(
+      (fallback, fields) => stitchMeteogramSeries(fields[key], fallback),
+      undefined,
+    );
+    const nextFields: MeteogramFields = {
+      precipitationRate: bestField("precipitationRate"),
+      precipitationProbability:
+        ensembleFields?.precipitationProbability
+        ?? bestField("precipitationProbability"),
+      cloudCover: bestField("cloudCover"),
+      windSpeed: bestField("windSpeed"),
+      windSpeedDistribution: ensembleFields?.windSpeed,
+      windDirection: bestField("windDirection"),
+      heatIndex: bestField("heatIndex"),
+      windChill: bestField("windChill"),
+    };
+    setMeteogramFields(nextFields);
+    setMeteogramPhase("ready");
+    setMeteogramMessage(
+      Object.values(nextFields).some(Boolean)
+        ? "Latest forecast guidance loaded."
+        : "Temperature comparison ready; auxiliary fields are unavailable.",
+    );
+  }, []);
+
+  const inspectedLatitude = inspector?.lat;
+  const inspectedLongitude = inspector?.lng;
+  const inspectionTimeZone = useMemo(
+    () => inspectedLatitude === undefined || inspectedLongitude === undefined
+      ? "UTC"
+      : timeZoneAt(inspectedLatitude, inspectedLongitude),
+    [inspectedLatitude, inspectedLongitude],
+  );
+  const forecastInspectorOpen = Boolean(inspector);
+  const meteogramRailOpen = Boolean(
+    inspector && viewMode === "meteogram",
+  );
+  useEffect(() => {
+    if (!mapReady) return;
+    let frame = 0;
+    const updateMapComposition = () => {
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        const map = mapRef.current;
+        if (!map) return;
+        map.resize();
+        const bottom = window.matchMedia("(max-width: 960px)").matches
+          ? MOBILE_MAP_BOTTOM_PADDING
+          : 0;
+        const current = map.getPadding();
+        if (
+          current.top !== 0
+          || current.right !== 0
+          || current.bottom !== bottom
+          || current.left !== 0
+        ) {
+          map.setPadding({ top: 0, right: 0, bottom, left: 0 });
+        }
+      });
+    };
+    updateMapComposition();
+    const observer = typeof ResizeObserver === "undefined"
+      ? null
+      : new ResizeObserver(updateMapComposition);
+    if (mapContainerRef.current) {
+      observer?.observe(mapContainerRef.current);
+    }
+    window.addEventListener("resize", updateMapComposition);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", updateMapComposition);
+      window.cancelAnimationFrame(frame);
+    };
+  }, [mapReady]);
+
+  useEffect(() => {
+    if (
+      viewMode !== "meteogram"
+      || inspectedLatitude === undefined
+      || inspectedLongitude === undefined
+    ) {
+      meteogramRequestControllerRef.current?.abort();
+      if (
+        viewMode === "series"
+        && inspectedLatitude !== undefined
+        && inspectedLongitude !== undefined
+      ) {
+        startSeriesComparisonRef.current({
+          lng: inspectedLongitude,
+          lat: inspectedLatitude,
+        }, { addMapDataset: true });
+      }
+      return;
+    }
+    void loadMeteogram({
+      lng: inspectedLongitude,
+      lat: inspectedLatitude,
+    });
+    return () => meteogramRequestControllerRef.current?.abort();
+  }, [inspectedLatitude, inspectedLongitude, loadMeteogram, viewMode]);
+
   useEffect(() => {
     const selected = new Set(seriesEntries.map((entry) => entry.datasetId));
     if (
@@ -945,7 +1405,7 @@ export function ZarrViewer() {
         throw new Error(`Basemap style request failed (${styleResponse.status})`);
       }
       const initialStyle = await styleResponse.json() as Record<string, unknown>;
-      initialStyle.projection = { type: "globe" };
+      initialStyle.projection = { type: projectionRef.current };
       if (disposed || !mapContainerRef.current) return;
       const map = new maplibregl.Map({
         container: mapContainerRef.current,
@@ -953,23 +1413,56 @@ export function ZarrViewer() {
           import("maplibre-gl").MapOptions["style"],
           string | null | undefined
         >,
-        center: DEFAULT_CENTER,
-        zoom: DEFAULT_ZOOM,
+        center: (
+          initialLocation.centerLatitude !== undefined
+          && initialLocation.centerLongitude !== undefined
+        )
+          ? [
+            initialLocation.centerLongitude,
+            initialLocation.centerLatitude,
+          ]
+          : DEFAULT_CENTER,
+        zoom: initialLocation.zoom ?? (
+          window.matchMedia("(max-width: 960px)").matches
+            ? MOBILE_DEFAULT_ZOOM
+            : DEFAULT_ZOOM
+        ),
         minZoom: 0.25,
         maxZoom: 8,
         attributionControl: false,
       });
+      if (window.matchMedia("(max-width: 960px)").matches) {
+        map.setPadding({
+          top: 0,
+          right: 0,
+          bottom: MOBILE_MAP_BOTTOM_PADDING,
+          left: 0,
+        });
+      }
       mapRef.current = map;
       map.addControl(
         new maplibregl.NavigationControl({ showCompass: true, visualizePitch: true }),
         "bottom-right",
       );
-      map.addControl(new maplibregl.AttributionControl({ compact: true }), "bottom-left");
+      map.addControl(new maplibregl.AttributionControl({
+        compact: true,
+        customAttribution: VIEWER_DATA_ATTRIBUTION,
+      }), "bottom-left");
+      const attributionElement = map.getContainer().querySelector(
+        ".maplibregl-ctrl-attrib",
+      );
+      attributionElement?.classList.remove("maplibregl-compact-show");
+      if (attributionElement instanceof HTMLDetailsElement) {
+        attributionElement.open = false;
+      }
       inspectLocationRef.current = (point, station) => {
         if (!station) {
           asosStationRef.current = null;
           setAsosStation(null);
           setAsosWindow(null);
+        } else {
+          asosStationRef.current = station;
+          setAsosStation(station);
         }
         inspectionPointRef.current = point;
         setInspector({ ...point, value: null });
@@ -981,7 +1474,9 @@ export function ZarrViewer() {
           .setLngLat([point.lng, point.lat])
           .addTo(map);
         void refreshInspection(point);
-        startSeriesComparisonRef.current(point);
+        if (viewModeRef.current === "series") {
+          startSeriesComparisonRef.current(point);
+        }
         if (station) startAsosComparisonRef.current(station);
       };
 
@@ -1049,7 +1544,12 @@ export function ZarrViewer() {
       mapRef.current = null;
       layerRef.current = null;
     };
-  }, [refreshInspection]);
+  }, [
+    initialLocation.centerLatitude,
+    initialLocation.centerLongitude,
+    initialLocation.zoom,
+    refreshInspection,
+  ]);
 
   useEffect(() => {
     if (stationsVisible) stationSearchInputRef.current?.focus();
@@ -1162,6 +1662,15 @@ export function ZarrViewer() {
     if (!mapReady) return;
     let cancelled = false;
     const installDataset = async () => {
+      const useDatasetDefaults = useDatasetDefaultsRef.current;
+      const startAtFirstLead = useDatasetDefaults || Boolean(
+        initialLocation.station
+        && dataset.sources.map?.meteogram?.kind === "regional",
+      );
+      const previousVariable = useDatasetDefaults
+        ? null
+        : variableRef.current;
+      useDatasetDefaultsRef.current = false;
       weatherNextStoreGenerationRef.current += 1;
       setPlayingAxis(null);
       resetPlaybackPrefetchRef.current();
@@ -1181,30 +1690,124 @@ export function ZarrViewer() {
         });
         return;
       }
+      if (ecmwfAuthRequired && !hasCdsApiKey()) {
+        const map = mapRef.current;
+        if (map?.getLayer(ZARR_LAYER_ID)) map.removeLayer(ZARR_LAYER_ID);
+        layerRef.current = null;
+        setLoadState({
+          phase: "ready",
+          message: "ECMWF CDS API key required",
+        });
+        return;
+      }
+      const initialTargetDate = !urlSelectionsAppliedRef.current
+        ? Object.values(initialLocation.axisValues)
+          .map((value) => new Date(value))
+          .find((date) => Number.isFinite(date.getTime()))
+        : undefined;
       const nextInfo = await loadStoreInfo(
         datasetId,
         "map",
-        rememberedValidDateRef.current,
+        rememberedValidDateRef.current ?? initialTargetDate,
       );
       if (cancelled) return;
-      const nextVariable = nextInfo.variables.find(
-        (candidate) => candidate.id === nextInfo.dataset.defaultVariable,
-      ) ?? nextInfo.variables[0];
+      const urlRequestedVariable = !urlSelectionsAppliedRef.current
+        && initialLocation.variableId
+        ? availableVariables(nextInfo).find(
+          (candidate) => candidate.id === initialLocation.variableId,
+        )
+        : undefined;
+      const preservedVariable = previousVariable
+        ? matchingVariable(nextInfo, previousVariable)
+        : undefined;
+      const nextVariable = urlRequestedVariable
+        ?? preservedVariable
+        ?? nextInfo.variables.find(
+          (candidate) => candidate.id === nextInfo.dataset.defaultVariable,
+        )
+        ?? nextInfo.variables[0];
       const requestedValidDate = rememberedValidDateRef.current;
       const availableRange = validDateRange(nextInfo, nextVariable);
-      const nextSelections = requestedValidDate
+      let nextSelections = requestedValidDate
         ? selectionsForValidDate(
           nextInfo,
           nextVariable,
           requestedValidDate,
         )
         : defaultSelections(nextInfo, nextVariable);
-      const nextColormap = defaultColormap(nextVariable);
+      const hasRequestedLead = nextVariable.dimensions.some((dimension) =>
+        nextInfo.axes[dimension]?.kind === "timedelta"
+        && initialLocation.axisValues[dimension] !== undefined
+      );
+      if (startAtFirstLead && !hasRequestedLead) {
+        nextSelections = meteogramStartSelections(
+          nextInfo,
+          nextVariable,
+          nextSelections,
+        );
+      }
+      if (!urlSelectionsAppliedRef.current) {
+        const dimensions = new Set([
+          ...nextVariable.dimensions,
+          ...Object.values(nextInfo.axes)
+            .filter((axis) => axis.requiresStoreReload)
+            .map((axis) => axis.id),
+        ]);
+        nextSelections = { ...nextSelections };
+        for (const dimension of dimensions) {
+          if (isSpatialDimension(dimension, nextInfo.source)) continue;
+          const requested = initialLocation.axisValues[dimension];
+          const axis = nextInfo.axes[dimension];
+          if (!axis || requested === undefined) continue;
+          if (axis.kind === "time") {
+            const date = new Date(requested);
+            if (Number.isFinite(date.getTime())) {
+              nextSelections[dimension] = axisIndexForDate(
+                nextInfo.dataset,
+                axis,
+                date,
+              );
+            }
+            continue;
+          }
+          const exact = axis.values.findIndex(
+            (value) => String(value) === requested,
+          );
+          if (exact >= 0) {
+            nextSelections[dimension] = exact;
+            continue;
+          }
+          const numeric = Number(requested);
+          if (Number.isFinite(numeric)) {
+            nextSelections[dimension] = axis.values.reduce<number>(
+              (nearest, value, index) =>
+                Math.abs(Number(value) - numeric)
+                  < Math.abs(Number(axis.values[nearest]) - numeric)
+                  ? index
+                  : nearest,
+              0,
+            );
+          }
+        }
+        urlSelectionsAppliedRef.current = true;
+      }
+      const urlColormap = !urlDisplayAppliedRef.current
+        ? COLORMAPS.find(
+          (candidate) => candidate.id === initialLocation.colormapId,
+        )
+        : undefined;
+      const nextColormap = urlColormap ?? defaultColormap(nextVariable);
       const rangeKey = displayRangeKey(nextInfo.dataset.id, nextVariable.id);
       const cachedDisplayRange = displayRangesRef.current.get(rangeKey);
-      const nextDisplayRange = cachedDisplayRange
+      const urlDisplayRange = !urlDisplayAppliedRef.current
+        ? initialLocation.displayRange
+        : undefined;
+      const nextDisplayRange = urlDisplayRange
+        ? [...urlDisplayRange] as [number, number]
+        : cachedDisplayRange
         ? [...cachedDisplayRange] as [number, number]
         : initialDisplayRange(nextVariable);
+      urlDisplayAppliedRef.current = true;
       const map = mapRef.current;
       if (!map) return;
       if (
@@ -1236,7 +1839,7 @@ export function ZarrViewer() {
       if (map.getLayer(ZARR_LAYER_ID)) map.removeLayer(ZARR_LAYER_ID);
       layerRef.current = null;
       const { ZarrLayer } = await import("@carbonplan/zarr-layer");
-      const nextLayerOptions = await derivedLayerOptions(
+      const nextLayerOptions = await variableLayerOptions(
         nextInfo,
         nextVariable,
       );
@@ -1249,6 +1852,7 @@ export function ZarrViewer() {
         clim: nextDisplayRange,
         opacity: opacityRef.current,
         ...nextLayerOptions,
+        ...variableRenderingOptions(nextVariable),
         onLoadingStateChange: (loading) => {
           if (loading.error) setLoadState(errorState(loading.error));
           else if (loading.loading) setLoadState(loadingState());
@@ -1272,7 +1876,7 @@ export function ZarrViewer() {
       setSelections(nextSelections);
       setColormapId(nextColormap.id);
       setActiveDisplayRange(nextDisplayRange);
-      needsRangeEstimateRef.current = !cachedDisplayRange;
+      needsRangeEstimateRef.current = !cachedDisplayRange && !urlDisplayRange;
       const firstSymbol = map.getStyle().layers?.find(
         (candidate) => candidate.type === "symbol",
       )?.id;
@@ -1285,9 +1889,11 @@ export function ZarrViewer() {
       );
       const point = inspectionPointRef.current;
       if (point) {
-        startSeriesComparisonRef.current(point, {
-          addMapDataset: true,
-        });
+        if (viewModeRef.current === "series") {
+          startSeriesComparisonRef.current(point, {
+            addMapDataset: true,
+          });
+        }
         const station = asosStationRef.current;
         if (station) startAsosComparisonRef.current(station);
       }
@@ -1312,20 +1918,34 @@ export function ZarrViewer() {
     };
   }, [
     datasetId,
+    dataset.sources.map?.meteogram?.kind,
+    ecmwfAuthRequired,
+    ecmwfConnected,
     googleAuthRequired,
     googleConnected,
+    initialLocation.axisValues,
+    initialLocation.colormapId,
+    initialLocation.displayRange,
+    initialLocation.station,
+    initialLocation.variableId,
     mapInstallRevision,
     mapReady,
   ]);
 
   useEffect(() => {
     if (!firstDatasetFrameReady || !info) return;
-    const includeAuthenticated = googleConnected;
-    const startedRef = includeAuthenticated
-      ? authenticatedDatasetPreloadStartedRef
-      : publicDatasetPreloadStartedRef;
-    if (startedRef.current) return;
-    startedRef.current = true;
+    const availableAuth = [
+      ...(googleConnected ? ["google" as const] : []),
+      ...(ecmwfConnected ? ["cds-api-key" as const] : []),
+    ];
+    const authKey = availableAuth.join(",") || "public";
+    if (authKey === "public") {
+      if (publicDatasetPreloadStartedRef.current) return;
+      publicDatasetPreloadStartedRef.current = true;
+    } else {
+      if (datasetPreloadAuthKeysRef.current.has(authKey)) return;
+      datasetPreloadAuthKeysRef.current.add(authKey);
+    }
 
     const initializationAxis = Object.values(info.axes).find(
       (axis) => axis.kind === "time" && axis.requiresStoreReload,
@@ -1343,7 +1963,7 @@ export function ZarrViewer() {
       activeDatasetId: info.dataset.id,
       targetDate: rememberedValidDateRef.current,
       activeDatasetTargetDate,
-      includeAuthenticated,
+      availableAuth,
     });
     void runDatasetPreloads(
       requests,
@@ -1367,6 +1987,7 @@ export function ZarrViewer() {
     });
   }, [
     firstDatasetFrameReady,
+    ecmwfConnected,
     googleConnected,
     info,
     selections,
@@ -1521,12 +2142,16 @@ export function ZarrViewer() {
     setColormapId(nextColormap.id);
     setLoadState(loadingState());
     try {
-      if (variable.derived || nextVariable.derived) {
+      if (
+        variable.derived
+        || nextVariable.derived
+        || variableFragmentShader(variable) !== variableFragmentShader(nextVariable)
+      ) {
         const map = mapRef.current;
         if (!map) return;
         const generation = ++requestGeneration.current;
         const { ZarrLayer } = await import("@carbonplan/zarr-layer");
-        const nextLayerOptions = await derivedLayerOptions(info, nextVariable);
+        const nextLayerOptions = await variableLayerOptions(info, nextVariable);
         if (generation !== requestGeneration.current) return;
         const nextLayer = new ZarrLayer({
           id: ZARR_LAYER_ID,
@@ -1536,6 +2161,7 @@ export function ZarrViewer() {
           clim: nextDisplayRange,
           opacity: opacityRef.current,
           ...nextLayerOptions,
+          ...variableRenderingOptions(nextVariable),
           onLoadingStateChange: (loading) => {
             if (generation !== requestGeneration.current) return;
             if (loading.error) setLoadState(errorState(loading.error));
@@ -1618,7 +2244,7 @@ export function ZarrViewer() {
       const map = mapRef.current;
       if (!map) return;
       const { ZarrLayer } = await import("@carbonplan/zarr-layer");
-      const nextLayerOptions = await derivedLayerOptions(
+      const nextLayerOptions = await variableLayerOptions(
         nextInfo,
         nextVariable,
       );
@@ -1631,6 +2257,7 @@ export function ZarrViewer() {
         clim: activeDisplayRange,
         opacity: opacityRef.current,
         ...nextLayerOptions,
+        ...variableRenderingOptions(nextVariable),
         onLoadingStateChange: (loading) => {
           if (generation !== weatherNextStoreGenerationRef.current) return;
           if (loading.error) setLoadState(errorState(loading.error));
@@ -1773,6 +2400,21 @@ export function ZarrViewer() {
     }
   };
 
+  const submitCdsApiKey = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    try {
+      setCdsApiKey(cdsKeyDraft);
+      setCdsKeyDraft("");
+    } catch {
+      // The auth control remains visible so the key can be corrected.
+    }
+  };
+
+  const forgetCdsApiKey = () => {
+    disconnectEcmwf();
+    setCdsKeyDraft("");
+  };
+
   const togglePlayback = (axis: AxisConfig) => {
     if (playingAxis === axis.id) {
       setPlayingAxis(null);
@@ -1791,22 +2433,158 @@ export function ZarrViewer() {
     layerRef.current?.setOpacity(clamped);
   };
 
-  const chooseStation = (station: AsosStation) => {
+  const chooseStation = useCallback((
+    station: AsosStation,
+    preserveMapCamera = false,
+  ) => {
     const map = mapRef.current;
     if (!map) return;
     const point = { lng: station.longitude, lat: station.latitude };
     setStationSearchQuery("");
     setStationSearchIndex(-1);
-    map.flyTo({
-      center: [station.longitude, station.latitude],
-      zoom: Math.max(map.getZoom(), 5),
-      duration: 700,
-    });
+    if (!preserveMapCamera) {
+      map.flyTo({
+        center: [station.longitude, station.latitude],
+        zoom: Math.max(map.getZoom(), 5),
+        duration: 700,
+      });
+    }
     inspectLocationRef.current(point, station);
+    if (pendingMobileForecastStationRef.current) {
+      pendingMobileForecastStationRef.current = false;
+      setViewMode("series");
+      setMobileControlsCollapsed(true);
+      window.history.pushState(null, "", window.location.href);
+      setMobileScreen("forecast");
+    }
+  }, []);
+
+  useEffect(() => {
+    if (deepLinkAppliedRef.current || !mapReady) return;
+    if (initialLocation.station) {
+      if (stationsPhase !== "ready") return;
+      const requested = initialLocation.station.toUpperCase();
+      const station = stations.find((candidate) => {
+        const code = candidate.station.toUpperCase();
+        return code === requested
+          || code.replace(/^K(?=[A-Z]{3}$)/, "") === requested;
+      });
+      deepLinkAppliedRef.current = true;
+      if (station) {
+        const preferredDataset = hasExplicitDataset
+          ? undefined
+          : preferredRegionalMeteogramDataset(
+            MAP_DATASETS,
+            station.longitude,
+            station.latitude,
+          );
+        if (preferredDataset) {
+          useDatasetDefaultsRef.current = true;
+          setDatasetId(preferredDataset.id);
+        }
+        chooseStation(
+          station,
+          initialLocation.centerLatitude !== undefined
+            && initialLocation.centerLongitude !== undefined,
+        );
+      }
+      return;
+    }
+    if (
+      initialLocation.latitude !== undefined
+      && initialLocation.longitude !== undefined
+    ) {
+      deepLinkAppliedRef.current = true;
+      const point = {
+        lat: Math.max(-90, Math.min(90, initialLocation.latitude)),
+        lng: ((initialLocation.longitude + 540) % 360) - 180,
+      };
+      if (
+        initialLocation.centerLatitude === undefined
+        || initialLocation.centerLongitude === undefined
+      ) {
+        mapRef.current?.jumpTo({
+          center: [point.lng, point.lat],
+          zoom: Math.max(mapRef.current.getZoom(), 5),
+        });
+      }
+      inspectLocationRef.current(point, null);
+      return;
+    }
+    deepLinkAppliedRef.current = true;
+  }, [
+    initialLocation,
+    mapReady,
+    stations,
+    stationsPhase,
+    chooseStation,
+    hasExplicitDataset,
+  ]);
+
+  const copyShareUrl = async () => {
+    const map = mapRef.current;
+    if (!info || !variable || !map) return;
+    const center = map.getCenter();
+    const station = asosStation?.station
+      ?? (!deepLinkAppliedRef.current ? initialLocation.station : undefined);
+    const dimensions = new Set([
+      ...variable.dimensions,
+      ...Object.values(info.axes)
+        .filter((axis) => axis.requiresStoreReload)
+        .map((axis) => axis.id),
+    ]);
+    const axisValues = Object.fromEntries(
+      Array.from(dimensions).flatMap((dimension) => {
+        if (isSpatialDimension(dimension, info.source)) return [];
+        const axis = info.axes[dimension];
+        const index = selections[dimension];
+        if (!axis || index === undefined) return [];
+        if (axis.kind === "time") {
+          const date = axisValueAsDate(info.dataset, axis, index);
+          return Number.isFinite(date.getTime())
+            ? [[dimension, date.toISOString()]]
+            : [];
+        }
+        const value = axis.values[index];
+        return value === undefined ? [] : [[dimension, String(value)]];
+      }),
+    );
+    const url = viewerShareUrl(window.location.href, {
+      datasetId,
+      mode: viewMode,
+      screen: mobileScreen,
+      station,
+      latitude: station ? undefined : inspector?.lat,
+      longitude: station ? undefined : inspector?.lng,
+      centerLatitude: center.lat,
+      centerLongitude: center.lng,
+      zoom: map.getZoom(),
+      variableId: variable.id,
+      axisValues,
+      colormapId,
+      opacity,
+      displayUnit: selectedUnit?.id,
+      displayRange: activeDisplayRange,
+      projection,
+    });
+    try {
+      await copyTextToClipboard(url);
+      setShareStatus("copied");
+    } catch {
+      setShareStatus("error");
+    }
+    if (shareStatusTimerRef.current !== null) {
+      window.clearTimeout(shareStatusTimerRef.current);
+    }
+    shareStatusTimerRef.current = window.setTimeout(() => {
+      setShareStatus("idle");
+      shareStatusTimerRef.current = null;
+    }, 2_000);
   };
 
   const changeDisplayUnit = (next: string) => {
     if (!currentUnitKind) return;
+    setUrlDisplayUnit(next);
     setUnitPreferences((current) => ({
       ...current,
       [currentUnitKind]: next,
@@ -1838,7 +2616,12 @@ export function ZarrViewer() {
       updated[editingLimit === "min" ? 0 : 1] = next;
       if (updated[0] < updated[1]) {
         const rawUpdated = roundRangeToSignificant(selectedUnit
-          ? convertUnitRange(updated, selectedUnit.id, variable.unit)
+          ? convertUnitRange(
+            updated,
+            selectedUnit.id,
+            variable.unit,
+            variableUnitContext,
+          )
           : updated);
         if (info && variable) {
           displayRangesRef.current.set(
@@ -1865,8 +2648,15 @@ export function ZarrViewer() {
     setAsosWindow(null);
     seriesRequestGeneration.current += 1;
     seriesRequestControllerRef.current?.abort();
+    meteogramRequestGenerationRef.current += 1;
+    meteogramRequestControllerRef.current?.abort();
     seriesDatasetIdsRef.current = [];
     setSeriesEntries([]);
+    setMeteogramEntries([]);
+    setMeteogramFields({});
+    setMeteogramPhase("idle");
+    setMeteogramMessage("Select a station or point to load an hourly forecast.");
+    setMobileScreen("map");
   };
 
   const addComparisonDataset = () => {
@@ -1901,7 +2691,12 @@ export function ZarrViewer() {
   };
 
   const [legendMin, legendMax] = variable && selectedUnit
-    ? convertUnitRange(activeDisplayRange, variable.unit, selectedUnit.id)
+    ? convertUnitRange(
+      activeDisplayRange,
+      variable.unit,
+      selectedUnit.id,
+      variableUnitContext,
+    )
     : activeDisplayRange;
   const legendMid = (legendMin + legendMax) / 2;
   const legendDecimals = decimalsForRange([legendMin, legendMax]);
@@ -1912,17 +2707,35 @@ export function ZarrViewer() {
     && variable
     && selectedUnit
   )
-    ? convertUnitValue(inspector.value, variable.unit, selectedUnit.id)
+    ? convertUnitValue(
+      inspector.value,
+      variable.unit,
+      selectedUnit.id,
+      variableUnitContext,
+    )
     : inspector?.value;
+  const formattedInspectorDisplayValue =
+    typeof inspectorDisplayValue === "number"
+      ? formatRangeValue(inspectorDisplayValue, [legendMin, legendMax])
+      : "—";
   const currentAsos = asosAtTime(asosWindow, selectedMapValidDate);
   const commonVariables = commonVariableMatches(info?.variables ?? []);
+  const smokeVariables = hrrrSmokeVariables(
+    info?.dataset.id,
+    info?.variables ?? [],
+  );
   const derivedVariables = info?.derivedVariables ?? [];
   const asosDisplayValue = (
     currentAsos.value !== null
     && asosWindow?.unit
     && selectedUnit
   )
-    ? convertUnitValue(currentAsos.value, asosWindow.unit, selectedUnit.id)
+    ? convertUnitValue(
+      currentAsos.value,
+      asosWindow.unit,
+      selectedUnit.id,
+      variableUnitContext,
+    )
     : currentAsos.value;
   const gridStationBias = (
     typeof inspectorDisplayValue === "number"
@@ -1931,16 +2744,62 @@ export function ZarrViewer() {
     ? inspectorDisplayValue - asosDisplayValue
     : null;
   const asosDisplayUnit = selectedUnit?.label ?? asosWindow?.unit ?? "";
-
+  const inspectionLocationLabel = inspector
+    ? asosStation
+      ? `${asosStation.station} · ${asosStation.name}`
+      : `${shortCoordinate(inspector.lat, "N", "S")} · ${
+        shortCoordinate(inspector.lng, "E", "W")
+      }`
+    : "";
+  const mobileMapAxis = backgroundPrefetchAxis;
+  const mobileMapAxisSelected = mobileMapAxis
+    ? selections[mobileMapAxis.id] ?? 0
+    : 0;
+  const mobileMapValueLabel = (
+    typeof inspectorDisplayValue === "number"
+  )
+    ? `${formattedInspectorDisplayValue} ${displayUnitLabel}`
+    : inspector
+      ? "—"
+      : "";
+  const changeMobileScreen = (next: "map" | "forecast") => {
+    if (next === mobileScreen) return;
+    window.history.pushState(null, "", window.location.href);
+    setMobileScreen(next);
+  };
+  const showMobileMap = () => {
+    pendingMobileForecastStationRef.current = false;
+    changeMobileScreen("map");
+    setMobileControlsCollapsed(true);
+  };
+  const showMobileForecast = () => {
+    if (!inspector) {
+      pendingMobileForecastStationRef.current = true;
+      changeMobileScreen("map");
+      setMobileControlsCollapsed(true);
+      setStationsVisible(true);
+      window.requestAnimationFrame(() => {
+        stationSearchInputRef.current?.focus();
+      });
+      return;
+    }
+    setViewMode("series");
+    changeMobileScreen("forecast");
+    setMobileControlsCollapsed(true);
+  };
   return (
-    <main className="viewer-shell">
+    <main
+      className={[
+        "viewer-shell",
+        forecastInspectorOpen ? "inspector-open" : "",
+        meteogramRailOpen ? "meteogram-open" : "",
+        `mobile-screen-${mobileScreen}`,
+        mobileControlsCollapsed ? "mobile-layers-closed" : "mobile-layers-open",
+      ].filter(Boolean).join(" ")}
+    >
       <div ref={mapContainerRef} className="map" aria-label="Interactive Zarr globe" />
 
       <div className="map-toolbar">
-        <div className="projection-switch" aria-label="Map projection">
-          <button className={projection === "globe" ? "active" : ""} onClick={() => changeProjection("globe")} type="button">Globe</button>
-          <button className={projection === "mercator" ? "active" : ""} onClick={() => changeProjection("mercator")} type="button">Map</button>
-        </div>
         <button
           className={`station-toggle ${stationsVisible ? "active" : ""} ${stationsPhase}`}
           type="button"
@@ -2044,9 +2903,31 @@ export function ZarrViewer() {
             ) : null}
           </div>
         ) : null}
-        <button className="reset-button" onClick={() => mapRef.current?.flyTo({ center: DEFAULT_CENTER, zoom: DEFAULT_ZOOM, pitch: 0, bearing: 0, duration: 900 })} type="button">Reset</button>
+        <ViewerOptions
+          className="toolbar-viewer-options"
+          projection={projection}
+          shareStatus={shareStatus}
+          shareDisabled={!info || !variable}
+          onProjectionChange={changeProjection}
+          onResetView={() => mapRef.current?.flyTo({
+            center: DEFAULT_CENTER,
+            zoom: DEFAULT_ZOOM,
+            pitch: 0,
+            bearing: 0,
+            duration: 900,
+          })}
+          onShare={() => void copyShareUrl()}
+        />
       </div>
 
+      <div
+        ref={forecastWorkbenchRef}
+        className={`forecast-workbench ${
+          forecastInspectorOpen ? "with-inspector " : ""
+        }${
+          meteogramRailOpen ? "with-meteogram" : ""
+        }`}
+      >
       <section
         className={`control-panel ${mobileControlsCollapsed ? "mobile-compact" : ""}`}
         aria-label="Viewer controls"
@@ -2057,84 +2938,28 @@ export function ZarrViewer() {
           aria-expanded={!mobileControlsCollapsed}
           aria-label={mobileControlsCollapsed
             ? "Show full viewer controls"
-            : "Minimize viewer controls"}
+            : "Close layer controls"}
           title={mobileControlsCollapsed
             ? "Show full controls"
-            : "Minimize controls"}
+            : "Close layer controls"}
           onClick={() => setMobileControlsCollapsed((current) => !current)}
         >
-          {mobileControlsCollapsed ? "Full" : "Hide"}
+          {mobileControlsCollapsed ? "Layers" : "Done"}
         </button>
-        <div className="mobile-time-controls" aria-label="Compact time controls">
-          {compactPlaybackAxes.length ? compactPlaybackAxes.map((axis) => {
-            const selected = selections[axis.id] ?? 0;
-            return (
-              <div className="mobile-axis-control" key={axis.id}>
-                <div className="mobile-axis-heading">
-                  <span>{axis.label}</span>
-                  <strong>{formatAxisValue(dataset, axis, selected)}</strong>
-                </div>
-                <div className="mobile-axis-inputs">
-                  <button
-                    type="button"
-                    disabled={selected <= 0}
-                    onClick={() => changeAxis(axis, selected - 1)}
-                    aria-label={`Previous ${axis.label}`}
-                  >
-                    ←
-                  </button>
-                  <input
-                    aria-label={`Compact ${axis.label}`}
-                    type="range"
-                    min="0"
-                    max={Math.max(0, axis.values.length - 1)}
-                    step="1"
-                    value={selected}
-                    onChange={(event) => changeAxis(axis, Number(event.target.value))}
-                  />
-                  <button
-                    type="button"
-                    disabled={selected >= axis.values.length - 1}
-                    onClick={() => changeAxis(axis, selected + 1)}
-                    aria-label={`Next ${axis.label}`}
-                  >
-                    →
-                  </button>
-                  <button
-                    className="play-button"
-                    type="button"
-                    disabled={selected >= axis.values.length - 1}
-                    onClick={() => togglePlayback(axis)}
-                    aria-label={playingAxis === axis.id
-                      ? `Pause ${axis.label}`
-                      : `Play ${axis.label}`}
-                  >
-                    {playingAxis === axis.id ? "Ⅱ" : "▶"}
-                  </button>
-                </div>
-              </div>
-            );
-          }) : (
-            <span className="mobile-axis-empty">No time coordinate for this variable</span>
-          )}
-          {forecastValidDate ? (
-            <div className="forecast-valid-time compact">
-              <span>Valid time</span>
-              <time dateTime={forecastValidDate.toISOString()}>
-                {formatUtcTime(forecastValidDate)}
-              </time>
-            </div>
-          ) : null}
-        </div>
-        <div className={`status-indicator ${loadState.phase}`} role="status" title={loadState.message}>
-          <span className="status-spinner" aria-hidden="true" />
-          <span className="sr-only">{loadState.message}</span>
-        </div>
-
         <div className="field-grid">
-          <label className="field">
+          <label className="field selector-field dataset-field">
             <span className="dataset-heading">
-              <span>Dataset</span>
+              <span className="dataset-title">
+                <span>Dataset</span>
+                <span
+                  className={`status-indicator ${loadState.phase}`}
+                  role="status"
+                  title={loadState.message}
+                >
+                  <span className="status-spinner" aria-hidden="true" />
+                  <span className="sr-only">{loadState.message}</span>
+                </span>
+              </span>
               <small className="dataset-chunking">
                 {datasetChunkingLabel(dataset)}
               </small>
@@ -2181,9 +3006,48 @@ export function ZarrViewer() {
                 ) : null}
               </div>
             ) : null}
+            {ecmwfAuthRequired ? (
+              <form
+                className={`cds-auth-control ${ecmwfAuth.phase}`}
+                onSubmit={submitCdsApiKey}
+              >
+                {ecmwfConnected ? (
+                  <button
+                    type="button"
+                    onClick={forgetCdsApiKey}
+                    title="Forget the CDS API key saved in this browser"
+                  >
+                    <i aria-hidden="true" />
+                    CDS API key configured
+                  </button>
+                ) : (
+                  <div>
+                    <input
+                      type="password"
+                      value={cdsKeyDraft}
+                      autoComplete="off"
+                      spellCheck={false}
+                      placeholder="CDS API key"
+                      aria-label="ECMWF CDS API key"
+                      onChange={(event) => setCdsKeyDraft(event.target.value)}
+                    />
+                    <button type="submit" disabled={!cdsKeyDraft.trim()}>
+                      Connect
+                    </button>
+                  </div>
+                )}
+                <small>
+                  {ecmwfAuth.phase === "error"
+                    ? ecmwfAuth.message
+                    : ecmwfConnected
+                      ? "Saved only in this browser. Click to forget."
+                      : "Available from your Copernicus CDS profile."}
+                </small>
+              </form>
+            ) : null}
           </label>
 
-          <div className="field">
+          <div className="field selector-field variable-field">
             <label className="field-heading" htmlFor="variable-select">
               Variable
             </label>
@@ -2204,6 +3068,19 @@ export function ZarrViewer() {
                       title={candidate.label || candidate.id}
                     >
                       {key === candidate.id ? candidate.id : `${key} · ${candidate.id}`}
+                    </option>
+                  ))}
+                </optgroup>
+              ) : null}
+              {smokeVariables.length ? (
+                <optgroup label="Smoke variables (HRRR)">
+                  {smokeVariables.map((candidate) => (
+                    <option
+                      key={`smoke-${candidate.id}`}
+                      value={candidate.id}
+                      title={candidate.label || candidate.id}
+                    >
+                      {candidate.id}
                     </option>
                   ))}
                 </optgroup>
@@ -2246,9 +3123,16 @@ export function ZarrViewer() {
               axis.kind === "time" || axis.kind === "timedelta"
             ) && !axis.requiresStoreReload && !unavailableMapDate;
             return (
-              <div className="axis-control" key={axis.id}>
+              <div
+                className={`axis-control ${
+                  axis.kind === "time" ? "with-calendar" : ""
+                }`}
+                key={axis.id}
+              >
                 <div className="axis-heading">
-                  <span>{axis.label}</span>
+                  <span>
+                    {axis.requiresStoreReload ? "Initialization" : axis.label}
+                  </span>
                   <strong>
                     {showsUnavailableAnalysisDate && unavailableMapDate
                       ? formatUtcTime(unavailableMapDate)
@@ -2319,6 +3203,7 @@ export function ZarrViewer() {
                 <select
                   className="unit-select"
                   aria-label="Display unit"
+                  title="Display units"
                   value={selectedUnit.id}
                   onChange={(event) => changeDisplayUnit(event.target.value)}
                 >
@@ -2373,16 +3258,16 @@ export function ZarrViewer() {
                 if (event.key === "Escape") setEditingLimit(null);
               }} />
             ) : (
-              <button className="legend-limit" type="button" onClick={() => beginLimitEdit("min")}>{legendMin.toFixed(legendDecimals)} {displayUnitLabel}</button>
+              <button className="legend-limit" type="button" onClick={() => beginLimitEdit("min")}>{formatRangeValue(legendMin, [legendMin, legendMax])} {displayUnitLabel}</button>
             )}
-            <span>{legendMid.toFixed(legendDecimals)}</span>
+            <span>{formatRangeValue(legendMid, [legendMin, legendMax])}</span>
             {editingLimit === "max" ? (
               <input className="legend-limit-input" aria-label="Maximum color limit" autoFocus type="number" step="any" value={limitDraft} onChange={(event) => setLimitDraft(event.target.value)} onBlur={commitLimitEdit} onKeyDown={(event) => {
                 if (event.key === "Enter") event.currentTarget.blur();
                 if (event.key === "Escape") setEditingLimit(null);
               }} />
             ) : (
-              <button className="legend-limit" type="button" onClick={() => beginLimitEdit("max")}>{legendMax.toFixed(legendDecimals)} {displayUnitLabel}</button>
+              <button className="legend-limit" type="button" onClick={() => beginLimitEdit("max")}>{formatRangeValue(legendMax, [legendMin, legendMax])} {displayUnitLabel}</button>
             )}
           </div>
         </div>
@@ -2391,12 +3276,67 @@ export function ZarrViewer() {
       </section>
 
       {inspector && info && variable ? (
-        <aside className="inspector" data-testid="inspector" aria-live="polite">
+        <aside
+          className={`inspector ${viewMode === "meteogram" ? "meteogram-view" : ""}`}
+          data-testid="inspector"
+          aria-live="polite"
+        >
           <button className="inspector-close" type="button" onClick={clearInspection} aria-label="Close inspection">×</button>
-          <strong>{inspectorDisplayValue === null || inspectorDisplayValue === undefined ? "—" : inspectorDisplayValue.toFixed(legendDecimals)} <small>{displayUnitLabel}</small></strong>
-          <span>{shortCoordinate(inspector.lat, "N", "S")} · {shortCoordinate(inspector.lng, "E", "W")}</span>
-          <span>{variable.label}</span>
-          <span className="inspector-axes">{axisSummary(info, variable, selections)}</span>
+          <div className="inspector-mode" aria-label="Point forecast view">
+            <button
+              className={viewMode === "series" ? "active" : ""}
+              type="button"
+              aria-pressed={viewMode === "series"}
+              onClick={() => {
+                setViewMode("series");
+                setMobileScreen("forecast");
+              }}
+            >
+              Time series
+            </button>
+            <button
+              className={viewMode === "meteogram" ? "active" : ""}
+              type="button"
+              aria-pressed={viewMode === "meteogram"}
+              onClick={() => {
+                setViewMode("meteogram");
+                setMobileScreen("forecast");
+              }}
+            >
+              Meteogram
+            </button>
+          </div>
+          {viewMode === "meteogram" ? (
+            <Meteogram
+              entries={meteogramEntries}
+              fields={meteogramFields}
+              phase={meteogramPhase}
+              message={meteogramMessage}
+              locationLabel={inspectionLocationLabel}
+              cursorDate={selectedMapValidDate}
+              temperatureUnit={meteogramTemperatureUnit}
+              precipitationUnit={meteogramPrecipitationUnit}
+              timeZone={inspectionTimeZone}
+            />
+          ) : (
+            <>
+          <div className="series-point-summary">
+            <strong>
+              {formattedInspectorDisplayValue}
+              {" "}
+              <small>{displayUnitLabel}</small>
+            </strong>
+            <span>
+              {shortCoordinate(inspector.lat, "N", "S")} ·{" "}
+              {shortCoordinate(inspector.lng, "E", "W")}
+            </span>
+            <i aria-hidden="true">·</i>
+            <span>{variable.label}</span>
+            <i aria-hidden="true">·</i>
+            <span className="inspector-axes">
+              {axisSummary(info, variable, selections)}
+            </span>
+          </div>
           {asosStation ? (
             <section className="station-observation" aria-label={`${asosStation.station} station observation`}>
               <header>
@@ -2477,9 +3417,118 @@ export function ZarrViewer() {
             onAdd={addComparisonDataset}
             onRemove={removeComparisonDataset}
             displayUnit={selectedUnit}
+            timeZone={inspectionTimeZone}
           />
+            </>
+          )}
         </aside>
       ) : null}
+      </div>
+
+      <section className="mobile-map-context" aria-label="Map forecast context">
+        <div className="mobile-map-summary">
+          <span>
+            <strong>
+              {inspectionLocationLabel || dataset.label}
+            </strong>
+            <small>
+              {mobileMapValueLabel ? <b>{mobileMapValueLabel}</b> : null}
+              {mobileMapValueLabel && variable?.label ? <i>·</i> : null}
+              <span>{variable?.label ?? "Choose a map layer"}</span>
+            </small>
+          </span>
+          <button
+            type="button"
+            onClick={() => setMobileControlsCollapsed(false)}
+          >
+            Layers
+          </button>
+        </div>
+        {mobileMapAxis ? (
+          <div className="mobile-time-controls" aria-label="Map time controls">
+            <div className="mobile-axis-control">
+              <div className="mobile-axis-heading">
+                <span>{mobileMapAxis.label}</span>
+                <strong>
+                  {formatAxisValue(
+                    dataset,
+                    mobileMapAxis,
+                    mobileMapAxisSelected,
+                  )}
+                </strong>
+              </div>
+              <div className="mobile-axis-inputs">
+                <button
+                  type="button"
+                  disabled={mobileMapAxisSelected <= 0}
+                  onClick={() =>
+                    changeAxis(mobileMapAxis, mobileMapAxisSelected - 1)}
+                  aria-label={`Previous ${mobileMapAxis.label}`}
+                >
+                  ←
+                </button>
+                <input
+                  aria-label={`Compact ${mobileMapAxis.label}`}
+                  type="range"
+                  min="0"
+                  max={Math.max(0, mobileMapAxis.values.length - 1)}
+                  step="1"
+                  value={mobileMapAxisSelected}
+                  onChange={(event) =>
+                    changeAxis(mobileMapAxis, Number(event.target.value))}
+                />
+                <button
+                  type="button"
+                  disabled={
+                    mobileMapAxisSelected >= mobileMapAxis.values.length - 1
+                  }
+                  onClick={() =>
+                    changeAxis(mobileMapAxis, mobileMapAxisSelected + 1)}
+                  aria-label={`Next ${mobileMapAxis.label}`}
+                >
+                  →
+                </button>
+                <button
+                  className="play-button"
+                  type="button"
+                  disabled={
+                    mobileMapAxisSelected >= mobileMapAxis.values.length - 1
+                  }
+                  onClick={() => togglePlayback(mobileMapAxis)}
+                  aria-label={playingAxis === mobileMapAxis.id
+                    ? `Pause ${mobileMapAxis.label}`
+                    : `Play ${mobileMapAxis.label}`}
+                >
+                  {playingAxis === mobileMapAxis.id ? "Ⅱ" : "▶"}
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
+      </section>
+
+      <nav className="mobile-view-switch" aria-label="Mobile view">
+        <button
+          className={mobileScreen === "map" ? "active" : ""}
+          type="button"
+          aria-pressed={mobileScreen === "map"}
+          aria-label="Show map"
+          onClick={showMobileMap}
+        >
+          Map
+        </button>
+        <button
+          className={mobileScreen === "forecast" ? "active" : ""}
+          type="button"
+          aria-pressed={mobileScreen === "forecast"}
+          aria-label={inspector
+            ? "Show local forecast"
+            : "Choose a station for a local forecast"}
+          onClick={showMobileForecast}
+        >
+          Local
+        </button>
+      </nav>
     </main>
   );
 }

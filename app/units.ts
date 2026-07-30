@@ -37,6 +37,10 @@ const DISPLAY_UNITS: Record<string, UnitOption[]> = {
     { id: "mm", label: "mm" },
     { id: "in", label: "in" },
   ],
+  precipitation_rate: [
+    { id: "mm/h", label: "mm/hr" },
+    { id: "in/h", label: "in/hr" },
+  ],
   degree_day: [
     { id: "degreeDayK", label: "K·day" },
     { id: "degreeDayC", label: "°C·day" },
@@ -121,14 +125,65 @@ function isPrecipitation(context = "") {
   return /(precip|rainfall|snowfall|water[_ ]equivalent)/i.test(context);
 }
 
+function quantity(unit: string) {
+  const normalized = normalizeUnit(unit);
+  if (!normalized || SPECIAL_UNITS[normalized]) return null;
+  try {
+    return Qty(1, normalized);
+  } catch {
+    return null;
+  }
+}
+
+function waterEquivalentConverter(
+  sourceUnit: string,
+  targetUnit: string,
+  context: string,
+): ((value: number) => number) | null {
+  if (!isPrecipitation(context)) return null;
+  const source = quantity(sourceUnit);
+  const target = quantity(targetUnit);
+  if (!source || !target) return null;
+  const sourceKind = source.kind();
+  const targetKind = target.kind();
+  if (sourceKind === "area_density" && targetKind === "length") {
+    try {
+      const toKilogramsPerSquareMeter = Qty.swiftConverter(
+        source.units(),
+        "kg/m2",
+      );
+      const millimetersToTarget = Qty.swiftConverter("mm", target.units());
+      return (value) =>
+        millimetersToTarget(toKilogramsPerSquareMeter(value) as number) as number;
+    } catch {
+      return null;
+    }
+  }
+  if (sourceKind === "length" && targetKind === "area_density") {
+    try {
+      const toMillimeters = Qty.swiftConverter(source.units(), "mm");
+      const kilogramsPerSquareMeterToTarget = Qty.swiftConverter(
+        "kg/m2",
+        target.units(),
+      );
+      return (value) =>
+        kilogramsPerSquareMeterToTarget(toMillimeters(value) as number) as number;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 export function unitKind(unit: string, context = "") {
   const normalized = normalizeUnit(unit);
   const specialKind = normalized ? SPECIAL_UNITS[normalized]?.kind : undefined;
   if (specialKind) return specialKind;
   const kind = parsedUnit(unit)?.kind();
-  return kind === "length" && isPrecipitation(context)
-    ? "precipitation"
-    : kind;
+  if (!isPrecipitation(context)) return kind;
+  if (kind === "length" || kind === "area_density") return "precipitation";
+  if (kind === "speed") return "precipitation_rate";
+  return kind;
 }
 
 export function unitOptions(unit: string, context = ""): UnitOption[] {
@@ -138,13 +193,9 @@ export function unitOptions(unit: string, context = ""): UnitOption[] {
   const source = parsedUnit(unit);
   if (!source) return [];
   const preferred = DISPLAY_UNITS[unitKind(unit, context) ?? ""] ?? [];
-  const compatible = preferred.filter((candidate) => {
-    try {
-      return source.isCompatible(Qty(1, candidate.id));
-    } catch {
-      return false;
-    }
-  });
+  const compatible = preferred.filter(
+    (candidate) => unitConverter(unit, candidate.id, context) !== null,
+  );
   if (!compatible.length) return [];
 
   if (
@@ -166,6 +217,7 @@ export function nativeUnitOption(unit: string, context = "") {
 export function unitConverter(
   sourceUnit: string,
   targetUnit: string,
+  context = "",
 ): ((value: number) => number) | null {
   const source = normalizeUnit(sourceUnit);
   const target = normalizeUnit(targetUnit);
@@ -179,6 +231,12 @@ export function unitConverter(
     }
     return (value) => value * sourceSpecial.factor / targetSpecial.factor;
   }
+  const waterEquivalent = waterEquivalentConverter(
+    sourceUnit,
+    targetUnit,
+    context,
+  );
+  if (waterEquivalent) return waterEquivalent;
   const key = `${source}->${target}`;
   let converter = converterCache.get(key);
   if (!converter) {
@@ -193,17 +251,71 @@ export function unitConverter(
   return converter;
 }
 
-export function unitsCompatible(sourceUnit: string, targetUnit: string) {
-  return unitConverter(sourceUnit, targetUnit) !== null;
+export function precipitationRateConverter(
+  sourceUnit: string,
+  context = "",
+): ((value: number, durationSeconds: number) => number) | null {
+  if (!isPrecipitation(context)) return null;
+
+  const direct = unitConverter(sourceUnit, "mm/s", context);
+  if (direct) {
+    return (value, durationSeconds) => direct(value) * durationSeconds;
+  }
+
+  const normalized = sourceUnit
+    .trim()
+    .replaceAll("**", "^")
+    .replaceAll(/\s+/g, " ");
+  const rateSuffixes: Array<{
+    pattern: RegExp;
+    seconds: number;
+  }> = [
+    { pattern: /^(.*?)(?:\s+|\*)s(?:\^)?-1$/i, seconds: 1 },
+    { pattern: /^(.*?)\/(?:s|sec|second)s?$/i, seconds: 1 },
+    { pattern: /^(.*?)(?:\s+|\*)(?:h|hr|hour)(?:\^)?-1$/i, seconds: 3600 },
+    { pattern: /^(.*?)\/(?:h|hr|hour)s?$/i, seconds: 3600 },
+    { pattern: /^(.*?)(?:\s+|\*)d(?:\^)?-1$/i, seconds: 86400 },
+    { pattern: /^(.*?)\/(?:d|day)s?$/i, seconds: 86400 },
+  ];
+  for (const { pattern, seconds } of rateSuffixes) {
+    const match = normalized.match(pattern);
+    const amountUnit = match?.[1]?.trim();
+    if (!amountUnit) continue;
+    const toMillimeters = unitConverter(amountUnit, "mm", context);
+    if (toMillimeters) {
+      return (value, durationSeconds) =>
+        toMillimeters(value) * durationSeconds / seconds;
+    }
+  }
+  return null;
+}
+
+export function precipitationRateUnitOption(
+  amountUnit?: string | null,
+): UnitOption {
+  const normalized = normalizeUnit(amountUnit ?? "");
+  return normalized === normalizeUnit("in")
+      || normalized === normalizeUnit("in/h")
+    ? { id: "in/h", label: "in/hr" }
+    : { id: "mm/h", label: "mm/hr" };
+}
+
+export function unitsCompatible(
+  sourceUnit: string,
+  targetUnit: string,
+  context = "",
+) {
+  return unitConverter(sourceUnit, targetUnit, context) !== null;
 }
 
 export function convertUnitValue(
   value: number,
   sourceUnit: string,
   targetUnit: string,
+  context = "",
 ) {
   if (!Number.isFinite(value)) return value;
-  const converter = unitConverter(sourceUnit, targetUnit);
+  const converter = unitConverter(sourceUnit, targetUnit, context);
   if (!converter) return value;
   try {
     return converter(value);
@@ -216,9 +328,10 @@ export function convertUnitRange(
   range: [number, number],
   sourceUnit: string,
   targetUnit: string,
+  context = "",
 ): [number, number] {
-  const first = convertUnitValue(range[0], sourceUnit, targetUnit);
-  const second = convertUnitValue(range[1], sourceUnit, targetUnit);
+  const first = convertUnitValue(range[0], sourceUnit, targetUnit, context);
+  const second = convertUnitValue(range[1], sourceUnit, targetUnit, context);
   return first <= second ? [first, second] : [second, first];
 }
 
@@ -226,11 +339,14 @@ export function convertPointSeries(
   series: PointSeries,
   target: UnitOption | null,
 ): PointSeries {
-  if (!target || !unitsCompatible(series.unit, target.id)) {
+  if (
+    !target
+    || !unitsCompatible(series.unit, target.id, series.variableLabel)
+  ) {
     return series;
   }
   const convert = (value: number) =>
-    convertUnitValue(value, series.unit, target.id);
+    convertUnitValue(value, series.unit, target.id, series.variableLabel);
   if (series.kind === "history") {
     return {
       ...series,

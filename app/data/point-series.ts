@@ -15,6 +15,7 @@ import {
 } from "./dimensions";
 import type {
   AxisSelection,
+  ForecastQuantiles,
   PointForecastSeries,
   PointSeriesLoadOptions,
   PointTimeSeries,
@@ -25,6 +26,12 @@ import {
   executeDerivedPipeline,
   nativeInputsForDerived,
 } from "../derived-variables";
+import { commonVariableMatches } from "../common-variables";
+import { PRECIPITATION_EVENT_THRESHOLD_MM } from "../precipitation";
+import {
+  precipitationRateConverter,
+  unitConverter,
+} from "../units";
 
 const HOUR_MS = 60 * 60 * 1000;
 const SERIES_CHUNK_CONCURRENCY = 6;
@@ -224,14 +231,22 @@ export async function loadPointTimeSeries(
   });
   const result = await zarr.get(dataArray, request, zarrReadOptions(options));
   const values = Array.from(result.data as ArrayLike<number | bigint>, Number);
+  const dates = Array.from(
+    { length: values.length },
+    (_, offset) => axisValueAsDate(info.dataset, timeAxis, start + offset),
+  );
+  const precipitation = pointPrecipitationRates(
+    values,
+    dates,
+    1,
+    variable,
+    info.source.precipitationAccumulation,
+  );
   return {
     kind: "history",
-    values,
-    dates: Array.from(
-      { length: values.length },
-      (_, offset) => axisValueAsDate(info.dataset, timeAxis, start + offset),
-    ),
-    unit: variable.unit,
+    values: precipitation ? Array.from(precipitation.values) : values,
+    dates,
+    unit: precipitation?.unit ?? variable.unit,
     variableLabel: variable.label,
     latitude,
     longitude,
@@ -248,6 +263,53 @@ function quantile(sorted: number[], probability: number) {
   return sorted[lower] * (1 - weight) + sorted[upper] * weight;
 }
 
+export function circularMeanDegrees(values: ArrayLike<number>) {
+  let sine = 0;
+  let cosine = 0;
+  let count = 0;
+  for (let index = 0; index < values.length; index += 1) {
+    const value = Number(values[index]);
+    if (!Number.isFinite(value)) continue;
+    const radians = value * Math.PI / 180;
+    sine += Math.sin(radians);
+    cosine += Math.cos(radians);
+    count += 1;
+  }
+  if (!count || Math.hypot(sine, cosine) <= count * 1e-12) return NaN;
+  return (Math.atan2(sine, cosine) * 180 / Math.PI + 360) % 360;
+}
+
+export function forecastQuantiles(
+  variable: VariableConfig,
+  values: ArrayLike<number>,
+): ForecastQuantiles {
+  const members = Array.from(values, Number).filter(Number.isFinite);
+  if (variable.standardName?.toLowerCase() === "wind_from_direction") {
+    // Scalar intervals cannot represent a distribution that crosses north.
+    // Expose its circular center without inventing misleading linear bands.
+    const center = circularMeanDegrees(members);
+    return {
+      min: center,
+      q10: center,
+      q25: center,
+      q50: center,
+      q75: center,
+      q90: center,
+      max: center,
+    };
+  }
+  members.sort((a, b) => a - b);
+  return {
+    min: members[0] ?? NaN,
+    q10: quantile(members, 0.1),
+    q25: quantile(members, 0.25),
+    q50: quantile(members, 0.5),
+    q75: quantile(members, 0.75),
+    q90: quantile(members, 0.9),
+    max: members.at(-1) ?? NaN,
+  };
+}
+
 type RawPointForecast = {
   values: Float64Array;
   dates: Date[];
@@ -256,6 +318,101 @@ type RawPointForecast = {
   latitude: number;
   longitude: number;
 };
+
+function precipitationContext(variable: VariableConfig) {
+  return [
+    variable.id,
+    variable.label,
+    variable.standardName ?? "",
+  ].join(" ");
+}
+
+function isPrecipitationVariable(variable: VariableConfig) {
+  return commonVariableMatches([variable]).some((match) => match.key === "tp");
+}
+
+export function pointPrecipitationRates(
+  values: ArrayLike<number>,
+  dates: Date[],
+  memberCount: number,
+  variable: VariableConfig,
+  accumulation?: DatasetSourceConfig["precipitationAccumulation"],
+): {
+  values: Float64Array;
+  amounts: Float64Array;
+  unit: "mm/h";
+} | null {
+  if (!isPrecipitationVariable(variable)) return null;
+  const context = precipitationContext(variable);
+  const rateConverter = precipitationRateConverter(variable.unit, context);
+  const cumulative = accumulation === "cumulative";
+  const toMillimeters = rateConverter
+    ? null
+    : unitConverter(variable.unit, "mm", context);
+  if (!rateConverter && !toMillimeters) return null;
+
+  const rateValues = new Float64Array(values.length);
+  const amountValues = new Float64Array(values.length);
+  rateValues.fill(NaN);
+  amountValues.fill(NaN);
+  const leadCount = Math.min(
+    dates.length,
+    Math.floor(values.length / Math.max(1, memberCount)),
+  );
+  for (let leadIndex = 0; leadIndex < leadCount; leadIndex += 1) {
+    const previousDate = dates[leadIndex - 1];
+    const nextDate = dates[leadIndex + 1];
+    const durationSeconds = Math.max(
+      0,
+      (
+        previousDate
+          ? dates[leadIndex].getTime() - previousDate.getTime()
+          : (nextDate?.getTime() ?? dates[leadIndex].getTime())
+            - dates[leadIndex].getTime()
+      ) / 1000,
+    );
+    const durationHours = durationSeconds / 3600;
+    for (let memberIndex = 0; memberIndex < memberCount; memberIndex += 1) {
+      const offset = leadIndex * memberCount + memberIndex;
+      const current = Number(values[offset]);
+      if (rateConverter) {
+        const rate = Number.isFinite(current)
+          ? Math.max(0, rateConverter(current, 3600))
+          : NaN;
+        rateValues[offset] = rate;
+        amountValues[offset] = Number.isFinite(rate) && durationHours > 0
+          ? rate * durationHours
+          : NaN;
+        continue;
+      }
+      const currentMillimeters = toMillimeters!(current);
+      const amount = cumulative
+        ? (() => {
+          const previousMillimeters = leadIndex > 0
+            ? toMillimeters!(Number(values[offset - memberCount]))
+            : currentMillimeters === 0
+              ? 0
+              : NaN;
+          return Number.isFinite(currentMillimeters)
+              && Number.isFinite(previousMillimeters)
+            ? Math.max(0, currentMillimeters - previousMillimeters)
+            : NaN;
+        })()
+        : Number.isFinite(currentMillimeters)
+          ? Math.max(0, currentMillimeters)
+          : NaN;
+      amountValues[offset] = amount;
+      rateValues[offset] = Number.isFinite(amount) && durationHours > 0
+        ? amount / durationHours
+        : NaN;
+    }
+  }
+  return {
+    values: rateValues,
+    amounts: amountValues,
+    unit: "mm/h",
+  };
+}
 
 async function loadRawPointForecast(
   info: StoreInfo,
@@ -368,23 +525,15 @@ function pointForecastFromRaw(
 ): PointForecastSeries {
   const allQuantiles = Array.from(
     { length: raw.leadCount },
-    (_, leadIndex) => {
-      const members = Array.from(
+    (_, leadIndex) => forecastQuantiles(
+      variable,
+      Array.from(
         { length: raw.memberCount },
         (_, memberIndex) => Number(
           values[leadIndex * raw.memberCount + memberIndex],
         ),
-      ).filter(Number.isFinite).sort((a, b) => a - b);
-      return {
-      min: members[0] ?? NaN,
-      q10: quantile(members, 0.1),
-      q25: quantile(members, 0.25),
-      q50: quantile(members, 0.5),
-      q75: quantile(members, 0.75),
-      q90: quantile(members, 0.9),
-      max: members.at(-1) ?? NaN,
-      };
-    },
+      ),
+    ),
   );
   const lastFiniteIndex = allQuantiles.findLastIndex((item) =>
     Number.isFinite(item.q50),
@@ -418,9 +567,87 @@ export async function loadPointForecast(
     latitude,
     options,
   );
-  return raw
-    ? pointForecastFromRaw(raw, variable, raw.values)
-    : null;
+  if (!raw) return null;
+  const precipitation = pointPrecipitationRates(
+    raw.values,
+    raw.dates,
+    raw.memberCount,
+    variable,
+    info.source.precipitationAccumulation,
+  );
+  return pointForecastFromRaw(
+    raw,
+    variable,
+    precipitation?.values ?? raw.values,
+    precipitation?.unit ?? variable.unit,
+  );
+}
+
+export type PointPrecipitationForecast = {
+  rate: PointForecastSeries;
+  probability: PointTimeSeries;
+};
+
+export async function loadPointPrecipitationForecast(
+  info: StoreInfo,
+  variable: VariableConfig,
+  selections: AxisSelection,
+  longitude: number,
+  latitude: number,
+  options: PointSeriesLoadOptions = {},
+  thresholdMillimeters = PRECIPITATION_EVENT_THRESHOLD_MM,
+): Promise<PointPrecipitationForecast | null> {
+  const raw = await loadRawPointForecast(
+    info,
+    variable,
+    selections,
+    longitude,
+    latitude,
+    options,
+  );
+  if (!raw) return null;
+  const normalized = pointPrecipitationRates(
+    raw.values,
+    raw.dates,
+    raw.memberCount,
+    variable,
+    info.source.precipitationAccumulation,
+  );
+  if (!normalized) return null;
+
+  const probabilities = new Array<number>(raw.leadCount).fill(NaN);
+  for (let leadIndex = 0; leadIndex < raw.leadCount; leadIndex += 1) {
+    let wetMembers = 0;
+    let finiteMembers = 0;
+    for (let memberIndex = 0; memberIndex < raw.memberCount; memberIndex += 1) {
+      const offset = leadIndex * raw.memberCount + memberIndex;
+      const step = normalized.amounts[offset];
+      if (Number.isFinite(step)) {
+        finiteMembers += 1;
+        if (step >= thresholdMillimeters) wetMembers += 1;
+      }
+    }
+    probabilities[leadIndex] = finiteMembers
+      ? 100 * wetMembers / finiteMembers
+      : NaN;
+  }
+  return {
+    rate: pointForecastFromRaw(
+      raw,
+      variable,
+      normalized.values,
+      normalized.unit,
+    ),
+    probability: {
+      kind: "history",
+      values: probabilities,
+      dates: [...raw.dates],
+      unit: "%",
+      variableLabel: `Precipitation likelihood (≥${thresholdMillimeters} mm/step)`,
+      latitude: raw.latitude,
+      longitude: raw.longitude,
+    },
+  };
 }
 
 function sameDates(first: Date[], second: Date[]) {

@@ -6,6 +6,8 @@ import {
   loadPointForecast,
   loadStoreInfo,
 } from "../app/dataset";
+import { isSpatialDimension } from "../app/data/dimensions";
+import { variableLayerOptions } from "../app/derived-store";
 
 await initializePcodec(
   await readFile(
@@ -15,6 +17,15 @@ await initializePcodec(
     ),
   ),
 );
+
+function scalarValue(result: unknown) {
+  const data = result && typeof result === "object" && "data" in result
+    ? result.data
+    : result;
+  return Array.isArray(data) || ArrayBuffer.isView(data)
+    ? Number((data as ArrayLike<number | bigint>)[0])
+    : Number(data);
+}
 
 const weatherZarr = await loadStoreInfo("weatherzarr-ecmwf-ifs", "map");
 const weatherZarrTemperature = weatherZarr.variables.find(
@@ -33,7 +44,8 @@ if (
 if (
   weatherZarr.axes.valid_time?.kind !== "timedelta"
   || weatherZarr.axes.valid_time.label !== "Lead time"
-  || Number(weatherZarr.axes.valid_time.values[0]) !== 0
+  || !Number.isFinite(Number(weatherZarr.axes.valid_time.values[0]))
+  || Number(weatherZarr.axes.valid_time.values[0]) < 0
 ) {
   throw new Error("WeatherZarr IFS did not normalize valid_time to forecast lead");
 }
@@ -47,6 +59,69 @@ const weatherZarrLatitude = await zarr.open(
   { kind: "array" },
 );
 const weatherZarrLatitudeValues = await zarr.get(weatherZarrLatitude);
+const weatherZarrPrecipitation = weatherZarr.variables.find(
+  (variable) => variable.id === "tp",
+);
+if (!weatherZarrPrecipitation?.shape) {
+  throw new Error("WeatherZarr IFS did not report total precipitation");
+}
+const precipitationLeadDimension = weatherZarrPrecipitation.dimensions.findIndex(
+  (dimension) => weatherZarr.axes[dimension]?.kind === "timedelta",
+);
+if (precipitationLeadDimension < 0) {
+  throw new Error("WeatherZarr precipitation did not report a lead-time axis");
+}
+const precipitationCurrentSelection = weatherZarrPrecipitation.dimensions.map(
+  (dimension, index) => {
+    if (index === precipitationLeadDimension) return 1;
+    return isSpatialDimension(dimension, weatherZarr.source)
+      ? Math.floor((weatherZarrPrecipitation.shape?.[index] ?? 1) / 2)
+      : 0;
+  },
+);
+const precipitationPreviousSelection = [...precipitationCurrentSelection];
+precipitationPreviousSelection[precipitationLeadDimension] = 0;
+const weatherZarrPrecipitationArray = await zarr.open(
+  zarr.root(weatherZarr.store!).resolve(weatherZarrPrecipitation.id),
+  { kind: "array" },
+);
+const [rawPreviousPrecipitation, rawCurrentPrecipitation] = await Promise.all([
+  zarr.get(weatherZarrPrecipitationArray, precipitationPreviousSelection),
+  zarr.get(weatherZarrPrecipitationArray, precipitationCurrentSelection),
+]);
+const precipitationLayerOptions = await variableLayerOptions(
+  weatherZarr,
+  weatherZarrPrecipitation,
+);
+const stepPrecipitationArray = await zarr.open(
+  zarr.root(precipitationLayerOptions.store!).resolve(
+    weatherZarrPrecipitation.id,
+  ),
+  { kind: "array" },
+);
+const stepPrecipitation = await zarr.get(
+  stepPrecipitationArray,
+  precipitationCurrentSelection,
+);
+const rawPreviousPrecipitationValue = scalarValue(rawPreviousPrecipitation);
+const rawCurrentPrecipitationValue = scalarValue(rawCurrentPrecipitation);
+const stepPrecipitationValue = scalarValue(stepPrecipitation);
+const expectedStepPrecipitation = Math.max(
+  0,
+  rawCurrentPrecipitationValue - rawPreviousPrecipitationValue,
+);
+if (
+  !Number.isFinite(rawPreviousPrecipitationValue)
+  || !Number.isFinite(rawCurrentPrecipitationValue)
+  || !Number.isFinite(stepPrecipitationValue)
+  || Math.abs(stepPrecipitationValue - expectedStepPrecipitation) > 1e-7
+) {
+  throw new Error(
+    "WeatherZarr precipitation was not converted to a finite step amount:"
+    + ` ${rawPreviousPrecipitationValue} → ${rawCurrentPrecipitationValue}`
+    + ` produced ${stepPrecipitationValue}`,
+  );
+}
 
 const weatherZarrSeriesInfo = await loadStoreInfo(
   "weatherzarr-ecmwf-ifs",
@@ -110,6 +185,11 @@ console.log({
       ]),
     ),
     mapValue: weatherZarrValue,
+    precipitationAccumulation: [
+      rawPreviousPrecipitationValue,
+      rawCurrentPrecipitationValue,
+    ],
+    stepPrecipitation: stepPrecipitationValue,
     latitude: [
       Number(weatherZarrLatitudeValues.data[0]),
       Number(weatherZarrLatitudeValues.data[weatherZarrLatitudeValues.data.length - 1]),

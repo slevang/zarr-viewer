@@ -502,7 +502,7 @@ export function observationVariable(variable: VariableConfig): AsosVariable | nu
     return directObservation(
       "p01m",
       "one-hour precipitation",
-      "mm",
+      "mm/hr",
     );
   }
   return null;

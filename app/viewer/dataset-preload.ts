@@ -14,15 +14,23 @@ type DatasetPreloadOptions = {
   targetDate?: Date;
   activeDatasetTargetDate?: Date;
   includeAuthenticated?: boolean;
+  availableAuth?: ReadonlyArray<
+    NonNullable<DatasetConfig["sources"]["map"]>["auth"]
+  >;
 };
 
 function canPreload(
   dataset: DatasetConfig,
   role: DatasetSourceRole,
   includeAuthenticated: boolean,
+  availableAuth: DatasetPreloadOptions["availableAuth"],
 ) {
   const source = dataset.sources[role];
-  return source && (includeAuthenticated || !source.auth);
+  return source && (
+    includeAuthenticated
+    || !source.auth
+    || availableAuth?.includes(source.auth)
+  );
 }
 
 export function datasetPreloadRequests(
@@ -32,6 +40,7 @@ export function datasetPreloadRequests(
     targetDate,
     activeDatasetTargetDate,
     includeAuthenticated = false,
+    availableAuth = [],
   }: DatasetPreloadOptions,
 ) {
   const requests: DatasetPreloadRequest[] = [];
@@ -39,7 +48,9 @@ export function datasetPreloadRequests(
   // Point-series stores come first because they are opened interactively after
   // a map click and can be substantially slower than a consolidated Zarr root.
   for (const dataset of datasets) {
-    if (!canPreload(dataset, "series", includeAuthenticated)) continue;
+    if (!canPreload(dataset, "series", includeAuthenticated, availableAuth)) {
+      continue;
+    }
     requests.push({
       datasetId: dataset.id,
       role: "series",
@@ -52,7 +63,7 @@ export function datasetPreloadRequests(
   for (const dataset of datasets) {
     if (
       dataset.id === activeDatasetId
-      || !canPreload(dataset, "map", includeAuthenticated)
+      || !canPreload(dataset, "map", includeAuthenticated, availableAuth)
     ) continue;
     requests.push({
       datasetId: dataset.id,

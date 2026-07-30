@@ -8,10 +8,14 @@ import {
   executeDerivedPipeline,
 } from "../app/derived-variables";
 import {
+  accumulatedToStepValues,
   derivedLayerOptions,
+  variableLayerOptions,
 } from "../app/derived-store";
 import {
+  forecastQuantiles,
   loadPointSeries,
+  pointPrecipitationRates,
   preloadPointSeriesCoordinates,
 } from "../app/data/point-series";
 import type {
@@ -81,6 +85,22 @@ close(calculate("wind_direction_10m", {
   u: [-1],
   v: [0],
 }).values[0], 90);
+close(calculate("wind_direction_10m", {
+  u: [1],
+  v: [1],
+}).values[0], 225);
+const windDirectionVariable = derived.find(
+  (variable) => variable.derived?.key === "wind_direction_10m",
+);
+if (!windDirectionVariable) throw new Error("Missing wind-direction variable");
+const wraparoundDirection = forecastQuantiles(
+  windDirectionVariable,
+  [350, 10],
+);
+close(wraparoundDirection.q50, 0);
+if (!Object.values(wraparoundDirection).every((value) => value === 0)) {
+  throw new Error("Circular direction center produced a linear ensemble band");
+}
 close(calculate("cdd_65f", {
   temperature: [30],
 }).values[0], 30 - (65 - 32) * 5 / 9);
@@ -109,6 +129,111 @@ const windChill = calculate("wind_chill", {
 }).values[0];
 close(windChill - 273.15, -7.05, 0.15);
 
+const stepPrecipitation = accumulatedToStepValues(
+  new Float32Array([
+    0, 1,
+    2, 4,
+    5, 4,
+  ]),
+  [3, 2],
+  0,
+  0,
+);
+if (
+  Array.from(stepPrecipitation).join(",")
+  !== [0, 1, 2, 3, 3, 0].join(",")
+) {
+  throw new Error(
+    `Cumulative precipitation was not differenced by lead: ${stepPrecipitation}`,
+  );
+}
+const laterStepPrecipitation = accumulatedToStepValues(
+  new Float32Array([
+    2, 4,
+    5, 9,
+    8, 10,
+  ]),
+  [3, 2],
+  0,
+  1,
+);
+if (
+  Array.from(laterStepPrecipitation).join(",")
+  !== [3, 5, 3, 1].join(",")
+) {
+  throw new Error(
+    `Chunk-boundary precipitation was not differenced: ${laterStepPrecipitation}`,
+  );
+}
+
+const precipitationDates = [
+  new Date("2026-01-01T00:00:00Z"),
+  new Date("2026-01-01T03:00:00Z"),
+  new Date("2026-01-01T09:00:00Z"),
+];
+const hrrrPointRates = pointPrecipitationRates(
+  [NaN, 1e-5, 2e-5],
+  precipitationDates,
+  1,
+  {
+    ...nativeVariable(
+      "precipitation_surface",
+      "kg m-2 s-1",
+      "Precipitation rate",
+    ),
+    standardName: "precipitation_flux",
+  },
+);
+if (!hrrrPointRates) {
+  throw new Error("HRRR point precipitation was not normalized");
+}
+if (hrrrPointRates.unit !== "mm/h") {
+  throw new Error(`Unexpected HRRR precipitation unit ${hrrrPointRates.unit}`);
+}
+close(hrrrPointRates.values[1], 0.036);
+close(hrrrPointRates.values[2], 0.072);
+close(hrrrPointRates.amounts[1], 0.108);
+close(hrrrPointRates.amounts[2], 0.432);
+
+const weatherZarrPointRates = pointPrecipitationRates(
+  [0.01, 0.02, 0.0103, 0.0206, 0.0109, 0.0218],
+  precipitationDates,
+  2,
+  nativeVariable("tp", "m", "Total precipitation"),
+  "cumulative",
+);
+if (!weatherZarrPointRates) {
+  throw new Error("WeatherZarr point precipitation was not normalized");
+}
+if (!Number.isNaN(weatherZarrPointRates.values[0])) {
+  throw new Error("A cumulative series without its prior lead invented a first step");
+}
+[0.1, 0.2, 0.1, 0.2].forEach(
+  (expected, index) => close(weatherZarrPointRates.values[index + 2], expected),
+);
+const nativeStepRates = pointPrecipitationRates(
+  [0.003, 0.003, 0.012],
+  precipitationDates,
+  1,
+  nativeVariable("total_precipitation_6hr", "m", "Total precipitation"),
+);
+if (!nativeStepRates) {
+  throw new Error("Native step precipitation was not converted to a rate");
+}
+[1, 1, 2].forEach(
+  (expected, index) => close(nativeStepRates.values[index], expected),
+);
+if (
+  pointPrecipitationRates(
+    [1, 2, 3],
+    precipitationDates,
+    1,
+    nativeVariable("temperature", "K", "Temperature"),
+  ) !== null
+) {
+  throw new Error("A non-precipitation series was converted to a rain rate");
+}
+
 const stationRecord: AsosRecord = {
   valid: new Date("2026-01-01T00:00:00Z"),
   tmpc: 30,
@@ -121,6 +246,16 @@ const stationRecord: AsosRecord = {
   vsby: 10,
   p01m: 0,
 };
+const stationPrecipitation = observationVariable(
+  nativeVariable("tp", "m", "Total precipitation"),
+);
+if (
+  !stationPrecipitation
+  || stationPrecipitation.unit !== "mm/hr"
+  || stationPrecipitation.values([stationRecord])[0] !== 0
+) {
+  throw new Error("ASOS precipitation was not exposed as an hourly rate");
+}
 function stationDerived(key: string) {
   const variable = derived.find((candidate) => candidate.derived?.key === key);
   if (!variable) throw new Error(`Missing station derived variable ${key}`);
@@ -199,6 +334,26 @@ const sourceMetadata = Object.fromEntries(nativeVariables.map((variable) => [
     attributes: { units: variable.unit },
   },
 ]));
+const precipitationVariable: VariableConfig = {
+  id: "tp",
+  label: "Total precipitation",
+  unit: "m",
+  dimensions: ["lead_time", "latitude", "longitude"],
+  shape: [3, 2, 3],
+  chunkShape: [1, 2, 3],
+  dataType: "float32",
+};
+sourceMetadata.tp = {
+  ...metadata(
+    precipitationVariable.shape ?? [],
+    precipitationVariable.chunkShape ?? [],
+    precipitationVariable.dimensions,
+  ),
+  attributes: {
+    long_name: precipitationVariable.label,
+    units: precipitationVariable.unit,
+  },
+};
 sourceMetadata.latitude = {
   ...metadata([2], [2], ["latitude"]),
   attributes: { units: "degrees_north" },
@@ -206,6 +361,10 @@ sourceMetadata.latitude = {
 sourceMetadata.longitude = {
   ...metadata([3], [3], ["longitude"]),
   attributes: { units: "degrees_east" },
+};
+sourceMetadata.lead_time = {
+  ...metadata([3], [3], ["lead_time"]),
+  attributes: { units: "hours" },
 };
 const sourceRoot = new TextEncoder().encode(JSON.stringify({
   attributes: {},
@@ -225,8 +384,12 @@ const sourceChunks = new Map<string, Uint8Array>([
   ["/v10/c/0/0/0", bytes(new Float32Array([4, -1, 0, 8]))],
   ["/u10/c/0/0/1", bytes(new Float32Array([5, NaN, 12, NaN]))],
   ["/v10/c/0/0/1", bytes(new Float32Array([12, NaN, 5, NaN]))],
+  ["/tp/c/0/0/0", bytes(new Float32Array([0, 1, 0, 2, 0, 0]))],
+  ["/tp/c/1/0/0", bytes(new Float32Array([2, 4, 1, 2, 3, 0]))],
+  ["/tp/c/2/0/0", bytes(new Float32Array([5, 4, 1, 6, 4, 8]))],
   ["/latitude/c/0", bytes(new Float32Array([0, 1]))],
   ["/longitude/c/0", bytes(new Float32Array([0, 1, 2]))],
+  ["/lead_time/c/0", bytes(new Float32Array([0, 3, 6]))],
 ]);
 for (const [id, entry] of Object.entries(sourceMetadata)) {
   sourceChunks.set(
@@ -283,6 +446,42 @@ const windSpeedValues = await zarr.get(windSpeedArray);
 const expectedWindSpeed = [5, 1, 13, 1, 10, 13];
 Array.from(windSpeedValues.data as ArrayLike<number>).forEach(
   (value, index) => close(value, expectedWindSpeed[index]),
+);
+
+const precipitationInfo: StoreInfo = {
+  ...info,
+  role: "map",
+  variables: [...nativeVariables, precipitationVariable],
+  axes: {
+    ...info.axes,
+    lead_time: {
+      id: "lead_time",
+      label: "Lead time",
+      unit: "hours",
+      kind: "timedelta",
+      values: [0, 3, 6],
+    },
+  },
+};
+const precipitationLayerOptions = await variableLayerOptions(
+  precipitationInfo,
+  precipitationVariable,
+);
+if (!precipitationLayerOptions.store) {
+  throw new Error("Step precipitation layer did not provide a virtual store");
+}
+const stepPrecipitationArray = await zarr.open(
+  zarr.root(precipitationLayerOptions.store).resolve(precipitationVariable.id),
+  { kind: "array" },
+);
+const stepPrecipitationResult = await zarr.get(stepPrecipitationArray);
+const expectedStepPrecipitation = [
+  0, 1, 0, 2, 0, 0,
+  2, 3, 1, 0, 3, 0,
+  3, 0, 0, 4, 1, 8,
+];
+Array.from(stepPrecipitationResult.data as ArrayLike<number>).forEach(
+  (value, index) => close(value, expectedStepPrecipitation[index]),
 );
 
 sourceReadCounts.clear();

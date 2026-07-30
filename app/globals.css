@@ -23,7 +23,14 @@ body {
 button, input, select { color: inherit; font: inherit; }
 button { cursor: pointer; }
 
-.viewer-shell { position: relative; width: 100vw; height: 100vh; overflow: hidden; background: #080b0a; }
+.viewer-shell {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+  background: #080b0a;
+}
 .viewer-shell > .map { position: absolute; inset: 0; width: 100%; height: 100%; }
 .maplibregl-canvas { cursor: grab; }
 .maplibregl-canvas:active { cursor: grabbing; }
@@ -1152,6 +1159,9 @@ input[type="range"] { width: 100%; height: 36px; margin: 0; accent-color: #dbe8f
 }
 
 @media (max-width: 960px) {
+  .viewer-shell {
+    --mobile-nav-height: calc(50px + env(safe-area-inset-bottom));
+  }
   .mobile-screen-map.mobile-layers-closed .maplibregl-ctrl-bottom-left {
     top: 10px;
     bottom: auto;
@@ -1165,10 +1175,11 @@ input[type="range"] { width: 100%; height: 36px; margin: 0; accent-color: #dbe8f
   .forecast-workbench {
     top: auto;
     right: 10px;
-    bottom: 58px;
+    bottom: calc(var(--mobile-nav-height) + 8px);
     left: 10px;
     width: auto;
     max-height: calc(100vh - 78px);
+    max-height: calc(100dvh - var(--mobile-nav-height) - 20px);
     border-radius: 10px;
   }
   .mobile-screen-map.mobile-layers-closed .forecast-workbench { display: none; }
@@ -1211,7 +1222,8 @@ input[type="range"] { width: 100%; height: 36px; margin: 0; accent-color: #dbe8f
     display: grid;
     width: 100%;
     max-height: none;
-    min-height: calc(100vh - 50px);
+    min-height: calc(100vh - var(--mobile-nav-height));
+    min-height: calc(100dvh - var(--mobile-nav-height));
     overflow: visible;
     padding: 12px 10px 64px;
     border: 0;
@@ -1261,7 +1273,7 @@ input[type="range"] { width: 100%; height: 36px; margin: 0; accent-color: #dbe8f
     position: absolute;
     z-index: 4;
     right: 10px;
-    bottom: 58px;
+    bottom: calc(var(--mobile-nav-height) + 8px);
     left: 10px;
     display: grid;
     min-height: 50px;
@@ -1373,7 +1385,7 @@ input[type="range"] { width: 100%; height: 36px; margin: 0; accent-color: #dbe8f
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 4px;
-    height: 50px;
+    height: var(--mobile-nav-height);
     padding: 5px max(10px, env(safe-area-inset-right)) max(5px, env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left));
     border-top: 1px solid var(--border);
     background: rgba(13, 17, 16, .97);

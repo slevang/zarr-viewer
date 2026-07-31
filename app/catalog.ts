@@ -23,6 +23,8 @@ export type DatasetSourceConfig = {
   latIsAscending?: boolean;
   layout?: "spatial" | "timeseries";
   directChunkReads?: boolean;
+  spatialCoordinates?: "regular-global";
+  requiresCrossOriginIsolation?: boolean;
   precipitationAccumulation?: "cumulative";
   geographicBounds?: [west: number, south: number, east: number, north: number];
   meteogram?: {
@@ -152,6 +154,7 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
         s3Url: "s3://dynamical-noaa-hrrr/noaa-hrrr-forecast-48-hour-virtual/v0.5.0.icechunk/",
         zarrVersion: 3,
         layout: "spatial",
+        requiresCrossOriginIsolation: true,
         meteogram: {
           kind: "regional",
           firstLeadHour: 1,
@@ -317,6 +320,7 @@ export const DATASETS: DatasetConfig[] = [
         bounds: [-180, -90, 180, 90],
         crs: "EPSG:4326",
         latIsAscending: false,
+        spatialCoordinates: "regular-global",
         precipitationAccumulation: "cumulative",
         geographicBounds: [-180, -90, 180, 90],
         meteogram: {
@@ -334,6 +338,7 @@ export const DATASETS: DatasetConfig[] = [
         bounds: [-180, -90, 180, 90],
         crs: "EPSG:4326",
         latIsAscending: false,
+        spatialCoordinates: "regular-global",
         precipitationAccumulation: "cumulative",
         geographicBounds: [-180, -90, 180, 90],
         meteogram: {

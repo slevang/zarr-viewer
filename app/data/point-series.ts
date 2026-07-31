@@ -5,6 +5,7 @@ import { createBoundedAsyncQueue } from "../async-queue";
 import {
   axisValueAsDate,
   isForecastSeries,
+  regularSpatialCoordinateValues,
   timedeltaMilliseconds,
 } from "./axes";
 import {
@@ -26,12 +27,11 @@ import {
   executeDerivedPipeline,
   nativeInputsForDerived,
 } from "../derived-variables";
-import { commonVariableMatches } from "../common-variables";
-import { PRECIPITATION_EVENT_THRESHOLD_MM } from "../precipitation";
 import {
-  precipitationRateConverter,
-  unitConverter,
-} from "../units";
+  PRECIPITATION_EVENT_THRESHOLD_MM,
+  PRECIPITATION_RATE_UNIT,
+  precipitationValueNormalization,
+} from "../precipitation";
 
 const HOUR_MS = 60 * 60 * 1000;
 const SERIES_CHUNK_CONCURRENCY = 6;
@@ -147,6 +147,16 @@ function coordinateValues(
   const cached = cache.get(dimension);
   if (cached) return cached;
   const promise = (async () => {
+    const variable = info.variables.find((candidate) =>
+      candidate.dimensions.includes(dimension)
+    );
+    const dimensionIndex = variable?.dimensions.indexOf(dimension) ?? -1;
+    const regular = regularSpatialCoordinateValues(
+      info.source,
+      dimension,
+      dimensionIndex >= 0 ? variable?.shape?.[dimensionIndex] ?? 0 : 0,
+    );
+    if (regular) return regular;
     if (!info.store) return [];
     const array = await zarr.open(
       zarr.root(info.store).resolve(dimension),
@@ -319,18 +329,6 @@ type RawPointForecast = {
   longitude: number;
 };
 
-function precipitationContext(variable: VariableConfig) {
-  return [
-    variable.id,
-    variable.label,
-    variable.standardName ?? "",
-  ].join(" ");
-}
-
-function isPrecipitationVariable(variable: VariableConfig) {
-  return commonVariableMatches([variable]).some((match) => match.key === "tp");
-}
-
 export function pointPrecipitationRates(
   values: ArrayLike<number>,
   dates: Date[],
@@ -342,14 +340,8 @@ export function pointPrecipitationRates(
   amounts: Float64Array;
   unit: "mm/h";
 } | null {
-  if (!isPrecipitationVariable(variable)) return null;
-  const context = precipitationContext(variable);
-  const rateConverter = precipitationRateConverter(variable.unit, context);
-  const cumulative = accumulation === "cumulative";
-  const toMillimeters = rateConverter
-    ? null
-    : unitConverter(variable.unit, "mm", context);
-  if (!rateConverter && !toMillimeters) return null;
+  const normalization = precipitationValueNormalization(variable, accumulation);
+  if (!normalization) return null;
 
   const rateValues = new Float64Array(values.length);
   const amountValues = new Float64Array(values.length);
@@ -375,9 +367,9 @@ export function pointPrecipitationRates(
     for (let memberIndex = 0; memberIndex < memberCount; memberIndex += 1) {
       const offset = leadIndex * memberCount + memberIndex;
       const current = Number(values[offset]);
-      if (rateConverter) {
+      if (normalization.kind === "rate") {
         const rate = Number.isFinite(current)
-          ? Math.max(0, rateConverter(current, 3600))
+          ? Math.max(0, normalization.toMillimetersPerHour(current))
           : NaN;
         rateValues[offset] = rate;
         amountValues[offset] = Number.isFinite(rate) && durationHours > 0
@@ -385,11 +377,13 @@ export function pointPrecipitationRates(
           : NaN;
         continue;
       }
-      const currentMillimeters = toMillimeters!(current);
-      const amount = cumulative
+      const currentMillimeters = normalization.toMillimeters(current);
+      const amount = normalization.kind === "cumulative"
         ? (() => {
           const previousMillimeters = leadIndex > 0
-            ? toMillimeters!(Number(values[offset - memberCount]))
+            ? normalization.toMillimeters(
+              Number(values[offset - memberCount]),
+            )
             : currentMillimeters === 0
               ? 0
               : NaN;
@@ -410,7 +404,7 @@ export function pointPrecipitationRates(
   return {
     values: rateValues,
     amounts: amountValues,
-    unit: "mm/h",
+    unit: PRECIPITATION_RATE_UNIT,
   };
 }
 

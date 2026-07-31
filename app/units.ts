@@ -125,6 +125,34 @@ function isPrecipitation(context = "") {
   return /(precip|rainfall|snowfall|water[_ ]equivalent)/i.test(context);
 }
 
+type PrecipitationRateUnit = {
+  amountUnit: string;
+  seconds: number;
+};
+
+function precipitationRateUnit(unit: string): PrecipitationRateUnit | null {
+  const normalized = unit
+    .trim()
+    .replaceAll("**", "^")
+    .replaceAll(/\s+/g, " ");
+  const rateSuffixes: Array<{
+    pattern: RegExp;
+    seconds: number;
+  }> = [
+    { pattern: /^(.*?)(?:\s+|\*)s(?:\^)?-1$/i, seconds: 1 },
+    { pattern: /^(.*?)\/(?:s|sec|second)s?$/i, seconds: 1 },
+    { pattern: /^(.*?)(?:\s+|\*)(?:h|hr|hour)(?:\^)?-1$/i, seconds: 3600 },
+    { pattern: /^(.*?)\/(?:h|hr|hour)s?$/i, seconds: 3600 },
+    { pattern: /^(.*?)(?:\s+|\*)d(?:\^)?-1$/i, seconds: 86400 },
+    { pattern: /^(.*?)\/(?:d|day)s?$/i, seconds: 86400 },
+  ];
+  for (const { pattern, seconds } of rateSuffixes) {
+    const amountUnit = normalized.match(pattern)?.[1]?.trim();
+    if (amountUnit) return { amountUnit, seconds };
+  }
+  return null;
+}
+
 function quantity(unit: string) {
   const normalized = normalizeUnit(unit);
   if (!normalized || SPECIAL_UNITS[normalized]) return null;
@@ -179,6 +207,9 @@ export function unitKind(unit: string, context = "") {
   const normalized = normalizeUnit(unit);
   const specialKind = normalized ? SPECIAL_UNITS[normalized]?.kind : undefined;
   if (specialKind) return specialKind;
+  if (isPrecipitation(context) && precipitationRateUnit(unit)) {
+    return "precipitation_rate";
+  }
   const kind = parsedUnit(unit)?.kind();
   if (!isPrecipitation(context)) return kind;
   if (kind === "length" || kind === "area_density") return "precipitation";
@@ -200,6 +231,7 @@ export function unitOptions(unit: string, context = ""): UnitOption[] {
 
   if (
     normalized
+    && unitKind(unit, context) !== "precipitation_rate"
     && !compatible.some((candidate) => candidate.id === normalized)
   ) {
     compatible.unshift({ id: normalized, label: unit });
@@ -231,6 +263,27 @@ export function unitConverter(
     }
     return (value) => value * sourceSpecial.factor / targetSpecial.factor;
   }
+  if (isPrecipitation(context)) {
+    const sourceRate = precipitationRateUnit(sourceUnit);
+    const targetRate = precipitationRateUnit(targetUnit);
+    if (sourceRate || targetRate) {
+      if (!sourceRate || !targetRate) return null;
+      const sourceToMillimeters = unitConverter(
+        sourceRate.amountUnit,
+        "mm",
+        context,
+      );
+      const millimetersToTarget = unitConverter(
+        "mm",
+        targetRate.amountUnit,
+        context,
+      );
+      if (!sourceToMillimeters || !millimetersToTarget) return null;
+      return (value) => millimetersToTarget(
+        sourceToMillimeters(value) * targetRate.seconds / sourceRate.seconds,
+      );
+    }
+  }
   const waterEquivalent = waterEquivalentConverter(
     sourceUnit,
     targetUnit,
@@ -256,38 +309,12 @@ export function precipitationRateConverter(
   context = "",
 ): ((value: number, durationSeconds: number) => number) | null {
   if (!isPrecipitation(context)) return null;
-
-  const direct = unitConverter(sourceUnit, "mm/s", context);
-  if (direct) {
-    return (value, durationSeconds) => direct(value) * durationSeconds;
-  }
-
-  const normalized = sourceUnit
-    .trim()
-    .replaceAll("**", "^")
-    .replaceAll(/\s+/g, " ");
-  const rateSuffixes: Array<{
-    pattern: RegExp;
-    seconds: number;
-  }> = [
-    { pattern: /^(.*?)(?:\s+|\*)s(?:\^)?-1$/i, seconds: 1 },
-    { pattern: /^(.*?)\/(?:s|sec|second)s?$/i, seconds: 1 },
-    { pattern: /^(.*?)(?:\s+|\*)(?:h|hr|hour)(?:\^)?-1$/i, seconds: 3600 },
-    { pattern: /^(.*?)\/(?:h|hr|hour)s?$/i, seconds: 3600 },
-    { pattern: /^(.*?)(?:\s+|\*)d(?:\^)?-1$/i, seconds: 86400 },
-    { pattern: /^(.*?)\/(?:d|day)s?$/i, seconds: 86400 },
-  ];
-  for (const { pattern, seconds } of rateSuffixes) {
-    const match = normalized.match(pattern);
-    const amountUnit = match?.[1]?.trim();
-    if (!amountUnit) continue;
-    const toMillimeters = unitConverter(amountUnit, "mm", context);
-    if (toMillimeters) {
-      return (value, durationSeconds) =>
-        toMillimeters(value) * durationSeconds / seconds;
-    }
-  }
-  return null;
+  const rate = precipitationRateUnit(sourceUnit);
+  if (!rate) return null;
+  const toMillimeters = unitConverter(rate.amountUnit, "mm", context);
+  if (!toMillimeters) return null;
+  return (value, durationSeconds) =>
+    toMillimeters(value) * durationSeconds / rate.seconds;
 }
 
 export function precipitationRateUnitOption(

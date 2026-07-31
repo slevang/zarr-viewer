@@ -38,6 +38,11 @@ assert.match(
   /"Cross-Origin-Opener-Policy", "same-origin"/,
   "Normal pages do not enable cross-origin isolation",
 );
+assert.match(
+  serviceWorker,
+  /doReload: \(\) => \{\}/,
+  "Static pages should enter cross-origin isolation only on demand",
+);
 
 const bundles = await Promise.all(scripts.map((name) => readFile(new URL(`assets/${name}`, output), "utf8")));
 assert.ok(bundles.some((bundle) => bundle.includes(`${base}coastline.geojson`)), "Coastline URL does not honor BASE_PATH");

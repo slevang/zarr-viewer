@@ -11,6 +11,7 @@ import {
   accumulatedToStepValues,
   derivedLayerOptions,
   variableLayerOptions,
+  variableLayerUnit,
 } from "../app/derived-store";
 import {
   forecastQuantiles,
@@ -406,7 +407,10 @@ const sourceStore: Readable = {
   },
 };
 const dataset = getDataset("weatherzarr-ecmwf-ifs");
-const source = dataset.sources.map!;
+const source = {
+  ...dataset.sources.map!,
+  spatialCoordinates: undefined,
+};
 const info: StoreInfo = {
   dataset,
   source,
@@ -468,20 +472,23 @@ const precipitationLayerOptions = await variableLayerOptions(
   precipitationVariable,
 );
 if (!precipitationLayerOptions.store) {
-  throw new Error("Step precipitation layer did not provide a virtual store");
+  throw new Error("Precipitation-rate layer did not provide a virtual store");
 }
-const stepPrecipitationArray = await zarr.open(
+if (variableLayerUnit(precipitationInfo, precipitationVariable) !== "mm/h") {
+  throw new Error("Precipitation layer did not expose its normalized rate unit");
+}
+const ratePrecipitationArray = await zarr.open(
   zarr.root(precipitationLayerOptions.store).resolve(precipitationVariable.id),
   { kind: "array" },
 );
-const stepPrecipitationResult = await zarr.get(stepPrecipitationArray);
-const expectedStepPrecipitation = [
+const ratePrecipitationResult = await zarr.get(ratePrecipitationArray);
+const expectedStepAmounts = [
   0, 1, 0, 2, 0, 0,
   2, 3, 1, 0, 3, 0,
   3, 0, 0, 4, 1, 8,
 ];
-Array.from(stepPrecipitationResult.data as ArrayLike<number>).forEach(
-  (value, index) => close(value, expectedStepPrecipitation[index]),
+Array.from(ratePrecipitationResult.data as ArrayLike<number>).forEach(
+  (value, index) => close(value, expectedStepAmounts[index] * 1000 / 3, 1e-4),
 );
 
 sourceReadCounts.clear();

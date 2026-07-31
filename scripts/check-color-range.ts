@@ -58,6 +58,30 @@ if (
   );
 }
 
+const precipitationRate = createFiniteValueSample();
+addFiniteValues(precipitationRate, [
+  ...Array.from({ length: 9_000 }, () => 0.001),
+  ...Array.from({ length: 900 }, () => 0.1),
+  ...Array.from({ length: 90 }, () => 1),
+  ...Array.from({ length: 10 }, () => 10),
+]);
+const precipitationRateRange = robustColorRange(
+  precipitationRate,
+  variable("tp", "Total precipitation", "kg m-2 s-1"),
+  "mm/h",
+);
+if (
+  !precipitationRateRange
+  || precipitationRateRange[0] !== 0
+  || precipitationRateRange[1] !== 5
+) {
+  throw new Error(
+    `Numerical drizzle controlled the precipitation rate range: ${
+      precipitationRateRange
+    }`,
+  );
+}
+
 const dryPrecipitation = createFiniteValueSample();
 addFiniteValues(dryPrecipitation, [0, 0, 0]);
 if (

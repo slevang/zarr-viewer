@@ -1,4 +1,10 @@
 import type { VariableConfig } from "./data/types";
+import {
+  PRECIPITATION_RATE_DEFAULT_MAX_MM_H,
+  PRECIPITATION_RATE_UNIT,
+  PRECIPITATION_RATE_VISIBILITY_THRESHOLD_MM_H,
+} from "./precipitation";
+import { unitConverter } from "./units";
 import { isHrrrSmokeVariable } from "./viewer/smoke";
 
 export type FiniteValueSample = {
@@ -118,6 +124,7 @@ function startsAtZero(variable: VariableConfig) {
 export function robustColorRange(
   sample: FiniteValueSample,
   variable: VariableConfig,
+  valueUnit = variable.unit,
 ): [number, number] | null {
   if (!sample.values.length) return null;
   const sorted = [...sample.values].sort((left, right) => left - right);
@@ -129,14 +136,40 @@ export function robustColorRange(
 
   let lower: number;
   let upper: number;
-  if (isPrecipitation(variable) || isHrrrSmokeVariable(variable)) {
+  if (isPrecipitation(variable)) {
+    const context = `${variable.id} ${variable.label} ${variable.standardName ?? ""}`;
+    const convertVisibilityThreshold = unitConverter(
+      PRECIPITATION_RATE_UNIT,
+      valueUnit,
+      context,
+    );
+    const visibilityThreshold = convertVisibilityThreshold
+      ? convertVisibilityThreshold(
+        PRECIPITATION_RATE_VISIBILITY_THRESHOLD_MM_H,
+      )
+      : 0;
+    const minimumUpper = convertVisibilityThreshold
+      ? convertVisibilityThreshold(PRECIPITATION_RATE_DEFAULT_MAX_MM_H)
+      : 0;
+    const positive = sorted.filter((value) => value > visibilityThreshold);
+    if (!positive.length) return null;
+    lower = 0;
+    const wetPixelUpper = quantile(positive, 0.99);
+    upper = Math.max(
+      minimumUpper,
+      Math.min(
+        positive[positive.length - 1],
+        wetPixelUpper * 1.1,
+      ),
+    );
+  } else if (isHrrrSmokeVariable(variable)) {
     const positive = sorted.filter((value) => value > 0);
     if (!positive.length) return null;
     lower = 0;
-    const wetPixelUpper = quantile(positive, 0.95);
+    const smokePixelUpper = quantile(positive, 0.95);
     upper = Math.min(
       positive[positive.length - 1],
-      wetPixelUpper * 1.05,
+      smokePixelUpper * 1.05,
     );
   } else {
     const temperature = isTemperature(variable);

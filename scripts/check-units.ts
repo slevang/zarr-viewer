@@ -85,6 +85,34 @@ if (!hrrrRateConverter) {
   throw new Error("HRRR precipitation flux did not expose a step converter");
 }
 close(hrrrRateConverter(1e-5, 3600), 0.036);
+const dynamicalPrecipitationContext =
+  "precipitation_surface Precipitation rate precipitation_flux";
+if (
+  unitKind("kg m-2 s-1", dynamicalPrecipitationContext)
+    !== "precipitation_rate"
+  || unitOptions("kg m-2 s-1", dynamicalPrecipitationContext)
+    .map((option) => option.id).join(",") !== "mm/h,in/h"
+) {
+  throw new Error("Dynamical precipitation rate units were not recognized");
+}
+close(
+  convertUnitValue(
+    1e-5,
+    "kg m-2 s-1",
+    "mm/h",
+    dynamicalPrecipitationContext,
+  ),
+  0.036,
+);
+close(
+  convertUnitValue(
+    25.4 / 3600,
+    "mm/h",
+    "in/h",
+    dynamicalPrecipitationContext,
+  ),
+  1 / 3600,
+);
 const precipitationRateOptions = unitOptions(
   "mm/h",
   "Precipitation rate",

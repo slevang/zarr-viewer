@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import "maplibre-gl/dist/maplibre-gl.css";
 import {
   COLORMAPS,
@@ -13,7 +19,10 @@ import {
 import { commonVariableMatches } from "./common-variables";
 import { DeferredCalendarInput } from "./components/DeferredCalendarInput";
 import { ViewerOptions } from "./components/ViewerOptions";
-import { variableLayerOptions } from "./derived-store";
+import {
+  variableLayerOptions,
+  variableLayerUnit,
+} from "./derived-store";
 import { derivedDisplayId } from "./derived-variables";
 import {
   DATASETS,
@@ -28,10 +37,7 @@ import {
   SeriesComparison,
   type ComparisonSeriesEntry,
 } from "./SeriesComparison";
-import {
-  Meteogram,
-  type MeteogramFields,
-} from "./Meteogram";
+import { Meteogram, type MeteogramFields } from "./Meteogram";
 import {
   ASOS_MANIFEST_URL,
   ASOS_SERIES_COLOR,
@@ -46,6 +52,7 @@ import {
   axisValueAsDate,
   defaultSelections,
   formatAxisValue,
+  preserveForecastLeadSelection,
   reconcileSelections,
   selectionsAfterAxisChange,
   selectionsForValidDate,
@@ -98,10 +105,11 @@ import {
   runDatasetPreloads,
 } from "./viewer/dataset-preload";
 import {
-  baseViewerUrl,
+  clearRememberedDatasetForReload,
   hasRequestedDataset,
   initialDatasetId,
   initialViewerLocation,
+  rememberDatasetForReload,
   storeUnitPreferences,
   storedUnitPreferences,
   viewerShareUrl,
@@ -179,6 +187,7 @@ const ASOS_HIT_LAYER_ID = "asos-station-hits";
 const DEFAULT_CENTER: [number, number] = [-98, 38.5];
 const DEFAULT_ZOOM = 1.75;
 const MOBILE_DEFAULT_ZOOM = 1.25;
+const DATASET_PRELOAD_DELAY_MS = 1_500;
 const READY_STATE: LoadState = { phase: "ready", message: "Ready" };
 const MAP_DATASETS = DATASETS.filter(hasMapSource);
 const TIME_SERIES_DATASETS = DATASETS.filter(hasSeriesSource);
@@ -195,6 +204,31 @@ const FULL_IMAGE_GEOMETRIES = [
     [west, -89.999],
   ]],
 }));
+async function navigateToIsolatedDataset(datasetId: string) {
+  const serviceWorker = navigator.serviceWorker;
+  if (!serviceWorker) {
+    throw new Error("This browser cannot prepare the isolated HRRR decoder");
+  }
+  await serviceWorker.ready;
+  if (!serviceWorker.controller) {
+    await new Promise<void>((resolve, reject) => {
+      const timeout = window.setTimeout(() => {
+        serviceWorker.removeEventListener("controllerchange", onControllerChange);
+        reject(new Error("The isolated HRRR decoder did not become ready"));
+      }, 10_000);
+      const onControllerChange = () => {
+        if (!serviceWorker.controller) return;
+        window.clearTimeout(timeout);
+        serviceWorker.removeEventListener("controllerchange", onControllerChange);
+        resolve();
+      };
+      serviceWorker.addEventListener("controllerchange", onControllerChange);
+      onControllerChange();
+    });
+  }
+  rememberDatasetForReload(datasetId);
+  window.location.reload();
+}
 
 async function copyTextToClipboard(text: string) {
   if (navigator.clipboard?.writeText) {
@@ -348,11 +382,7 @@ export function ZarrViewer() {
     return () => window.removeEventListener("popstate", restoreMobileScreen);
   }, []);
   useEffect(() => {
-    window.history.replaceState(
-      window.history.state,
-      "",
-      baseViewerUrl(window.location.href),
-    );
+    clearRememberedDatasetForReload();
     return () => {
       if (shareStatusTimerRef.current !== null) {
         window.clearTimeout(shareStatusTimerRef.current);
@@ -369,15 +399,18 @@ export function ZarrViewer() {
     && hasGoogleAccessToken();
   const ecmwfAuthRequired = dataset.sources.map?.auth === "cds-api-key";
   const ecmwfConnected = hasCdsApiKey();
+  const activeVariableUnit = info && variable
+    ? variableLayerUnit(info, variable)
+    : variable?.unit ?? "";
   const variableUnitContext = variable
     ? `${variable.id} ${variable.label} ${variable.standardName ?? ""}`
     : "";
   const availableUnitOptions = useMemo(
-    () => variable ? unitOptions(variable.unit, variableUnitContext) : [],
-    [variable, variableUnitContext],
+    () => variable ? unitOptions(activeVariableUnit, variableUnitContext) : [],
+    [activeVariableUnit, variable, variableUnitContext],
   );
   const currentUnitKind = variable
-    ? unitKind(variable.unit, variableUnitContext)
+    ? unitKind(activeVariableUnit, variableUnitContext)
     : undefined;
   const selectedUnit = useMemo<UnitOption | null>(() => {
     if (!variable) return null;
@@ -386,7 +419,7 @@ export function ZarrViewer() {
       : undefined;
     return availableUnitOptions.find((option) => option.id === urlDisplayUnit)
       ?? availableUnitOptions.find((option) => option.id === preferred)
-      ?? nativeUnitOption(variable.unit, variableUnitContext)
+      ?? nativeUnitOption(activeVariableUnit, variableUnitContext)
       ?? availableUnitOptions[0]
       ?? null;
   }, [
@@ -394,6 +427,7 @@ export function ZarrViewer() {
     currentUnitKind,
     unitPreferences,
     urlDisplayUnit,
+    activeVariableUnit,
     variable,
     variableUnitContext,
   ]);
@@ -408,6 +442,7 @@ export function ZarrViewer() {
   const meteogramPrecipitationUnit = useMemo(
     () => precipitationRateUnitOption(
       currentUnitKind === "precipitation"
+          || currentUnitKind === "precipitation_rate"
         ? selectedUnit?.id
         : unitPreferences.precipitation,
     ),
@@ -482,6 +517,12 @@ export function ZarrViewer() {
       ? selectedValidDate(info, variable, selections)
       : undefined),
     [info, selections, unavailableMapDate, variable],
+  );
+  const initialDatasetTargetDate = useMemo(
+    () => Object.values(initialLocation.axisValues)
+      .map((value) => new Date(value))
+      .find((date) => Number.isFinite(date.getTime())),
+    [initialLocation.axisValues],
   );
   const forecastValidDate = dataset.category === "forecast"
     && selectedMapValidDate
@@ -1370,7 +1411,11 @@ export function ZarrViewer() {
         generation !== rangeGeneration.current
         || variableRef.current?.id !== currentVariable.id
       ) return;
-      const estimatedRange = robustColorRange(sample, currentVariable);
+      const estimatedRange = robustColorRange(
+        sample,
+        currentVariable,
+        variableLayerUnit(currentInfo, currentVariable),
+      );
       const rangeFromData = estimatedRange
         ? roundRangeToSignificant(estimatedRange)
         : null;
@@ -1393,6 +1438,32 @@ export function ZarrViewer() {
     document.addEventListener("pointerdown", closeColormap);
     return () => document.removeEventListener("pointerdown", closeColormap);
   }, []);
+
+  useEffect(() => {
+    if (
+      (googleAuthRequired && !googleConnected)
+      || (ecmwfAuthRequired && !ecmwfConnected)
+      || (
+        dataset.sources.map?.requiresCrossOriginIsolation
+        && !window.crossOriginIsolated
+      )
+    ) return;
+    void loadStoreInfo(
+      datasetId,
+      "map",
+      rememberedValidDateRef.current ?? initialDatasetTargetDate,
+    ).catch(() => {
+      // The foreground installer reports errors once the map can show them.
+    });
+  }, [
+    datasetId,
+    dataset.sources.map?.requiresCrossOriginIsolation,
+    ecmwfAuthRequired,
+    ecmwfConnected,
+    googleAuthRequired,
+    googleConnected,
+    initialDatasetTargetDate,
+  ]);
 
   useEffect(() => {
     if (!mapContainerRef.current || mapRef.current) return;
@@ -1480,26 +1551,8 @@ export function ZarrViewer() {
         if (station) startAsosComparisonRef.current(station);
       };
 
-      map.on("load", () => {
+      map.on("style.load", () => {
         if (disposed) return;
-        const firstSymbol = map.getStyle().layers?.find(
-          (candidate) => candidate.type === "symbol",
-        )?.id;
-        map.addSource("coastline", {
-          type: "geojson",
-          data: `${import.meta.env.BASE_URL}coastline.geojson`,
-          attribution: "Coastline © Natural Earth",
-        });
-        map.addLayer({
-          id: "basemap-coastline",
-          type: "line",
-          source: "coastline",
-          paint: {
-            "line-color": "hsl(248, 2%, 56%)",
-            "line-opacity": ["interpolate", ["linear"], ["zoom"], 0, 0.7, 4, 0.95],
-            "line-width": ["interpolate", ["linear"], ["zoom"], 0, 0.8, 5, 1.15],
-          },
-        }, firstSymbol);
         setMapReady(true);
       });
 
@@ -1550,6 +1603,29 @@ export function ZarrViewer() {
     initialLocation.zoom,
     refreshInspection,
   ]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!firstDatasetFrameReady || !map || map.getSource("coastline")) return;
+    const firstSymbol = map.getStyle().layers?.find(
+      (candidate) => candidate.type === "symbol",
+    )?.id;
+    map.addSource("coastline", {
+      type: "geojson",
+      data: `${import.meta.env.BASE_URL}coastline.geojson`,
+      attribution: "Coastline © Natural Earth",
+    });
+    map.addLayer({
+      id: "basemap-coastline",
+      type: "line",
+      source: "coastline",
+      paint: {
+        "line-color": "hsl(248, 2%, 56%)",
+        "line-opacity": ["interpolate", ["linear"], ["zoom"], 0, 0.7, 4, 0.95],
+        "line-width": ["interpolate", ["linear"], ["zoom"], 0, 0.8, 5, 1.15],
+      },
+    }, firstSymbol);
+  }, [firstDatasetFrameReady]);
 
   useEffect(() => {
     if (stationsVisible) stationSearchInputRef.current?.focus();
@@ -1670,6 +1746,8 @@ export function ZarrViewer() {
       const previousVariable = useDatasetDefaults
         ? null
         : variableRef.current;
+      const previousInfo = useDatasetDefaults ? null : infoRef.current;
+      const previousSelections = { ...selectionsRef.current };
       useDatasetDefaultsRef.current = false;
       weatherNextStoreGenerationRef.current += 1;
       setPlayingAxis(null);
@@ -1680,6 +1758,14 @@ export function ZarrViewer() {
       setUnavailableMapDate(null);
       setInfo(null);
       setVariable(null);
+      if (
+        dataset.sources.map?.requiresCrossOriginIsolation
+        && !window.crossOriginIsolated
+      ) {
+        setLoadState(loadingState("Preparing HRRR decoder…"));
+        await navigateToIsolatedDataset(datasetId);
+        return;
+      }
       if (googleAuthRequired && !hasGoogleAccessToken()) {
         const map = mapRef.current;
         if (map?.getLayer(ZARR_LAYER_ID)) map.removeLayer(ZARR_LAYER_ID);
@@ -1700,15 +1786,14 @@ export function ZarrViewer() {
         });
         return;
       }
-      const initialTargetDate = !urlSelectionsAppliedRef.current
-        ? Object.values(initialLocation.axisValues)
-          .map((value) => new Date(value))
-          .find((date) => Number.isFinite(date.getTime()))
-        : undefined;
       const nextInfo = await loadStoreInfo(
         datasetId,
         "map",
-        rememberedValidDateRef.current ?? initialTargetDate,
+        rememberedValidDateRef.current ?? (
+          !urlSelectionsAppliedRef.current
+            ? initialDatasetTargetDate
+            : undefined
+        ),
       );
       if (cancelled) return;
       const urlRequestedVariable = !urlSelectionsAppliedRef.current
@@ -1739,6 +1824,20 @@ export function ZarrViewer() {
         nextInfo.axes[dimension]?.kind === "timedelta"
         && initialLocation.axisValues[dimension] !== undefined
       );
+      if (
+        !hasRequestedLead
+        && previousInfo
+        && previousVariable
+      ) {
+        nextSelections = preserveForecastLeadSelection(
+          previousInfo,
+          previousVariable,
+          previousSelections,
+          nextInfo,
+          nextVariable,
+          nextSelections,
+        );
+      }
       if (startAtFirstLead && !hasRequestedLead) {
         nextSelections = meteogramStartSelections(
           nextInfo,
@@ -1797,6 +1896,7 @@ export function ZarrViewer() {
         )
         : undefined;
       const nextColormap = urlColormap ?? defaultColormap(nextVariable);
+      const nextLayerUnit = variableLayerUnit(nextInfo, nextVariable);
       const rangeKey = displayRangeKey(nextInfo.dataset.id, nextVariable.id);
       const cachedDisplayRange = displayRangesRef.current.get(rangeKey);
       const urlDisplayRange = !urlDisplayAppliedRef.current
@@ -1806,7 +1906,7 @@ export function ZarrViewer() {
         ? [...urlDisplayRange] as [number, number]
         : cachedDisplayRange
         ? [...cachedDisplayRange] as [number, number]
-        : initialDisplayRange(nextVariable);
+        : initialDisplayRange(nextVariable, nextLayerUnit);
       urlDisplayAppliedRef.current = true;
       const map = mapRef.current;
       if (!map) return;
@@ -1852,7 +1952,7 @@ export function ZarrViewer() {
         clim: nextDisplayRange,
         opacity: opacityRef.current,
         ...nextLayerOptions,
-        ...variableRenderingOptions(nextVariable),
+        ...variableRenderingOptions(nextVariable, nextLayerUnit),
         onLoadingStateChange: (loading) => {
           if (loading.error) setLoadState(errorState(loading.error));
           else if (loading.loading) setLoadState(loadingState());
@@ -1919,6 +2019,7 @@ export function ZarrViewer() {
   }, [
     datasetId,
     dataset.sources.map?.meteogram?.kind,
+    dataset.sources.map?.requiresCrossOriginIsolation,
     ecmwfAuthRequired,
     ecmwfConnected,
     googleAuthRequired,
@@ -1928,6 +2029,7 @@ export function ZarrViewer() {
     initialLocation.displayRange,
     initialLocation.station,
     initialLocation.variableId,
+    initialDatasetTargetDate,
     mapInstallRevision,
     mapReady,
   ]);
@@ -1941,50 +2043,58 @@ export function ZarrViewer() {
     const authKey = availableAuth.join(",") || "public";
     if (authKey === "public") {
       if (publicDatasetPreloadStartedRef.current) return;
-      publicDatasetPreloadStartedRef.current = true;
     } else {
       if (datasetPreloadAuthKeysRef.current.has(authKey)) return;
-      datasetPreloadAuthKeysRef.current.add(authKey);
     }
 
-    const initializationAxis = Object.values(info.axes).find(
-      (axis) => axis.kind === "time" && axis.requiresStoreReload,
-    );
-    const activeDatasetTargetDate = initializationAxis
-      ? axisValueAsDate(
-        info.dataset,
-        initializationAxis,
-        selections[initializationAxis.id]
-          ?? initializationAxis.defaultIndex
-          ?? 0,
-      )
-      : rememberedValidDateRef.current;
-    const requests = datasetPreloadRequests(DATASETS, {
-      activeDatasetId: info.dataset.id,
-      targetDate: rememberedValidDateRef.current,
-      activeDatasetTargetDate,
-      availableAuth,
-    });
-    void runDatasetPreloads(
-      requests,
-      async ({ datasetId: preloadDatasetId, role, targetDate }) => {
-        const preloadInfo = await loadStoreInfo(
-          preloadDatasetId,
-          role,
-          targetDate,
-        );
-        if (role === "series") {
-          await preloadPointSeriesCoordinates(preloadInfo);
-        }
-      },
-    ).then((failures) => {
-      if (failures.length) {
-        console.debug(
-          `Background dataset preload skipped ${failures.length} store(s)`,
-          failures,
-        );
+    const timeout = window.setTimeout(() => {
+      if (authKey === "public") {
+        if (publicDatasetPreloadStartedRef.current) return;
+        publicDatasetPreloadStartedRef.current = true;
+      } else {
+        if (datasetPreloadAuthKeysRef.current.has(authKey)) return;
+        datasetPreloadAuthKeysRef.current.add(authKey);
       }
-    });
+      const initializationAxis = Object.values(info.axes).find(
+        (axis) => axis.kind === "time" && axis.requiresStoreReload,
+      );
+      const activeDatasetTargetDate = initializationAxis
+        ? axisValueAsDate(
+          info.dataset,
+          initializationAxis,
+          selections[initializationAxis.id]
+            ?? initializationAxis.defaultIndex
+            ?? 0,
+        )
+        : rememberedValidDateRef.current;
+      const requests = datasetPreloadRequests(DATASETS, {
+        activeDatasetId: info.dataset.id,
+        targetDate: rememberedValidDateRef.current,
+        activeDatasetTargetDate,
+        availableAuth,
+      });
+      void runDatasetPreloads(
+        requests,
+        async ({ datasetId: preloadDatasetId, role, targetDate }) => {
+          const preloadInfo = await loadStoreInfo(
+            preloadDatasetId,
+            role,
+            targetDate,
+          );
+          if (role === "series") {
+            await preloadPointSeriesCoordinates(preloadInfo);
+          }
+        },
+      ).then((failures) => {
+        if (failures.length) {
+          console.debug(
+            `Background dataset preload skipped ${failures.length} store(s)`,
+            failures,
+          );
+        }
+      });
+    }, DATASET_PRELOAD_DELAY_MS);
+    return () => window.clearTimeout(timeout);
   }, [
     firstDatasetFrameReady,
     ecmwfConnected,
@@ -2117,11 +2227,13 @@ export function ZarrViewer() {
       )
       : reconciledSelections;
     const nextColormap = defaultColormap(nextVariable);
+    const currentLayerUnit = variableLayerUnit(info, variable);
+    const nextLayerUnit = variableLayerUnit(info, nextVariable);
     const rangeKey = displayRangeKey(info.dataset.id, nextVariable.id);
     const cachedDisplayRange = displayRangesRef.current.get(rangeKey);
     const nextDisplayRange = cachedDisplayRange
       ? [...cachedDisplayRange] as [number, number]
-      : initialDisplayRange(nextVariable);
+      : initialDisplayRange(nextVariable, nextLayerUnit);
     variableRef.current = nextVariable;
     selectionsRef.current = nextSelections;
     rememberedValidDateRef.current = selectedValidDate(
@@ -2145,7 +2257,8 @@ export function ZarrViewer() {
       if (
         variable.derived
         || nextVariable.derived
-        || variableFragmentShader(variable) !== variableFragmentShader(nextVariable)
+        || variableFragmentShader(variable, currentLayerUnit)
+          !== variableFragmentShader(nextVariable, nextLayerUnit)
       ) {
         const map = mapRef.current;
         if (!map) return;
@@ -2161,7 +2274,7 @@ export function ZarrViewer() {
           clim: nextDisplayRange,
           opacity: opacityRef.current,
           ...nextLayerOptions,
-          ...variableRenderingOptions(nextVariable),
+          ...variableRenderingOptions(nextVariable, nextLayerUnit),
           onLoadingStateChange: (loading) => {
             if (generation !== requestGeneration.current) return;
             if (loading.error) setLoadState(errorState(loading.error));
@@ -2224,6 +2337,7 @@ export function ZarrViewer() {
       ) ?? nextInfo.variables.find(
         (candidate) => candidate.id === nextInfo.dataset.defaultVariable,
       ) ?? nextInfo.variables[0];
+      const nextLayerUnit = variableLayerUnit(nextInfo, nextVariable);
       const physicalSelections = { ...desiredSelections };
       for (const axis of Object.values(nextInfo.axes)) {
         if (axis.requiresStoreReload) delete physicalSelections[axis.id];
@@ -2257,7 +2371,7 @@ export function ZarrViewer() {
         clim: activeDisplayRange,
         opacity: opacityRef.current,
         ...nextLayerOptions,
-        ...variableRenderingOptions(nextVariable),
+        ...variableRenderingOptions(nextVariable, nextLayerUnit),
         onLoadingStateChange: (loading) => {
           if (generation !== weatherNextStoreGenerationRef.current) return;
           if (loading.error) setLoadState(errorState(loading.error));
@@ -2619,7 +2733,7 @@ export function ZarrViewer() {
           ? convertUnitRange(
             updated,
             selectedUnit.id,
-            variable.unit,
+            activeVariableUnit,
             variableUnitContext,
           )
           : updated);
@@ -2693,14 +2807,14 @@ export function ZarrViewer() {
   const [legendMin, legendMax] = variable && selectedUnit
     ? convertUnitRange(
       activeDisplayRange,
-      variable.unit,
+      activeVariableUnit,
       selectedUnit.id,
       variableUnitContext,
     )
     : activeDisplayRange;
   const legendMid = (legendMin + legendMax) / 2;
   const legendDecimals = decimalsForRange([legendMin, legendMax]);
-  const displayUnitLabel = selectedUnit?.label ?? variable?.unit ?? "";
+  const displayUnitLabel = selectedUnit?.label ?? activeVariableUnit;
   const inspectorDisplayValue = (
     inspector?.value !== null
     && inspector?.value !== undefined
@@ -2709,7 +2823,7 @@ export function ZarrViewer() {
   )
     ? convertUnitValue(
       inspector.value,
-      variable.unit,
+      activeVariableUnit,
       selectedUnit.id,
       variableUnitContext,
     )

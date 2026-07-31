@@ -2,8 +2,11 @@ import type { Selector } from "@carbonplan/zarr-layer";
 import {
   getDatasetSource,
   type DatasetConfig,
+  type DatasetSourceConfig,
 } from "../catalog";
 import {
+  isLatitudeDimension,
+  isLongitudeDimension,
   isInitializationDimension,
   isValidTimeDimension,
 } from "./dimensions";
@@ -16,6 +19,35 @@ import type {
 
 const HOUR_MS = 60 * 60 * 1000;
 const SERIES_LOOKAHEAD_HOURS = 15 * 24;
+const DEFAULT_FORECAST_LEAD_INDEX = 1;
+
+export function regularSpatialCoordinateValues(
+  source: DatasetSourceConfig,
+  dimension: string,
+  length: number,
+) {
+  if (
+    source.spatialCoordinates !== "regular-global"
+    || !source.bounds
+    || length <= 0
+  ) return undefined;
+  const [west, south, east, north] = source.bounds;
+  if (isLatitudeDimension(dimension, source)) {
+    if (length === 1) return [source.latIsAscending === false ? north : south];
+    const step = (north - south) / (length - 1);
+    return Array.from(
+      { length },
+      (_, index) => source.latIsAscending === false
+        ? north - index * step
+        : south + index * step,
+    );
+  }
+  if (isLongitudeDimension(dimension, source)) {
+    const step = (east - west) / length;
+    return Array.from({ length }, (_, index) => west + index * step);
+  }
+  return undefined;
+}
 
 export function timedeltaMilliseconds(axis: AxisConfig, index: number) {
   const value = Number(axis.values[index]);
@@ -62,7 +94,9 @@ export function defaultSelections(info: StoreInfo, variable: VariableConfig): Ax
         0,
         axis.values.length - (historicalSeries ? SERIES_LOOKAHEAD_HOURS : 1),
       )
-      : 0;
+      : axis.kind === "timedelta" && info.dataset.category === "forecast"
+        ? Math.min(DEFAULT_FORECAST_LEAD_INDEX, axis.values.length - 1)
+        : 0;
   }
   for (const axis of Object.values(info.axes)) {
     if (axis.requiresStoreReload) {
@@ -111,6 +145,31 @@ function temporalDimensions(info: StoreInfo, variable: VariableConfig) {
     (dimension) => info.axes[dimension]?.kind === "timedelta",
   );
   return { valid, initialization, lead };
+}
+
+export function preserveForecastLeadSelection(
+  previousInfo: StoreInfo,
+  previousVariable: VariableConfig,
+  previousSelections: AxisSelection,
+  nextInfo: StoreInfo,
+  nextVariable: VariableConfig,
+  nextSelections: AxisSelection,
+) {
+  const previousLead = temporalDimensions(previousInfo, previousVariable).lead;
+  const nextLead = temporalDimensions(nextInfo, nextVariable).lead;
+  if (!previousLead || !nextLead) return nextSelections;
+  const previousIndex = previousSelections[previousLead];
+  const nextAxis = nextInfo.axes[nextLead];
+  if (previousIndex === undefined || !nextAxis?.values.length) {
+    return nextSelections;
+  }
+  return {
+    ...nextSelections,
+    [nextLead]: Math.max(
+      0,
+      Math.min(nextAxis.values.length - 1, previousIndex),
+    ),
+  };
 }
 
 export function validDateRange(

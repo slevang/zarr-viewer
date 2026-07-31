@@ -7,7 +7,10 @@ import {
   loadStoreInfo,
 } from "../app/dataset";
 import { isSpatialDimension } from "../app/data/dimensions";
-import { variableLayerOptions } from "../app/derived-store";
+import {
+  variableLayerOptions,
+  variableLayerUnit,
+} from "../app/derived-store";
 
 await initializePcodec(
   await readFile(
@@ -93,33 +96,36 @@ const precipitationLayerOptions = await variableLayerOptions(
   weatherZarr,
   weatherZarrPrecipitation,
 );
-const stepPrecipitationArray = await zarr.open(
+const ratePrecipitationArray = await zarr.open(
   zarr.root(precipitationLayerOptions.store!).resolve(
     weatherZarrPrecipitation.id,
   ),
   { kind: "array" },
 );
-const stepPrecipitation = await zarr.get(
-  stepPrecipitationArray,
+const ratePrecipitation = await zarr.get(
+  ratePrecipitationArray,
   precipitationCurrentSelection,
 );
 const rawPreviousPrecipitationValue = scalarValue(rawPreviousPrecipitation);
 const rawCurrentPrecipitationValue = scalarValue(rawCurrentPrecipitation);
-const stepPrecipitationValue = scalarValue(stepPrecipitation);
-const expectedStepPrecipitation = Math.max(
+const ratePrecipitationValue = scalarValue(ratePrecipitation);
+const previousLead = Number(weatherZarr.axes.valid_time.values[0]);
+const currentLead = Number(weatherZarr.axes.valid_time.values[1]);
+const expectedRatePrecipitation = Math.max(
   0,
   rawCurrentPrecipitationValue - rawPreviousPrecipitationValue,
-);
+) * 1000 / (currentLead - previousLead);
 if (
   !Number.isFinite(rawPreviousPrecipitationValue)
   || !Number.isFinite(rawCurrentPrecipitationValue)
-  || !Number.isFinite(stepPrecipitationValue)
-  || Math.abs(stepPrecipitationValue - expectedStepPrecipitation) > 1e-7
+  || !Number.isFinite(ratePrecipitationValue)
+  || variableLayerUnit(weatherZarr, weatherZarrPrecipitation) !== "mm/h"
+  || Math.abs(ratePrecipitationValue - expectedRatePrecipitation) > 1e-7
 ) {
   throw new Error(
-    "WeatherZarr precipitation was not converted to a finite step amount:"
+    "WeatherZarr precipitation was not converted to a finite hourly rate:"
     + ` ${rawPreviousPrecipitationValue} → ${rawCurrentPrecipitationValue}`
-    + ` produced ${stepPrecipitationValue}`,
+    + ` produced ${ratePrecipitationValue}`,
   );
 }
 
@@ -189,7 +195,7 @@ console.log({
       rawPreviousPrecipitationValue,
       rawCurrentPrecipitationValue,
     ],
-    stepPrecipitation: stepPrecipitationValue,
+    ratePrecipitation: ratePrecipitationValue,
     latitude: [
       Number(weatherZarrLatitudeValues.data[0]),
       Number(weatherZarrLatitudeValues.data[weatherZarrLatitudeValues.data.length - 1]),

@@ -1,10 +1,13 @@
 import type { VariableConfig } from "../data/types";
-import { PRECIPITATION_EVENT_THRESHOLD_MM } from "../precipitation";
+import {
+  PRECIPITATION_RATE_UNIT,
+  PRECIPITATION_RATE_VISIBILITY_THRESHOLD_MM_H,
+} from "../precipitation";
 import { unitConverter } from "../units";
 import { isHrrrSmokeVariable } from "./smoke";
 
-export const MINIMUM_VISIBLE_PRECIPITATION_MM =
-  PRECIPITATION_EVENT_THRESHOLD_MM;
+export const MINIMUM_VISIBLE_PRECIPITATION_RATE_MM_H =
+  PRECIPITATION_RATE_VISIBILITY_THRESHOLD_MM_H;
 export const MINIMUM_VISIBLE_SMOKE_RANGE_FRACTION = 0.1;
 
 function glslFloat(value: number) {
@@ -30,18 +33,21 @@ export function isRainVariable(variable: VariableConfig) {
   );
 }
 
-export function variableFragmentShader(variable: VariableConfig) {
+export function variableFragmentShader(
+  variable: VariableConfig,
+  valueUnit = variable.unit,
+) {
   const smoke = isHrrrSmokeVariable(variable);
   if (!isRainVariable(variable) && !smoke) return undefined;
   const value = variable.id;
   const context = `${variable.id} ${variable.label} ${variable.standardName ?? ""}`;
   const convertMinimum = unitConverter(
-    "mm",
-    variable.unit,
+    PRECIPITATION_RATE_UNIT,
+    valueUnit,
     context,
   );
   const minimumVisibleValue = convertMinimum
-    ? convertMinimum(MINIMUM_VISIBLE_PRECIPITATION_MM)
+    ? convertMinimum(MINIMUM_VISIBLE_PRECIPITATION_RATE_MM_H)
     : 0;
   const visibilityThreshold = smoke
     ? `(clim.x + (clim.y - clim.x) * ${glslFloat(MINIMUM_VISIBLE_SMOKE_RANGE_FRACTION)})`
@@ -58,7 +64,10 @@ export function variableFragmentShader(variable: VariableConfig) {
 `;
 }
 
-export function variableRenderingOptions(variable: VariableConfig) {
-  const customFrag = variableFragmentShader(variable);
+export function variableRenderingOptions(
+  variable: VariableConfig,
+  valueUnit = variable.unit,
+) {
+  const customFrag = variableFragmentShader(variable, valueUnit);
   return customFrag ? { customFrag } : {};
 }

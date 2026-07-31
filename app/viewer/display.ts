@@ -1,8 +1,9 @@
 import type { VariableConfig } from "../data/types";
+import { PRECIPITATION_RATE_DEFAULT_MAX_MM_H } from "../precipitation";
 
 export type LoadState = { phase: "loading" | "ready" | "error"; message: string };
 
-const COLOR_RANGE_ESTIMATOR_VERSION = 4;
+const COLOR_RANGE_ESTIMATOR_VERSION = 6;
 
 export function loadingState(message = "Loading…"): LoadState {
   return { phase: "loading", message };
@@ -80,9 +81,12 @@ export function roundRangeToSignificant(
   ];
 }
 
-export function initialDisplayRange(variable: VariableConfig): [number, number] {
+export function initialDisplayRange(
+  variable: VariableConfig,
+  valueUnit = variable.unit,
+): [number, number] {
   const name = `${variable.id} ${variable.label}`.toLowerCase();
-  const unit = variable.unit.toLowerCase();
+  const unit = valueUnit.toLowerCase();
   if (name.includes("wind direction")) return [0, 360];
   if (name.includes("degree days")) return [0, 25];
   if (
@@ -103,6 +107,9 @@ export function initialDisplayRange(variable: VariableConfig): [number, number] 
       : [90_000, 105_000];
   }
   if (name.includes("precip") || name.includes("rainfall") || name.includes("snowfall")) {
+    if (unit === "mm/h" || unit === "mm/hr") {
+      return [0, PRECIPITATION_RATE_DEFAULT_MAX_MM_H];
+    }
     if (/^(?:m|meter|metre)s?$/.test(unit)) return [0, 0.025];
     if (unit.includes("inch") || unit === "in") return [0, 1];
     return [0, 25];

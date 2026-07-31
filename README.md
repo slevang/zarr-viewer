@@ -53,12 +53,12 @@ normal macOS/Linux development machine.
 
 Open <http://localhost:3000>.
 
-The viewer remains cross-origin isolated so the threaded Gribberish decoder is
-always available without a dataset-specific reload. Google authorization runs
-in a small same-origin `/google-auth.html` bridge that is intentionally not
-isolated and returns its result over a browser-local channel. The Vite
-development/preview middleware and static service worker implement these
-per-page headers.
+The Vite development/preview server is cross-origin isolated. On static hosts,
+the viewer loads normally for most datasets and performs one service-worker
+navigation only when a source such as the GRIB-backed HRRR map declares that it
+needs the threaded Gribberish decoder. Google authorization runs in a small
+same-origin `/google-auth.html` bridge that is intentionally not isolated and
+returns its result over a browser-local channel.
 
 ### Google WeatherNext authorization
 
@@ -122,10 +122,11 @@ This remains a prototype rather than a universal Zarr reader. Regular
 latitude/longitude Icechunk stores are the most complete path. HRRR has an
 explicit Lambert conformal grid configuration. The materialized HRRR forecast
 is retained for point-series reads but omitted from the map selector; the
-GRIB-backed HRRR forecast is the map source. HRRR additionally
-requires cross-origin-isolation headers because the upstream Gribberish WASM
-package uses shared memory. The viewer is therefore always isolated; only the
-dedicated Google authorization bridge opts out.
+GRIB-backed HRRR forecast is the map source. HRRR additionally requires
+cross-origin-isolation headers because the upstream Gribberish WASM package
+uses shared memory. Static deployments enter that mode on demand; only the
+dedicated Google authorization bridge opts out when the rest of the page is
+isolated.
 
 Each logical dataset in `app/catalog.ts` has independent optional `map` and
 `series` sources. The two roles may resolve to the same store, different groups

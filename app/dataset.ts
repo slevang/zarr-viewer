@@ -123,6 +123,8 @@ type WeatherZarrCatalog = {
   models?: Record<string, WeatherZarrCatalogRun[]>;
 };
 
+type WeatherZarrLatest = WeatherZarrCatalogRun;
+
 const GOOGLE_TIME_ORIGIN_MS = Date.UTC(1900, 0, 1);
 const HOUR_MS = 60 * 60 * 1000;
 const STORE_READ_CONCURRENCY = 32;
@@ -136,6 +138,18 @@ const GOOGLE_LEVELS = [
 const storeReadCache = new Map<string, Uint8Array>();
 let storeReadCacheBytes = 0;
 let nextStoreCacheId = 1;
+const weatherZarrCatalogPromises = new Map<
+  string,
+  Promise<WeatherZarrCatalog>
+>();
+const weatherZarrLatestPromises = new Map<
+  string,
+  Promise<WeatherZarrLatest>
+>();
+const weatherZarrManifestPromises = new Map<
+  string,
+  Promise<WeatherZarrManifest>
+>();
 
 function product(values: number[]) {
   return values.reduce((result, value) => result * value, 1);
@@ -1031,6 +1045,26 @@ function weatherZarrRunDate(run: string) {
     : new Date(run);
 }
 
+function cachedWeatherZarrJson<T>(
+  cache: Map<string, Promise<T>>,
+  url: string,
+  label: string,
+) {
+  const cached = cache.get(url);
+  if (cached) return cached;
+  const promise = fetch(url).then(async (response) => {
+    if (!response.ok) {
+      throw new Error(`${label} request failed (${response.status})`);
+    }
+    return await response.json() as T;
+  }).catch((error) => {
+    cache.delete(url);
+    throw error;
+  });
+  cache.set(url, promise);
+  return promise;
+}
+
 async function resolveWeatherZarrManifest(
   latestUrl: string,
   targetDate?: Date,
@@ -1039,39 +1073,49 @@ async function resolveWeatherZarrManifest(
   const segments = parsed.pathname.split("/").filter(Boolean);
   const dataIndex = segments.indexOf("data");
   const model = dataIndex >= 0 ? segments[dataIndex + 1] : undefined;
-  const catalogResponse = await fetch(
-    new URL("/catalog.json", parsed.origin),
-    { cache: "no-store" },
+  const catalogUrl = new URL("/catalog.json", parsed.origin).toString();
+  const catalogPromise = cachedWeatherZarrJson(
+    weatherZarrCatalogPromises,
+    catalogUrl,
+    "WeatherZarr catalog",
   );
-  if (!catalogResponse.ok) {
-    throw new Error(`WeatherZarr catalog request failed (${catalogResponse.status})`);
-  }
-  const catalog = await catalogResponse.json() as WeatherZarrCatalog;
-  const runs = model ? catalog.models?.[model] ?? [] : [];
+  const validTarget = targetDate && Number.isFinite(targetDate.getTime())
+    ? targetDate
+    : undefined;
+  const [catalog, latest] = validTarget
+    ? [await catalogPromise, undefined]
+    : await Promise.all([
+      catalogPromise,
+      cachedWeatherZarrJson(
+        weatherZarrLatestPromises,
+        latestUrl,
+        "WeatherZarr latest run",
+      ),
+    ]);
+  let runs = model ? catalog.models?.[model] ?? [] : [];
   if (!runs.length) {
     throw new Error("WeatherZarr catalog did not report any available runs");
   }
-  const selectedRun = targetDate && Number.isFinite(targetDate.getTime())
+  if (!validTarget && (!latest?.run || !latest.manifest)) {
+    throw new Error("WeatherZarr latest run did not report a manifest");
+  }
+  const selectedRun = validTarget
     ? runs.reduce((nearest, candidate) => (
-      Math.abs(weatherZarrRunDate(candidate.run).getTime() - targetDate.getTime())
-        < Math.abs(weatherZarrRunDate(nearest.run).getTime() - targetDate.getTime())
+      Math.abs(weatherZarrRunDate(candidate.run).getTime() - validTarget.getTime())
+        < Math.abs(weatherZarrRunDate(nearest.run).getTime() - validTarget.getTime())
         ? candidate
         : nearest
-    ))
-    : runs.reduce((latest, candidate) => (
-      weatherZarrRunDate(candidate.run).getTime()
-        > weatherZarrRunDate(latest.run).getTime()
-        ? candidate
-        : latest
-    ));
-  const manifestResponse = await fetch(
-    weatherZarrProxyUrl(selectedRun.manifest),
-    { cache: "no-store" },
-  );
-  if (!manifestResponse.ok) {
-    throw new Error(`WeatherZarr manifest request failed (${manifestResponse.status})`);
+      ))
+    : latest!;
+  if (!runs.some((run) => run.run === selectedRun.run)) {
+    runs = [...runs, selectedRun];
   }
-  const manifest = await manifestResponse.json() as WeatherZarrManifest;
+  const manifestUrl = weatherZarrProxyUrl(selectedRun.manifest);
+  const manifest = await cachedWeatherZarrJson(
+    weatherZarrManifestPromises,
+    manifestUrl,
+    "WeatherZarr manifest",
+  );
   return { manifest, runs, selectedRun };
 }
 

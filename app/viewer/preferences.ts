@@ -6,6 +6,7 @@ import {
 } from "../catalog";
 
 const DATASET_PARAMETER = "dataset";
+const RELOAD_DATASET_STORAGE_KEY = "zarr-viewer:reload-dataset";
 const UNIT_PREFERENCES_STORAGE_KEY = "zarr-viewer:unit-preferences";
 const MAP_DATASETS = DATASETS.filter(hasMapSource);
 
@@ -21,12 +22,40 @@ export function hasRequestedDataset() {
 
 export function initialDatasetId() {
   if (typeof window === "undefined") return getDataset(DEFAULT_DATASET_ID).id;
+  let reloadDataset: string | null = null;
+  try {
+    reloadDataset = window.sessionStorage.getItem(RELOAD_DATASET_STORAGE_KEY);
+  } catch {
+    // Continue with the URL/default when session storage is unavailable.
+  }
+  if (
+    reloadDataset
+    && MAP_DATASETS.some((candidate) => candidate.id === reloadDataset)
+  ) {
+    return reloadDataset;
+  }
   const requested = new URL(window.location.href).searchParams.get(
     DATASET_PARAMETER,
   );
   return hasRequestedDataset()
     ? requested!
     : getDataset(DEFAULT_DATASET_ID).id;
+}
+
+export function rememberDatasetForReload(datasetId: string) {
+  try {
+    window.sessionStorage.setItem(RELOAD_DATASET_STORAGE_KEY, datasetId);
+  } catch {
+    // Reload still preserves the static URL even if selection cannot be retained.
+  }
+}
+
+export function clearRememberedDatasetForReload() {
+  try {
+    window.sessionStorage.removeItem(RELOAD_DATASET_STORAGE_KEY);
+  } catch {
+    // Session storage is optional.
+  }
 }
 
 export type InitialViewerLocation = {

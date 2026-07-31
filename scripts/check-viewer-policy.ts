@@ -13,7 +13,7 @@ import {
 import {
   isRainVariable,
   MINIMUM_VISIBLE_SMOKE_RANGE_FRACTION,
-  MINIMUM_VISIBLE_PRECIPITATION_MM,
+  MINIMUM_VISIBLE_PRECIPITATION_RATE_MM_H,
   variableFragmentShader,
 } from "../app/viewer/rendering";
 import {
@@ -92,6 +92,16 @@ assert.equal(
   getDataset("weatherzarr-ecmwf-ifs").sources.series
     ?.precipitationAccumulation,
   "cumulative",
+);
+assert.equal(
+  getDataset("noaa-hrrr-forecast-48-hour").sources.map
+    ?.requiresCrossOriginIsolation,
+  true,
+);
+assert.equal(
+  getDataset("noaa-hrrr-forecast-48-hour").sources.series
+    ?.requiresCrossOriginIsolation,
+  undefined,
 );
 assert.equal(
   baseViewerUrl("https://example.com/viewer/?dataset=old#map"),
@@ -178,15 +188,19 @@ const precipitation: VariableConfig = {
 assert.equal(isRainVariable(precipitation), true);
 assert.equal(defaultColormap(precipitation).id, "rain");
 assert.equal(PRECIPITATION_EVENT_THRESHOLD_MM, 0.1);
-assert.equal(MINIMUM_VISIBLE_PRECIPITATION_MM, 0.1);
-assert.match(variableFragmentShader(precipitation) ?? "", /tp <= 0\.0001/);
+assert.equal(MINIMUM_VISIBLE_PRECIPITATION_RATE_MM_H, 0.03);
+assert.deepEqual(initialDisplayRange(precipitation, "mm/h"), [0, 5]);
+assert.match(
+  variableFragmentShader(precipitation, "mm/h") ?? "",
+  /tp <= 0\.03/,
+);
 assert.match(
   variableFragmentShader({
     ...precipitation,
     id: "total_precipitation_surface",
     unit: "kg m-2",
-  }) ?? "",
-  /total_precipitation_surface <= 0\.1/,
+  }, "mm/h") ?? "",
+  /total_precipitation_surface <= 0\.03/,
 );
 assert.equal(variableFragmentShader(temperature), undefined);
 const hrrrSmoke = {

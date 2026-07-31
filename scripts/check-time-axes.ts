@@ -5,6 +5,8 @@ import {
   axisIndexForDate,
   axisValueAsDate,
   defaultSelections,
+  preserveForecastLeadSelection,
+  regularSpatialCoordinateValues,
   selectionsAfterAxisChange,
   selectionsForValidDate,
   selectorFor,
@@ -56,6 +58,21 @@ assert.deepEqual(
 assert.deepEqual(
   toDataCoordinates(getDataset("weatherzarr-ecmwf-ifs"), -98, 38.5),
   [-98, 38.5],
+);
+const weatherZarrSource = getDataset(
+  "weatherzarr-ecmwf-ifs",
+).sources.map!;
+assert.deepEqual(
+  regularSpatialCoordinateValues(weatherZarrSource, "latitude", 3),
+  [90, 0, -90],
+);
+assert.deepEqual(
+  regularSpatialCoordinateValues(weatherZarrSource, "longitude", 4),
+  [-180, -90, 0, 90],
+);
+assert.equal(
+  regularSpatialCoordinateValues(weatherZarrSource, "valid_time", 57),
+  undefined,
 );
 
 const dataset = {
@@ -189,6 +206,46 @@ const forecastVariable = {
   unit: "K",
   dimensions: ["init_time", "lead_time", "latitude", "longitude"],
 } satisfies VariableConfig;
+assert.deepEqual(
+  defaultSelections({
+    ...forecastInfo,
+    dataset: { ...forecastInfo.dataset, category: "forecast" },
+  }, forecastVariable),
+  { init_time: 2, lead_time: 1 },
+);
+const nextForecastInfo = {
+  ...forecastInfo,
+  axes: {
+    ...forecastInfo.axes,
+    prediction_timedelta: {
+      id: "prediction_timedelta",
+      label: "Forecast lead time",
+      unit: "hours",
+      kind: "timedelta",
+      values: [0, 3, 6],
+    },
+  },
+} satisfies StoreInfo;
+const nextForecastVariable = {
+  ...forecastVariable,
+  dimensions: [
+    "init_time",
+    "prediction_timedelta",
+    "latitude",
+    "longitude",
+  ],
+} satisfies VariableConfig;
+assert.deepEqual(
+  preserveForecastLeadSelection(
+    forecastInfo,
+    forecastVariable,
+    { init_time: 2, lead_time: 1 },
+    nextForecastInfo,
+    nextForecastVariable,
+    { init_time: 2, prediction_timedelta: 0 },
+  ),
+  { init_time: 2, prediction_timedelta: 1 },
+);
 assert.deepEqual(
   Object.fromEntries(
     Object.entries(validDateRange(forecastInfo, forecastVariable) ?? {}).map(

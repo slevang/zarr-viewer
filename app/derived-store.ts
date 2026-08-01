@@ -423,6 +423,78 @@ function precipitationDurationHours(
   return duration > 0 ? duration : NaN;
 }
 
+export function normalizePrecipitationChunk(
+  values: ArrayLike<number | bigint>,
+  targetShape: number[],
+  temporalIndex: number,
+  temporalStart: number,
+  normalization: MapPrecipitationNormalization,
+  durationHoursAt: (index: number) => number,
+) {
+  const output = new Float32Array(product(targetShape));
+  if (normalization.kind === "rate") {
+    for (let index = 0; index < output.length; index += 1) {
+      const current = Number(values[index]);
+      output[index] = Number.isFinite(current)
+        ? Math.max(0, normalization.toMillimetersPerHour(current))
+        : NaN;
+    }
+    return output;
+  }
+
+  const temporalLength = targetShape[temporalIndex];
+  const innerLength = product(targetShape.slice(temporalIndex + 1));
+  const outerLength = product(targetShape.slice(0, temporalIndex));
+  const includesPrevious = normalization.kind === "cumulative"
+    && temporalStart > 0;
+  const sourceTemporalLength = temporalLength + (includesPrevious ? 1 : 0);
+  const durations = Array.from(
+    { length: temporalLength },
+    (_, index) => durationHoursAt(temporalStart + index),
+  );
+
+  for (let outer = 0; outer < outerLength; outer += 1) {
+    const outputOuterStart = outer * temporalLength * innerLength;
+    const sourceOuterStart = outer * sourceTemporalLength * innerLength;
+    for (let temporal = 0; temporal < temporalLength; temporal += 1) {
+      const globalTemporalIndex = temporalStart + temporal;
+      const outputStart = outputOuterStart + temporal * innerLength;
+      const sourceStart = sourceOuterStart
+        + (temporal + (includesPrevious ? 1 : 0)) * innerLength;
+      const previousStart = sourceStart - (
+        globalTemporalIndex > 0 ? innerLength : 0
+      );
+      const durationHours = durations[temporal];
+      for (let offset = 0; offset < innerLength; offset += 1) {
+        const current = Number(values[sourceStart + offset]);
+        const currentMillimeters = normalization.toMillimeters(current);
+        const amount = normalization.kind === "cumulative"
+          ? (() => {
+            const previousMillimeters = globalTemporalIndex > 0
+              ? normalization.toMillimeters(
+                Number(values[previousStart + offset]),
+              )
+              : currentMillimeters === 0
+                ? 0
+                : NaN;
+            return Number.isFinite(currentMillimeters)
+                && Number.isFinite(previousMillimeters)
+              ? Math.max(0, currentMillimeters - previousMillimeters)
+              : NaN;
+          })()
+          : Number.isFinite(currentMillimeters)
+            ? Math.max(0, currentMillimeters)
+            : NaN;
+        output[outputStart + offset] = Number.isFinite(amount)
+            && Number.isFinite(durationHours)
+          ? amount / durationHours
+          : NaN;
+      }
+    }
+  }
+  return output;
+}
+
 async function buildPrecipitationRateStore(
   info: StoreInfo,
   variable: VariableConfig,
@@ -541,66 +613,19 @@ async function buildPrecipitationRateStore(
       { signal: options?.signal },
     );
     const sourceValues = contiguousValues(result as ZarrResult);
-    const sourceShape = (result as ZarrResult).shape;
-    const sourceStride = cStride(sourceShape);
     const targetShape = stops.map((stop, index) => stop - starts[index]);
-    const targetStride = cStride(targetShape);
-    const rateValues = new Float32Array(product(targetShape));
-    for (let outputIndex = 0; outputIndex < rateValues.length; outputIndex += 1) {
-      let remainder = outputIndex;
-      let currentSourceIndex = 0;
-      let previousSourceIndex = 0;
-      let temporalCoordinate = 0;
-      for (let dimension = 0; dimension < targetShape.length; dimension += 1) {
-        const coordinate = Math.floor(remainder / targetStride[dimension]);
-        remainder %= targetStride[dimension];
-        const sourceCoordinate = dimension === temporalIndex && includesPrevious
-          ? coordinate + 1
-          : coordinate;
-        currentSourceIndex += sourceCoordinate * sourceStride[dimension];
-        previousSourceIndex += (
-          dimension === temporalIndex
-            ? Math.max(0, sourceCoordinate - 1)
-            : sourceCoordinate
-        ) * sourceStride[dimension];
-        if (dimension === temporalIndex) temporalCoordinate = coordinate;
-      }
-      const current = Number(sourceValues[currentSourceIndex]);
-      if (normalization.kind === "rate") {
-        rateValues[outputIndex] = Number.isFinite(current)
-          ? Math.max(0, normalization.toMillimetersPerHour(current))
-          : NaN;
-        continue;
-      }
-      const globalTemporalIndex = starts[temporalIndex] + temporalCoordinate;
-      const durationHours = precipitationDurationHours(
+    const rateValues = normalizePrecipitationChunk(
+      sourceValues,
+      targetShape,
+      temporalIndex,
+      temporalIndex >= 0 ? starts[temporalIndex] : 0,
+      normalization,
+      (index) => precipitationDurationHours(
         info,
         temporalDimension!,
-        globalTemporalIndex,
-      );
-      const currentMillimeters = normalization.toMillimeters(current);
-      const amount = normalization.kind === "cumulative"
-        ? (() => {
-          const previousMillimeters = globalTemporalIndex > 0
-            ? normalization.toMillimeters(
-              Number(sourceValues[previousSourceIndex]),
-            )
-            : currentMillimeters === 0
-              ? 0
-              : NaN;
-          return Number.isFinite(currentMillimeters)
-              && Number.isFinite(previousMillimeters)
-            ? Math.max(0, currentMillimeters - previousMillimeters)
-            : NaN;
-        })()
-        : Number.isFinite(currentMillimeters)
-          ? Math.max(0, currentMillimeters)
-          : NaN;
-      rateValues[outputIndex] = Number.isFinite(amount)
-          && Number.isFinite(durationHours)
-        ? amount / durationHours
-        : NaN;
-    }
+        index,
+      ),
+    );
     return bytesOf(padChunk(
       rateValues,
       targetShape,

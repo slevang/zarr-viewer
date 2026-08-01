@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import * as zarr from "zarrita";
 import type { Readable } from "zarrita";
 import { observationVariable } from "../app/asos";
@@ -10,6 +11,7 @@ import {
 import {
   accumulatedToStepValues,
   derivedLayerOptions,
+  normalizePrecipitationChunk,
   variableLayerOptions,
   variableLayerUnit,
 } from "../app/derived-store";
@@ -166,6 +168,55 @@ if (
     `Chunk-boundary precipitation was not differenced: ${laterStepPrecipitation}`,
   );
 }
+
+let durationLookups = 0;
+const normalizedStepPrecipitation = normalizePrecipitationChunk(
+  new Float32Array([
+    0.001, 0.002,
+    0.006, 0.010,
+  ]),
+  [2, 2],
+  0,
+  4,
+  {
+    kind: "step",
+    temporalDimension: "time",
+    toMillimeters: (value) => value * 1_000,
+  },
+  (index) => {
+    durationLookups += 1;
+    return index === 4 ? 1 : 2;
+  },
+);
+assert.deepEqual(
+  Array.from(normalizedStepPrecipitation),
+  [1, 2, 3, 5],
+);
+assert.equal(durationLookups, 2);
+
+const normalizedCumulativePrecipitation = normalizePrecipitationChunk(
+  new Float32Array([
+    1, 2,
+    4, 8,
+    10, 9,
+    5, 5,
+    7, 4,
+    9, 10,
+  ]),
+  [2, 2, 2],
+  1,
+  1,
+  {
+    kind: "cumulative",
+    temporalDimension: "lead_time",
+    toMillimeters: (value) => value,
+  },
+  () => 1,
+);
+assert.deepEqual(
+  Array.from(normalizedCumulativePrecipitation),
+  [3, 6, 6, 1, 2, 0, 2, 6],
+);
 
 const precipitationDates = [
   new Date("2026-01-01T00:00:00Z"),

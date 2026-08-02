@@ -43,6 +43,7 @@ type MeteogramProps = {
   cursorDate?: Date;
   temperatureUnit: UnitOption | null;
   precipitationUnit: UnitOption;
+  windSpeedUnit: UnitOption | null;
   timeZone: string;
 };
 
@@ -152,6 +153,7 @@ export function Meteogram({
   cursorDate,
   temperatureUnit,
   precipitationUnit,
+  windSpeedUnit,
   timeZone,
 }: MeteogramProps) {
   const [hoverTimestamp, setHoverTimestamp] = useState<number | null>(null);
@@ -274,8 +276,19 @@ export function Meteogram({
     : maxPrecipitation < 1
       ? 1
       : 0;
-  const wind = fields.windSpeed ? valuesOf(fields.windSpeed) : [];
-  const windDistribution = fields.windSpeedDistribution;
+  const windSpeedSeries = useMemo(
+    () => fields.windSpeed
+      ? convertPointSeries(fields.windSpeed, windSpeedUnit)
+      : undefined,
+    [fields.windSpeed, windSpeedUnit],
+  );
+  const windDistribution = useMemo(
+    () => fields.windSpeedDistribution
+      ? convertPointSeries(fields.windSpeedDistribution, windSpeedUnit)
+      : undefined,
+    [fields.windSpeedDistribution, windSpeedUnit],
+  );
+  const wind = windSpeedSeries ? valuesOf(windSpeedSeries) : [];
   const windHighs = windDistribution?.kind === "forecast"
     ? windDistribution.quantiles.map((item) => item.q90)
     : wind;
@@ -283,7 +296,7 @@ export function Meteogram({
     5,
     Math.ceil(Math.max(...windHighs.filter(Number.isFinite), 0)),
   );
-  const windUnit = fields.windSpeed?.unit ?? "m/s";
+  const windUnit = windSpeedSeries?.unit ?? "m/s";
   const direction = fields.windDirection ? valuesOf(fields.windDirection) : [];
   const dayTicks = timeRange
     ? meteogramDayTicks(timeRange.start, timeRange.stop)
@@ -323,7 +336,7 @@ export function Meteogram({
     precipitationSeries,
     activeTimestamp,
   );
-  const activeWind = valueAt(fields.windSpeed, activeTimestamp);
+  const activeWind = valueAt(windSpeedSeries, activeTimestamp);
   const activeDirection = valueAt(fields.windDirection, activeTimestamp);
   const updateHover = (event: PointerEvent<SVGSVGElement>) => {
     if (!timeRange) return;
@@ -392,7 +405,7 @@ export function Meteogram({
           Wind
           <strong>
             {activeWind === null ? "—" : activeWind.toFixed(1)}
-            <small> {fields.windSpeed?.unit ?? "m/s"}</small>
+            <small> {windUnit}</small>
           </strong>
           <small>
             {activeDirection === null ? "—" : `${Math.round(activeDirection)}°`}
@@ -632,7 +645,7 @@ export function Meteogram({
                   strokeLinecap="round"
                 />
               ) : null}
-              {fields.windSpeed ? (
+              {windSpeedSeries ? (
                 <>
                   {windDistribution?.kind === "forecast"
                     && windDistribution.memberCount > 1 ? (
@@ -663,7 +676,7 @@ export function Meteogram({
                     ) : null}
                   <path
                     d={pathFor(
-                      fields.windSpeed.dates,
+                      windSpeedSeries.dates,
                       wind,
                       x,
                       (value) => WIND_BOTTOM

@@ -448,6 +448,16 @@ export function ZarrViewer() {
     ),
     [currentUnitKind, selectedUnit?.id, unitPreferences.precipitation],
   );
+  const meteogramWindSpeedUnit = useMemo(() => {
+    const options = unitOptions("m/s", "10 metre wind speed");
+    const preferred = currentUnitKind === "speed"
+      ? selectedUnit?.id
+      : unitPreferences.speed;
+    return options.find((option) => option.id === preferred)
+      ?? options.find((option) => option.id === "m/s")
+      ?? options[0]
+      ?? null;
+  }, [currentUnitKind, selectedUnit?.id, unitPreferences.speed]);
   const stationSearchResults = useMemo(() => {
     const query = stationSearchQuery.trim().toLocaleLowerCase();
     if (!query) return [];
@@ -3430,6 +3440,7 @@ export function ZarrViewer() {
               cursorDate={selectedMapValidDate}
               temperatureUnit={meteogramTemperatureUnit}
               precipitationUnit={meteogramPrecipitationUnit}
+              windSpeedUnit={meteogramWindSpeedUnit}
               timeZone={inspectionTimeZone}
             />
           ) : (

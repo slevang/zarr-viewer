@@ -20,11 +20,12 @@
     "check:variables": "node --import tsx scripts/check-common-variables.ts",
     "check:time": "node --import tsx scripts/check-time-axes.ts",
     "check:units": "node --import tsx scripts/check-units.ts",
+    "check:meteogram": "node --import tsx scripts/check-meteogram.ts",
     "check:viewer": "node --import tsx scripts/check-viewer-policy.ts",
     "preview": "vite preview --host 127.0.0.1 --port 3000",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "test": "npm run lint && npm run typecheck && npm run check:queue && npm run check:variables && npm run check:time && npm run check:units && npm run check:derived && npm run check:color-range && npm run check:viewer && npm run build && npm run check:static"
+    "test": "npm run lint && npm run typecheck && npm run check:queue && npm run check:variables && npm run check:time && npm run check:units && npm run check:meteogram && npm run check:derived && npm run check:color-range && npm run check:viewer && npm run build && npm run check:static"
   },
   "dependencies": {
     "@carbonplan/zarr-layer": "^0.6.1",

@@ -1,3 +1,4 @@
+import proj4 from "proj4";
 import type { Selector } from "@carbonplan/zarr-layer";
 import {
   getDatasetSource,
@@ -473,13 +474,30 @@ export function toDataCoordinates(
   latitude: number,
 ): [number, number] {
   const source = getDatasetSource(dataset, "map");
-  if (
-    source?.crs === "EPSG:4326"
-    && source.bounds
-    && source.bounds[0] >= 0
-    && source.bounds[2] > 180
-  ) {
-    return [((longitude % 360) + 360) % 360, latitude];
+  // zarr-layer query geometries are always geographic, including for custom
+  // projected datasets; it applies the configured proj4 transform internally.
+  if (source?.proj4) return [longitude, latitude];
+  return sourcePointCoordinates(
+    source,
+    longitude,
+    latitude,
+    source?.bounds?.[0],
+  );
+}
+
+export function sourcePointCoordinates(
+  source: Pick<DatasetSourceConfig, "proj4"> | undefined,
+  longitude: number,
+  latitude: number,
+  firstLongitude?: number,
+): [number, number] {
+  if (source?.proj4) {
+    return proj4("EPSG:4326", source.proj4, [longitude, latitude]);
   }
-  return [longitude, latitude];
+  return [
+    firstLongitude !== undefined && firstLongitude >= 0
+      ? ((longitude % 360) + 360) % 360
+      : longitude,
+    latitude,
+  ];
 }

@@ -43,6 +43,7 @@ import {
   preferredRegionalMeteogramDataset,
   meteogramDayTicks,
   meteogramHoverTimestamps,
+  meteogramSelectionsForInitialization,
   meteogramStartSelections,
   nearestTimestamp,
   normalizeMeteogramPercentSeries,
@@ -305,6 +306,31 @@ assert.deepEqual(
     "ecmwf-ifs-ens-forecast-15-day-0-25-degree",
   ],
 );
+assert.deepEqual(
+  meteogramComparisonDatasets(
+    DATASETS,
+    -71.06,
+    42.36,
+    "ecmwf-ifs-ens-forecast-15-day-0-25-degree",
+  ).map((candidate) => candidate.id),
+  [
+    "ecmwf-ifs-ens-forecast-15-day-0-25-degree",
+    "noaa-hrrr-forecast-48-hour",
+  ],
+);
+assert.deepEqual(
+  meteogramComparisonDatasets(
+    DATASETS,
+    -71.06,
+    42.36,
+    "weatherzarr-ecmwf-ifs",
+  ).map((candidate) => candidate.id),
+  [
+    "weatherzarr-ecmwf-ifs",
+    "noaa-hrrr-forecast-48-hour",
+    "ecmwf-ifs-ens-forecast-15-day-0-25-degree",
+  ],
+);
 assert.equal(
   preferredRegionalMeteogramDataset(DATASETS, -71.06, 42.36)?.id,
   "noaa-hrrr-forecast-48-hour",
@@ -503,6 +529,34 @@ const forecastSource = getDatasetSource(
   "map",
 );
 assert.ok(forecastSource);
+assert.deepEqual(
+  meteogramSelectionsForInitialization({
+    dataset: getDataset("noaa-hrrr-forecast-48-hour"),
+    source: forecastSource,
+    role: "series",
+    axes: {
+      init_time: {
+        id: "init_time",
+        label: "Initialization time",
+        unit: "hours since 2026-07-20T00:00:00Z",
+        kind: "time",
+        values: [0, 6, 12],
+      },
+      lead_time: {
+        id: "lead_time",
+        label: "Forecast lead time",
+        unit: "hours",
+        kind: "timedelta",
+        values: [0, 1, 2],
+      },
+    },
+    variables: [],
+  }, {
+    ...temperature,
+    dimensions: ["init_time", "lead_time", "latitude", "longitude"],
+  }, new Date("2026-07-20T06:00:00Z")),
+  { init_time: 1, lead_time: 1 },
+);
 assert.deepEqual(
   meteogramStartSelections({
     dataset: getDataset("noaa-hrrr-forecast-48-hour"),

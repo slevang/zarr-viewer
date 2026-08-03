@@ -43,6 +43,11 @@ type MeteogramProps = {
   cursorDate?: Date;
   temperatureUnit: UnitOption | null;
   precipitationUnit: UnitOption;
+  mapPrecipitationRate?: {
+    timestamp: number;
+    value: number;
+    unit: string;
+  };
   windSpeedUnit: UnitOption | null;
   timeZone: string;
 };
@@ -153,6 +158,7 @@ export function Meteogram({
   cursorDate,
   temperatureUnit,
   precipitationUnit,
+  mapPrecipitationRate,
   windSpeedUnit,
   timeZone,
 }: MeteogramProps) {
@@ -253,8 +259,24 @@ export function Meteogram({
       : undefined,
     [fields.precipitationRate, precipitationUnit],
   );
+  const mapPrecipitationValue = mapPrecipitationRate
+    ? convertUnitValue(
+      mapPrecipitationRate.value,
+      mapPrecipitationRate.unit,
+      precipitationUnit.id,
+      "Precipitation rate",
+    )
+    : undefined;
   const precipitation = precipitationSeries
-    ? valuesOf(precipitationSeries)
+    ? valuesOf(precipitationSeries).map((value, index) =>
+      mapPrecipitationRate
+        && precipitationSeries.dates[index]?.getTime()
+          === mapPrecipitationRate.timestamp
+        && mapPrecipitationValue !== undefined
+        && Number.isFinite(mapPrecipitationValue)
+        ? mapPrecipitationValue
+        : value
+    )
     : [];
   const minimumPrecipitationMaximum = convertUnitValue(
     0.1,
@@ -332,10 +354,16 @@ export function Meteogram({
   const activeCloud = activeCloudRaw === null
     ? null
     : activeCloudRaw <= 1.5 ? activeCloudRaw * 100 : activeCloudRaw;
-  const activePrecipitation = valueAt(
+  const pointSeriesPrecipitation = valueAt(
     precipitationSeries,
     activeTimestamp,
   );
+  const activePrecipitation = mapPrecipitationRate
+      && activeTimestamp === mapPrecipitationRate.timestamp
+      && mapPrecipitationValue !== undefined
+      && Number.isFinite(mapPrecipitationValue)
+    ? mapPrecipitationValue
+    : pointSeriesPrecipitation;
   const activeWind = valueAt(windSpeedSeries, activeTimestamp);
   const activeDirection = valueAt(fields.windDirection, activeTimestamp);
   const updateHover = (event: PointerEvent<SVGSVGElement>) => {

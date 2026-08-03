@@ -116,6 +116,7 @@ import {
 } from "./viewer/preferences";
 import {
   meteogramComparisonDatasets,
+  meteogramSelectionsForInitialization,
   meteogramStartSelections,
   normalizeMeteogramPercentSeries,
   primaryMeteogramDataset,
@@ -174,7 +175,10 @@ type SeriesComparisonOptions = {
   addMapDataset?: boolean;
 };
 type InspectionPoint = { lng: number; lat: number };
-type Inspector = InspectionPoint & { value: number | null };
+type Inspector = InspectionPoint & {
+  value: number | null;
+  valueTimestamp?: number;
+};
 type Limit = "min" | "max";
 type ShareStatus = "idle" | "copied" | "error";
 
@@ -528,6 +532,19 @@ export function ZarrViewer() {
       : undefined),
     [info, selections, unavailableMapDate, variable],
   );
+  const selectedMapInitializationTime = useMemo(() => {
+    if (!info) return undefined;
+    const axis = Object.values(info.axes).find(
+      (candidate) => candidate.kind === "time" && isInitializationAxis(candidate),
+    );
+    if (!axis) return undefined;
+    const timestamp = axisValueAsDate(
+      info.dataset,
+      axis,
+      selections[axis.id] ?? axis.defaultIndex ?? 0,
+    ).getTime();
+    return Number.isFinite(timestamp) ? timestamp : undefined;
+  }, [info, selections]);
   const initialDatasetTargetDate = useMemo(
     () => Object.values(initialLocation.axisValues)
       .map((value) => new Date(value))
@@ -1021,7 +1038,11 @@ export function ZarrViewer() {
   }, []);
   startAsosComparisonRef.current = startAsosComparison;
 
-  const loadMeteogram = useCallback(async (point: InspectionPoint) => {
+  const loadMeteogram = useCallback(async (
+    point: InspectionPoint,
+    preferredDatasetId: string,
+    preferredInitializationDate?: Date,
+  ) => {
     meteogramRequestControllerRef.current?.abort();
     const controller = new AbortController();
     meteogramRequestControllerRef.current = controller;
@@ -1030,6 +1051,7 @@ export function ZarrViewer() {
       TIME_SERIES_DATASETS,
       point.lng,
       point.lat,
+      preferredDatasetId,
     );
     const primary = primaryMeteogramDataset(datasets);
     setMeteogramPhase("loading");
@@ -1048,16 +1070,28 @@ export function ZarrViewer() {
       selections: AxisSelection;
       temperature: VariableConfig;
       series: PointSeries;
+      initializationDate?: Date;
     }>();
     await Promise.all(datasets.map(async (candidate) => {
       try {
-        const nextInfo = await loadStoreInfo(candidate.id, "series");
+        const initializationDate = candidate.id === preferredDatasetId
+          ? preferredInitializationDate
+          : undefined;
+        const nextInfo = await loadStoreInfo(
+          candidate.id,
+          "series",
+          initializationDate,
+        );
         controller.signal.throwIfAborted();
         const temperature = commonVariableMatches(nextInfo.variables).find(
           (match) => match.key === "t2m",
         )?.variable;
         if (!temperature) throw new Error("2 m temperature is unavailable");
-        const nextSelections = defaultSelections(nextInfo, temperature);
+        const nextSelections = meteogramSelectionsForInitialization(
+          nextInfo,
+          temperature,
+          initializationDate,
+        );
         const series = await loadPointSeries(
           nextInfo,
           temperature,
@@ -1076,6 +1110,7 @@ export function ZarrViewer() {
           selections: nextSelections,
           temperature,
           series: displaySeries,
+          initializationDate,
         });
         if (
           controller.signal.aborted
@@ -1126,7 +1161,10 @@ export function ZarrViewer() {
     await Promise.all(datasets.map(async (candidate) => {
       const candidateLoaded = loaded.get(candidate.id);
       if (!candidateLoaded) return;
-      const { info: candidateInfo } = candidateLoaded;
+      const {
+        info: candidateInfo,
+        initializationDate,
+      } = candidateLoaded;
       const common = new Map(
         commonVariableMatches(candidateInfo.variables).map((match) => [
           match.key,
@@ -1149,10 +1187,15 @@ export function ZarrViewer() {
       ) => {
         if (!fieldVariable) return;
         try {
+          const fieldSelections = meteogramSelectionsForInitialization(
+            candidateInfo,
+            fieldVariable,
+            initializationDate,
+          );
           const series = await loadPointSeries(
             candidateInfo,
             fieldVariable,
-            defaultSelections(candidateInfo, fieldVariable),
+            fieldSelections,
             point.lng,
             point.lat,
             { signal: controller.signal },
@@ -1177,10 +1220,15 @@ export function ZarrViewer() {
           const precipitation = common.get("tp");
           if (!precipitation) return;
           try {
+            const precipitationSelections = meteogramSelectionsForInitialization(
+              candidateInfo,
+              precipitation,
+              initializationDate,
+            );
             const result = await loadPointPrecipitationForecast(
               candidateInfo,
               precipitation,
-              defaultSelections(candidateInfo, precipitation),
+              precipitationSelections,
               point.lng,
               point.lat,
               { signal: controller.signal },
@@ -1238,9 +1286,7 @@ export function ZarrViewer() {
     );
     const nextFields: MeteogramFields = {
       precipitationRate: bestField("precipitationRate"),
-      precipitationProbability:
-        ensembleFields?.precipitationProbability
-        ?? bestField("precipitationProbability"),
+      precipitationProbability: bestField("precipitationProbability"),
       cloudCover: bestField("cloudCover"),
       windSpeed: bestField("windSpeed"),
       windSpeedDistribution: ensembleFields?.windSpeed,
@@ -1329,9 +1375,18 @@ export function ZarrViewer() {
     void loadMeteogram({
       lng: inspectedLongitude,
       lat: inspectedLatitude,
-    });
+    }, datasetId, selectedMapInitializationTime === undefined
+      ? undefined
+      : new Date(selectedMapInitializationTime));
     return () => meteogramRequestControllerRef.current?.abort();
-  }, [inspectedLatitude, inspectedLongitude, loadMeteogram, viewMode]);
+  }, [
+    datasetId,
+    inspectedLatitude,
+    inspectedLongitude,
+    loadMeteogram,
+    selectedMapInitializationTime,
+    viewMode,
+  ]);
 
   useEffect(() => {
     const selected = new Set(seriesEntries.map((entry) => entry.datasetId));
@@ -1365,6 +1420,11 @@ export function ZarrViewer() {
         { includeSpatialCoordinates: false },
       );
       const value = firstFinite(result[nextVariable.id]);
+      const valueTimestamp = selectedValidDate(
+        currentInfo,
+        nextVariable,
+        nextSelections,
+      )?.getTime();
       const activePoint = inspectionPointRef.current;
       if (
         generation !== inspectionRequestGeneration.current
@@ -1372,7 +1432,13 @@ export function ZarrViewer() {
         || activePoint.lng !== point.lng
         || activePoint.lat !== point.lat
       ) return;
-      setInspector({ ...point, value: value ?? null });
+      setInspector({
+        ...point,
+        value: value ?? null,
+        valueTimestamp: Number.isFinite(valueTimestamp)
+          ? valueTimestamp
+          : undefined,
+      });
     } catch (error) {
       console.debug("Point inspection skipped", error);
     }
@@ -3440,6 +3506,17 @@ export function ZarrViewer() {
               cursorDate={selectedMapValidDate}
               temperatureUnit={meteogramTemperatureUnit}
               precipitationUnit={meteogramPrecipitationUnit}
+              mapPrecipitationRate={
+                currentUnitKind === "precipitation_rate"
+                && inspector.value !== null
+                && inspector.valueTimestamp !== undefined
+                  ? {
+                    timestamp: inspector.valueTimestamp,
+                    value: inspector.value,
+                    unit: activeVariableUnit,
+                  }
+                  : undefined
+              }
               windSpeedUnit={meteogramWindSpeedUnit}
               timeZone={inspectionTimeZone}
             />

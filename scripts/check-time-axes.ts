@@ -12,6 +12,7 @@ import {
   selectorFor,
   selectedValidDate,
   seriesStartDate,
+  sourcePointCoordinates,
   toDataCoordinates,
   validDateRange,
 } from "../app/data/axes";
@@ -59,6 +60,19 @@ assert.deepEqual(
   toDataCoordinates(getDataset("weatherzarr-ecmwf-ifs"), -98, 38.5),
   [-98, 38.5],
 );
+const hrrrCoordinates = toDataCoordinates(
+  getDataset("noaa-hrrr-forecast-48-hour"),
+  -71.5,
+  42.9,
+);
+assert.deepEqual(hrrrCoordinates, [-71.5, 42.9]);
+const projectedHrrrCoordinates = sourcePointCoordinates(
+  getDataset("noaa-hrrr-forecast-48-hour").sources.series,
+  -71.5,
+  42.9,
+);
+assert.ok(Math.abs(projectedHrrrCoordinates[0] - 2_096_161.55) < 1);
+assert.ok(Math.abs(projectedHrrrCoordinates[1] - 787_819.67) < 1);
 const weatherZarrSource = getDataset(
   "weatherzarr-ecmwf-ifs",
 ).sources.map!;

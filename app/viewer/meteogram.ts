@@ -1,5 +1,5 @@
 import type { DatasetConfig, DatasetSourceConfig } from "../catalog";
-import { timedeltaMilliseconds } from "../data/axes";
+import { defaultSelections, timedeltaMilliseconds } from "../data/axes";
 import type {
   AxisSelection,
   PointSeries,
@@ -7,6 +7,7 @@ import type {
   VariableConfig,
 } from "../data/types";
 import { convertUnitValue } from "../units";
+import { comparisonTimeIndex, isInitializationAxis } from "./variables";
 
 export type MeteogramViewMode = "series" | "meteogram";
 export type MeteogramLocation = {
@@ -35,19 +36,27 @@ export function meteogramComparisonDatasets(
   datasets: DatasetConfig[],
   longitude: number,
   latitude: number,
+  preferredDatasetId?: string,
 ) {
   return datasets
     .filter((dataset) => {
       const source = dataset.sources.series;
       return Boolean(
-        source?.meteogram?.comparisonPriority !== undefined
+        source?.meteogram
+        && (
+          source.meteogram.comparisonPriority !== undefined
+          || dataset.id === preferredDatasetId
+        )
         && containsPoint(source, longitude, latitude),
       );
     })
-    .sort((first, second) =>
-      (first.sources.series?.meteogram?.comparisonPriority ?? Infinity)
-      - (second.sources.series?.meteogram?.comparisonPriority ?? Infinity)
-    );
+    .sort((first, second) => {
+      const firstPreferred = first.id === preferredDatasetId;
+      const secondPreferred = second.id === preferredDatasetId;
+      if (firstPreferred !== secondPreferred) return firstPreferred ? -1 : 1;
+      return (first.sources.series?.meteogram?.comparisonPriority ?? Infinity)
+        - (second.sources.series?.meteogram?.comparisonPriority ?? Infinity);
+    });
 }
 
 export function preferredRegionalMeteogramDataset(
@@ -108,6 +117,33 @@ export function meteogramStartSelections(
   return index < 0
     ? selections
     : { ...selections, [leadDimension]: index };
+}
+
+export function meteogramSelectionsForInitialization(
+  info: StoreInfo,
+  variable: VariableConfig,
+  initializationDate?: Date,
+): AxisSelection {
+  const selections = defaultSelections(info, variable);
+  if (!initializationDate) return selections;
+  const dimensions = new Set([
+    ...variable.dimensions,
+    ...Object.values(info.axes)
+      .filter((axis) => axis.requiresStoreReload)
+      .map((axis) => axis.id),
+  ]);
+  for (const dimension of dimensions) {
+    const axis = info.axes[dimension];
+    if (axis?.kind === "time" && isInitializationAxis(axis)) {
+      selections[dimension] = comparisonTimeIndex(
+        info,
+        variable,
+        axis,
+        initializationDate,
+      );
+    }
+  }
+  return selections;
 }
 
 function centralValues(series: PointSeries) {

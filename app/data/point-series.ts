@@ -1,4 +1,3 @@
-import proj4 from "proj4";
 import * as zarr from "zarrita";
 import type { DatasetSourceConfig } from "../catalog";
 import { createBoundedAsyncQueue } from "../async-queue";
@@ -6,6 +5,7 @@ import {
   axisValueAsDate,
   isForecastSeries,
   regularSpatialCoordinateValues,
+  sourcePointCoordinates,
   timedeltaMilliseconds,
 } from "./axes";
 import {
@@ -75,22 +75,6 @@ function nearestLongitudeIndex(values: ArrayLike<number>, target: number) {
   return nearestIndex;
 }
 
-function pointInSourceCoordinates(
-  source: DatasetSourceConfig,
-  longitude: number,
-  latitude: number,
-  xValues: ArrayLike<number>,
-) {
-  if (source.proj4) {
-    const [x, y] = proj4("EPSG:4326", source.proj4, [longitude, latitude]);
-    return [x, y] as const;
-  }
-  const x = xValues[0] >= 0
-    ? ((longitude % 360) + 360) % 360
-    : longitude;
-  return [x, latitude] as const;
-}
-
 async function pointSpatialSelection(
   info: StoreInfo,
   variable: VariableConfig,
@@ -109,11 +93,11 @@ async function pointSpatialSelection(
     coordinateValues(info, longitudeDimension, options.concurrency),
   ]);
   options.signal?.throwIfAborted();
-  const [sourceLongitude, sourceLatitude] = pointInSourceCoordinates(
+  const [sourceLongitude, sourceLatitude] = sourcePointCoordinates(
     info.source,
     longitude,
     latitude,
-    longitudeValues,
+    longitudeValues[0],
   );
   return {
     latitudeDimension,

@@ -7,6 +7,15 @@ const date = new Date("2026-07-20T00:00:00Z");
 const markup = renderToStaticMarkup(createElement(Meteogram, {
   entries: [],
   fields: {
+    precipitationRate: {
+      kind: "history",
+      dates: [date],
+      values: [1.2],
+      unit: "mm/h",
+      variableLabel: "Precipitation rate",
+      latitude: 42,
+      longitude: -71,
+    },
     windSpeed: {
       kind: "history",
       dates: [date],
@@ -40,11 +49,17 @@ const markup = renderToStaticMarkup(createElement(Meteogram, {
   locationLabel: "Boston",
   temperatureUnit: { id: "tempF", label: "°F" },
   precipitationUnit: { id: "in/h", label: "in/hr" },
+  mapPrecipitationRate: {
+    timestamp: date.getTime(),
+    value: 27.68,
+    unit: "mm/h",
+  },
   windSpeedUnit: { id: "mph", label: "mph" },
   timeZone: "America/New_York",
 }));
 
 assert.match(markup, /22\.4<small> mph<\/small>/);
+assert.match(markup, /1\.1 in\/hr/);
 assert.match(markup, />36 mph<\/span>/);
 assert.doesNotMatch(markup, /m\/s/);
 

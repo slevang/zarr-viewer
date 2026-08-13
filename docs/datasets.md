@@ -82,19 +82,22 @@ Test users** and must periodically reauthorize.
 | `noaa-hrrr-forecast-48-hour-virtual` | `https://dynamical-noaa-hrrr.s3.us-west-2.amazonaws.com/noaa-hrrr-forecast-48-hour-virtual/v0.5.0.icechunk` | `s3://dynamical-noaa-hrrr/noaa-hrrr-forecast-48-hour-virtual/v0.5.0.icechunk/` |
 | `noaa-hrrr-analysis` | `https://dynamical-noaa-hrrr.s3.us-west-2.amazonaws.com/noaa-hrrr-analysis/v0.2.0.icechunk` | `s3://dynamical-noaa-hrrr/noaa-hrrr-analysis/v0.2.0.icechunk/` |
 | `ecmwf-aifs-single-forecast` | `https://dynamical-ecmwf-aifs-single.s3.us-west-2.amazonaws.com/ecmwf-aifs-single-forecast/v0.1.0.icechunk` | `s3://dynamical-ecmwf-aifs-single/ecmwf-aifs-single-forecast/v0.1.0.icechunk/` |
+| `ecmwf-aifs-single-forecast-virtual` | `https://dynamical-ecmwf-aifs-single.s3.us-west-2.amazonaws.com/ecmwf-aifs-single-forecast-virtual/v0.1.0.icechunk` | `s3://dynamical-ecmwf-aifs-single/ecmwf-aifs-single-forecast-virtual/v0.1.0.icechunk/` |
 | `ecmwf-aifs-ens-forecast` | `https://dynamical-ecmwf-aifs-ens.s3.us-west-2.amazonaws.com/ecmwf-aifs-ens-forecast/v0.1.0.icechunk` | `s3://dynamical-ecmwf-aifs-ens/ecmwf-aifs-ens-forecast/v0.1.0.icechunk/` |
 | `ecmwf-ifs-ens-forecast-15-day-0-25-degree` | `https://dynamical-ecmwf-ifs-ens.s3.us-west-2.amazonaws.com/ecmwf-ifs-ens-forecast-15-day-0-25-degree/v0.1.0.icechunk` | `s3://dynamical-ecmwf-ifs-ens/ecmwf-ifs-ens-forecast-15-day-0-25-degree/v0.1.0.icechunk/` |
 | `dwd-icon-eu-forecast-5-day` | `https://dynamical-dwd-icon-eu.s3.us-west-2.amazonaws.com/dwd-icon-eu-forecast-5-day/v0.2.0.icechunk` | `s3://dynamical-dwd-icon-eu/dwd-icon-eu-forecast-5-day/v0.2.0.icechunk/` |
 
-All are anonymous public stores in `us-west-2`. The virtual HRRR repository
-contains byte-range references to NOAA GRIB objects and uses the `gribberish`
-array-to-bytes codec. The other repositories use ordinary Zarr v3 codec
-pipelines, including sharded arrays.
+All are anonymous public stores in `us-west-2`. The virtual HRRR and AIFS
+Single repositories contain byte-range references to upstream GRIB objects and
+use the `gribberish` array-to-bytes codec. The other repositories use ordinary
+Zarr v3 codec pipelines, including sharded arrays.
 
-HRRR is represented as one logical dataset. Its map role resolves to the
-GRIB-backed repository and its series role resolves to the materialized
-repository. HRRR analysis remains cataloged separately and uses its currently
-available time-oriented store for maps until a spatial counterpart exists.
+HRRR and AIFS Single are each represented as one logical dataset. Their map
+roles resolve to GRIB-backed repositories and their series roles resolve to
+materialized repositories. The AIFS Single virtual repository remains in
+Dynamical's staging catalog, so the viewer marks that pairing experimental.
+HRRR analysis remains cataloged separately and uses its currently available
+time-oriented store for maps until a spatial counterpart exists.
 
 ## dynamical.org ASOS/AWOS observations
 

@@ -204,16 +204,29 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
     label: "ECMWF AIFS Single forecast",
     provider: "dynamical.org",
     category: "forecast",
-    description: "Global deterministic AI forecast through 15 days.",
-    sources: sharedSource({
-      id: "ecmwf-aifs-single-forecast",
-      kind: "icechunk",
-      url: "https://dynamical-ecmwf-aifs-single.s3.us-west-2.amazonaws.com/ecmwf-aifs-single-forecast/v0.1.0.icechunk",
-      s3Url: "s3://dynamical-ecmwf-aifs-single/ecmwf-aifs-single-forecast/v0.1.0.icechunk/",
-      zarrVersion: 3,
-    }),
-    support: "ready",
-    defaultVariable: "precipitation_surface",
+    description: "Global deterministic AI forecast through 15 days with role-optimized map and point-series stores.",
+    sources: {
+      map: {
+        id: "ecmwf-aifs-single-forecast-virtual",
+        kind: "icechunk",
+        url: "https://dynamical-ecmwf-aifs-single.s3.us-west-2.amazonaws.com/ecmwf-aifs-single-forecast-virtual/v0.1.0.icechunk",
+        s3Url: "s3://dynamical-ecmwf-aifs-single/ecmwf-aifs-single-forecast-virtual/v0.1.0.icechunk/",
+        zarrVersion: 3,
+        layout: "spatial",
+        requiresCrossOriginIsolation: true,
+        precipitationAccumulation: "cumulative",
+      },
+      series: {
+        id: "ecmwf-aifs-single-forecast",
+        kind: "icechunk",
+        url: "https://dynamical-ecmwf-aifs-single.s3.us-west-2.amazonaws.com/ecmwf-aifs-single-forecast/v0.1.0.icechunk",
+        s3Url: "s3://dynamical-ecmwf-aifs-single/ecmwf-aifs-single-forecast/v0.1.0.icechunk/",
+        zarrVersion: 3,
+      },
+    },
+    support: "experimental",
+    supportNote: "Map frames use Dynamical's staging GRIB-backed store; point forecasts use the production time-optimized store.",
+    defaultVariable: "total_precipitation_run_total_surface",
   },
   {
     id: "ecmwf-aifs-ens-forecast",
@@ -460,6 +473,7 @@ export const DATASETS: DatasetConfig[] = [
 ];
 
 const DATASET_ALIASES: Record<string, string> = {
+  "ecmwf-aifs-single-forecast-virtual": "ecmwf-aifs-single-forecast",
   "noaa-hrrr-forecast-48-hour-virtual": "noaa-hrrr-forecast-48-hour",
   "earthmover-era5-single-spatial": "earthmover-era5",
 };

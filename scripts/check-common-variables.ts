@@ -117,6 +117,7 @@ assertMatches("No false solar aggregate", [
 const expectedChunking = new Map([
   ["weatherzarr-ecmwf-ifs", "Dual-chunked"],
   ["noaa-hrrr-forecast-48-hour", "Dual-chunked"],
+  ["ecmwf-aifs-single-forecast", "Dual-chunked"],
   ["earthmover-era5", "Dual-chunked"],
   ["google-arco-era5", "Spatially-chunked"],
   ["google-weathernext-2", "Spatially-chunked"],

@@ -104,6 +104,22 @@ assert.equal(
     ?.requiresCrossOriginIsolation,
   undefined,
 );
+const aifsSingle = getDataset("ecmwf-aifs-single-forecast");
+assert.equal(
+  getDataset("ecmwf-aifs-single-forecast-virtual").id,
+  aifsSingle.id,
+);
+assert.equal(
+  aifsSingle.sources.map?.id,
+  "ecmwf-aifs-single-forecast-virtual",
+);
+assert.equal(aifsSingle.sources.map?.layout, "spatial");
+assert.equal(aifsSingle.sources.map?.requiresCrossOriginIsolation, true);
+assert.equal(
+  aifsSingle.sources.map?.precipitationAccumulation,
+  "cumulative",
+);
+assert.equal(aifsSingle.sources.series?.id, "ecmwf-aifs-single-forecast");
 assert.equal(
   baseViewerUrl("https://example.com/viewer/?dataset=old#map"),
   "https://example.com/viewer/",

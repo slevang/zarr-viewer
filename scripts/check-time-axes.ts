@@ -6,13 +6,13 @@ import {
   axisValueAsDate,
   defaultSelections,
   preserveForecastLeadSelection,
-  regularSpatialCoordinateValues,
   selectionsAfterAxisChange,
   selectionsForValidDate,
   selectorFor,
   selectedValidDate,
   seriesStartDate,
   sourcePointCoordinates,
+  storageIndex,
   toDataCoordinates,
   validDateRange,
 } from "../app/data/axes";
@@ -26,22 +26,7 @@ import type {
   StoreInfo,
   VariableConfig,
 } from "../app/data/types";
-import { weatherNextStoreUrl } from "../app/dataset";
-
-const weatherNextRoot =
-  "https://storage.googleapis.com/weathernext/weathernext_2_0_0/zarr";
-assert.equal(
-  weatherNextStoreUrl(weatherNextRoot, new Date("2026-07-25T18:00:00Z")),
-  `${weatherNextRoot}/2025_to_present/20260725_18hr_01_preds/predictions.zarr`,
-);
-assert.equal(
-  weatherNextStoreUrl(weatherNextRoot, new Date("2024-02-03T18:00:00Z")),
-  `${weatherNextRoot}/2024_to_2025/20240203_18hr_01_preds/predictions.zarr`,
-);
-assert.equal(
-  weatherNextStoreUrl(weatherNextRoot, new Date("2024-02-03T07:59:00Z")),
-  `${weatherNextRoot}/2024_to_2025/20240203_06hr_01_preds/predictions.zarr`,
-);
+import { playbackChunkKey } from "../app/viewer/playback";
 assert.equal(
   hasSpatialDimensions(
     ["time", "northing", "easting"],
@@ -56,10 +41,6 @@ assert.deepEqual(
   toDataCoordinates(getDataset("google-arco-era5"), -98, 38.5),
   [262, 38.5],
 );
-assert.deepEqual(
-  toDataCoordinates(getDataset("weatherzarr-ecmwf-ifs"), -98, 38.5),
-  [-98, 38.5],
-);
 const hrrrCoordinates = toDataCoordinates(
   getDataset("noaa-hrrr-forecast-48-hour"),
   -71.5,
@@ -73,21 +54,6 @@ const projectedHrrrCoordinates = sourcePointCoordinates(
 );
 assert.ok(Math.abs(projectedHrrrCoordinates[0] - 2_096_161.55) < 1);
 assert.ok(Math.abs(projectedHrrrCoordinates[1] - 787_819.67) < 1);
-const weatherZarrSource = getDataset(
-  "weatherzarr-ecmwf-ifs",
-).sources.map!;
-assert.deepEqual(
-  regularSpatialCoordinateValues(weatherZarrSource, "latitude", 3),
-  [90, 0, -90],
-);
-assert.deepEqual(
-  regularSpatialCoordinateValues(weatherZarrSource, "longitude", 4),
-  [-180, -90, 0, 90],
-);
-assert.equal(
-  regularSpatialCoordinateValues(weatherZarrSource, "valid_time", 57),
-  undefined,
-);
 
 const dataset = {
   id: "time-axis-check",
@@ -148,6 +114,22 @@ assert.equal(
     0,
   ).toISOString(),
   "1900-01-02T00:00:00.000Z",
+);
+
+const compactEra5Axis: AxisConfig = {
+  id: "time",
+  label: "Time",
+  unit: "hours since 1900-01-01",
+  kind: "time",
+  storageIndexOffset: 350_616,
+  values: [350_616, 350_617],
+};
+assert.equal(storageIndex(compactEra5Axis, 0), 350_616);
+assert.equal(storageIndex(compactEra5Axis, 380_447), 731_063);
+assert.equal(storageIndex(compactEra5Axis, 760_895), 1_111_511);
+assert.deepEqual(
+  [0, 380_447, 760_895].map((index) => storageIndex(compactEra5Axis, index)),
+  [350_616, 731_063, 1_111_511],
 );
 
 const ascendingAxis: AxisConfig = {
@@ -220,6 +202,29 @@ const forecastVariable = {
   unit: "K",
   dimensions: ["init_time", "lead_time", "latitude", "longitude"],
 } satisfies VariableConfig;
+assert.deepEqual(
+  selectorFor(
+    { ...forecastVariable, dimensions: ["time", "latitude", "longitude"] },
+    { time: 760_895 },
+    { time: compactEra5Axis },
+  ),
+  { time: { selected: 1_111_511, type: "index" } },
+);
+assert.equal(
+  playbackChunkKey(
+    {
+      id: "temperature_2m",
+      label: "Temperature",
+      unit: "K",
+      dimensions: ["time", "latitude", "longitude"],
+      shape: [1_323_648, 721, 1_440],
+      chunkShape: [24, 721, 1_440],
+    },
+    { time: 760_895 },
+    { time: compactEra5Axis },
+  ),
+  "/temperature_2m/c/46312/0/0",
+);
 assert.deepEqual(
   defaultSelections({
     ...forecastInfo,
@@ -323,69 +328,6 @@ assert.deepEqual(cannotPreserveBeforeInitialization, {
   init_time: 1,
   lead_time: 0,
 });
-
-const weatherNextInfo = {
-  ...forecastInfo,
-  source: {
-    ...forecastInfo.source,
-    kind: "weathernext",
-    zarrVersion: 2,
-  },
-  axes: {
-    init_time: {
-      ...forecastInfo.axes.init_time,
-      defaultIndex: 1,
-      requiresStoreReload: true,
-    },
-    time: {
-      id: "time",
-      label: "Lead time",
-      unit: "hours",
-      kind: "timedelta",
-      values: [0, 6, 12, 18],
-    },
-    sample: {
-      id: "sample",
-      label: "Sample",
-      unit: "",
-      kind: "number",
-      values: [0, 1],
-    },
-  },
-} satisfies StoreInfo;
-const weatherNextVariable = {
-  ...forecastVariable,
-  dimensions: ["sample", "time", "lat", "lon"],
-} satisfies VariableConfig;
-assert.deepEqual(
-  defaultSelections(weatherNextInfo, weatherNextVariable),
-  { sample: 0, time: 0, init_time: 1 },
-);
-const weatherNextAtNoon = selectionsForValidDate(
-  weatherNextInfo,
-  weatherNextVariable,
-  new Date("2021-02-07T12:00:00Z"),
-);
-assert.deepEqual(weatherNextAtNoon, {
-  sample: 0,
-  time: 1,
-  init_time: 1,
-});
-assert.equal(
-  selectedValidDate(
-    weatherNextInfo,
-    weatherNextVariable,
-    weatherNextAtNoon,
-  )?.toISOString(),
-  "2021-02-07T12:00:00.000Z",
-);
-assert.deepEqual(
-  selectorFor(weatherNextVariable, weatherNextAtNoon),
-  {
-    sample: { selected: 0, type: "index" },
-    time: { selected: 1, type: "index" },
-  },
-);
 
 const analysisInfo = {
   ...forecastInfo,

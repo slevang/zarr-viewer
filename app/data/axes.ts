@@ -62,6 +62,10 @@ export function timedeltaMilliseconds(axis: AxisConfig, index: number) {
   return value * 1_000;
 }
 
+export function storageIndex(axis: AxisConfig, logicalIndex: number) {
+  return Math.trunc(logicalIndex) + (axis.storageIndexOffset ?? 0);
+}
+
 export function isForecastSeries(
   info: StoreInfo,
   variable: VariableConfig,
@@ -85,7 +89,6 @@ export function defaultSelections(info: StoreInfo, variable: VariableConfig): Ax
       && axis.kind === "time"
       && (
         isValidTimeDimension(dimension)
-        || info.source.kind === "weathernext"
       )
       && !hasLeadAxis;
     selections[dimension] = axis.kind === "time"
@@ -323,11 +326,18 @@ export function selectionsAfterAxisChange(
 export function selectorFor(
   variable: VariableConfig,
   selections: AxisSelection,
+  axes: Record<string, AxisConfig> = {},
 ): Selector {
   const selector: Selector = {};
   for (const dimension of variable.dimensions) {
     if (dimension in selections) {
-      selector[dimension] = { selected: selections[dimension], type: "index" };
+      const axis = axes[dimension];
+      selector[dimension] = {
+        selected: axis
+          ? storageIndex(axis, selections[dimension])
+          : selections[dimension],
+        type: "index",
+      };
     }
   }
   return selector;

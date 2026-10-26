@@ -14,6 +14,8 @@ export type AxisConfig = {
   unit: string;
   kind: AxisKind;
   values: Array<number | string>;
+  /** Physical array index = logical selection + this offset. */
+  storageIndexOffset?: number;
   defaultIndex?: number;
   requiresStoreReload?: boolean;
 };

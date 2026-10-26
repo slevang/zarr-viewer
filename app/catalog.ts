@@ -5,17 +5,16 @@ export type DatasetCategory = "forecast" | "analysis";
 export type DatasetSourceConfig = {
   id: string;
   kind:
-    | "zarr"
     | "icechunk"
-    | "weatherzarr"
-    | "weathernext"
     | "google-arco"
     | "ecmwf-arco";
   url: string;
+  stacCollectionId?: string;
+  stacAsset?: string;
   s3Url?: string;
   group?: string;
   zarrVersion: 2 | 3;
-  auth?: "google" | "cds-api-key";
+  auth?: "cds-api-key";
   spatialDimensions?: { lat: string; lon: string };
   bounds?: [number, number, number, number];
   crs?: string;
@@ -80,6 +79,15 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
     description: "Global, 0.25°, hourly analysis; time-optimized.",
     sources: {
       map: {
+        id: "noaa-gfs-analysis-virtual",
+        kind: "icechunk",
+        url: "https://dynamical-noaa-gfs.s3.us-west-2.amazonaws.com/noaa-gfs-analysis-virtual/v0.1.0.icechunk",
+        s3Url: "s3://dynamical-noaa-gfs/noaa-gfs-analysis-virtual/v0.1.0.icechunk/",
+        zarrVersion: 3,
+        layout: "spatial",
+        requiresCrossOriginIsolation: true,
+      },
+      series: {
         id: "noaa-gfs-analysis",
         kind: "icechunk",
         url: "https://dynamical-noaa-gfs.s3.us-west-2.amazonaws.com/noaa-gfs-analysis/v0.1.0.icechunk",
@@ -96,13 +104,24 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
     provider: "dynamical.org",
     category: "forecast",
     description: "Global, 0.25°, 16-day deterministic forecast.",
-    sources: sharedSource({
-      id: "noaa-gfs-forecast",
-      kind: "icechunk",
-      url: "https://dynamical-noaa-gfs.s3.us-west-2.amazonaws.com/noaa-gfs-forecast/v0.2.7.icechunk",
-      s3Url: "s3://dynamical-noaa-gfs/noaa-gfs-forecast/v0.2.7.icechunk/",
-      zarrVersion: 3,
-    }),
+    sources: {
+      map: {
+        id: "noaa-gfs-forecast-virtual",
+        kind: "icechunk",
+        url: "https://dynamical-noaa-gfs.s3.us-west-2.amazonaws.com/noaa-gfs-forecast-virtual/v0.1.0.icechunk",
+        s3Url: "s3://dynamical-noaa-gfs/noaa-gfs-forecast-virtual/v0.1.0.icechunk/",
+        zarrVersion: 3,
+        layout: "spatial",
+        requiresCrossOriginIsolation: true,
+      },
+      series: {
+        id: "noaa-gfs-forecast",
+        kind: "icechunk",
+        url: "https://dynamical-noaa-gfs.s3.us-west-2.amazonaws.com/noaa-gfs-forecast/v0.2.7.icechunk",
+        s3Url: "s3://dynamical-noaa-gfs/noaa-gfs-forecast/v0.2.7.icechunk/",
+        zarrVersion: 3,
+      },
+    },
     support: "ready",
     defaultVariable: "precipitation_surface",
   },
@@ -112,13 +131,24 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
     provider: "dynamical.org",
     category: "forecast",
     description: "Global ensemble forecast through 35 days.",
-    sources: sharedSource({
-      id: "noaa-gefs-forecast-35-day",
-      kind: "icechunk",
-      url: "https://dynamical-noaa-gefs.s3.us-west-2.amazonaws.com/noaa-gefs-forecast-35-day/v0.2.0.icechunk",
-      s3Url: "s3://dynamical-noaa-gefs/noaa-gefs-forecast-35-day/v0.2.0.icechunk/",
-      zarrVersion: 3,
-    }),
+    sources: {
+      map: {
+        id: "noaa-gefs-forecast-10-day-0-25-degree-virtual",
+        kind: "icechunk",
+        url: "https://dynamical-noaa-gefs.s3.us-west-2.amazonaws.com/noaa-gefs-forecast-10-day-0-25-degree-virtual/v0.1.0.icechunk",
+        s3Url: "s3://dynamical-noaa-gefs/noaa-gefs-forecast-10-day-0-25-degree-virtual/v0.1.0.icechunk/",
+        zarrVersion: 3,
+        layout: "spatial",
+        requiresCrossOriginIsolation: true,
+      },
+      series: {
+        id: "noaa-gefs-forecast-35-day",
+        kind: "icechunk",
+        url: "https://dynamical-noaa-gefs.s3.us-west-2.amazonaws.com/noaa-gefs-forecast-35-day/v0.2.0.icechunk",
+        s3Url: "s3://dynamical-noaa-gefs/noaa-gefs-forecast-35-day/v0.2.0.icechunk/",
+        zarrVersion: 3,
+      },
+    },
     support: "ready",
     defaultVariable: "precipitation_surface",
   },
@@ -130,6 +160,15 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
     description: "Global, 0.25°, three-hourly ensemble analysis.",
     sources: {
       map: {
+        id: "noaa-gefs-analysis-0-25-degree-virtual",
+        kind: "icechunk",
+        url: "https://dynamical-noaa-gefs.s3.us-west-2.amazonaws.com/noaa-gefs-analysis-0-25-degree-virtual/v0.1.0.icechunk",
+        s3Url: "s3://dynamical-noaa-gefs/noaa-gefs-analysis-0-25-degree-virtual/v0.1.0.icechunk/",
+        zarrVersion: 3,
+        layout: "spatial",
+        requiresCrossOriginIsolation: true,
+      },
+      series: {
         id: "noaa-gefs-analysis",
         kind: "icechunk",
         url: "https://dynamical-noaa-gefs.s3.us-west-2.amazonaws.com/noaa-gefs-analysis/v0.1.2.icechunk",
@@ -187,6 +226,16 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
     description: "CONUS, 3 km, hourly analysis.",
     sources: {
       map: {
+        id: "noaa-hrrr-analysis-virtual",
+        kind: "icechunk",
+        url: "https://dynamical-noaa-hrrr.s3.us-west-2.amazonaws.com/noaa-hrrr-analysis-virtual/v0.1.0.icechunk",
+        s3Url: "s3://dynamical-noaa-hrrr/noaa-hrrr-analysis-virtual/v0.1.0.icechunk/",
+        zarrVersion: 3,
+        layout: "spatial",
+        requiresCrossOriginIsolation: true,
+        ...HRRR_GRID,
+      },
+      series: {
         id: "noaa-hrrr-analysis",
         kind: "icechunk",
         url: "https://dynamical-noaa-hrrr.s3.us-west-2.amazonaws.com/noaa-hrrr-analysis/v0.2.0.icechunk",
@@ -196,7 +245,7 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
       },
     },
     support: "experimental",
-    supportNote: "Uses the available time-oriented store for maps until a spatial store exists.",
+    supportNote: "Map frames use the virtual spatial store; point history uses the time-oriented store.",
     defaultVariable: "precipitation_surface",
   },
   {
@@ -225,7 +274,7 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
       },
     },
     support: "experimental",
-    supportNote: "Map frames use Dynamical's staging GRIB-backed store; point forecasts use the production time-optimized store.",
+    supportNote: "Map frames use Dynamical's virtual spatial store; point forecasts use the time-optimized store.",
     defaultVariable: "total_precipitation_run_total_surface",
   },
   {
@@ -291,77 +340,52 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
   },
 ];
 
+const DYNAMICAL_DATASETS_WITH_STAC = DYNAMICAL_DATASETS.map((dataset) => ({
+  ...dataset,
+  sources: {
+    map: dataset.sources.map
+      ? {
+        ...dataset.sources.map,
+        stacCollectionId: dataset.sources.map.id,
+        stacAsset: "icechunk-https",
+      }
+      : undefined,
+    series: dataset.sources.series
+      ? {
+        ...dataset.sources.series,
+        stacCollectionId: dataset.sources.series.id,
+        stacAsset: "icechunk-https",
+      }
+      : undefined,
+  },
+}));
+
 export const DATASETS: DatasetConfig[] = [
   {
     id: "google-weathernext-2",
     label: "WeatherNext 2 forecast",
-    provider: "Google",
+    provider: "dynamical.org / Google",
     category: "forecast",
     description: "Current global 0.25° 64-member, 15-day AI forecast.",
     sources: {
       map: {
-        id: "google-weathernext-2",
-        kind: "weathernext",
-        url: "https://storage.googleapis.com/weathernext/weathernext_2_0_0/zarr",
-        zarrVersion: 2,
+        id: "google-weathernext2-forecast-operational-virtual",
+        kind: "icechunk",
+        url: "https://google-weathernext2.r2.dynamical.org/google-weathernext2-forecast-operational-virtual/v0.1.0.icechunk",
+        zarrVersion: 3,
         layout: "spatial",
-        auth: "google",
-        spatialDimensions: { lat: "lat", lon: "lon" },
+        requiresCrossOriginIsolation: false,
+        spatialDimensions: { lat: "y", lon: "x" },
         bounds: [0, -90, 360, 90],
         crs: "EPSG:4326",
         latIsAscending: true,
+        stacCollectionId: "google-weathernext2-forecast-operational-virtual",
+        stacAsset: "icechunk-https",
       },
     },
-    support: "experimental",
-    supportNote: "Requires Google authorization; each map chunk contains one global ensemble-member field.",
-    defaultVariable: "total_precipitation_6hr",
-  },
-  {
-    id: "weatherzarr-ecmwf-ifs",
-    label: "ECMWF IFS forecast",
-    provider: "WeatherZarr",
-    category: "forecast",
-    description: "Current global 0.25° IFS control forecast with paired map and point layouts.",
-    sources: {
-      map: {
-        id: "weatherzarr-ecmwf-ifs-spatial",
-        kind: "weatherzarr",
-        url: "https://weatherzarr.com/data/ecmwf-ifs025/latest.json",
-        zarrVersion: 3,
-        layout: "spatial",
-        spatialDimensions: { lat: "latitude", lon: "longitude" },
-        bounds: [-180, -90, 180, 90],
-        crs: "EPSG:4326",
-        latIsAscending: false,
-        spatialCoordinates: "regular-global",
-        precipitationAccumulation: "cumulative",
-        geographicBounds: [-180, -90, 180, 90],
-        meteogram: {
-          kind: "global-control",
-          firstLeadHour: 3,
-        },
-      },
-      series: {
-        id: "weatherzarr-ecmwf-ifs-timeseries",
-        kind: "weatherzarr",
-        url: "https://weatherzarr.com/data/ecmwf-ifs025/latest.json",
-        zarrVersion: 3,
-        layout: "timeseries",
-        spatialDimensions: { lat: "latitude", lon: "longitude" },
-        bounds: [-180, -90, 180, 90],
-        crs: "EPSG:4326",
-        latIsAscending: false,
-        spatialCoordinates: "regular-global",
-        precipitationAccumulation: "cumulative",
-        geographicBounds: [-180, -90, 180, 90],
-        meteogram: {
-          kind: "global-control",
-        },
-      },
-    },
-    support: "experimental",
-    supportNote: "WeatherZarr retains a rolling set of recent operational runs.",
-    defaultVariable: "tp",
+    support: "ready",
+    supportNote: "Public, map-optimized Icechunk archive; no Google credentials required.",
+    defaultVariable: "temperature_2m",
   },
   {
     id: "google-arco-era5",
@@ -419,7 +443,7 @@ export const DATASETS: DatasetConfig[] = [
     supportNote: "Requires a CDS API key; ECMWF currently describes tokenized ARCO access as a beta service.",
     defaultVariable: "tp",
   },
-  ...DYNAMICAL_DATASETS,
+  ...DYNAMICAL_DATASETS_WITH_STAC,
   {
     id: "earthmover-era5",
     label: "ECMWF ERA5 reanalysis",
@@ -450,36 +474,18 @@ export const DATASETS: DatasetConfig[] = [
     supportNote: "Uses the read-only PCodec WASM decoder.",
     defaultVariable: "tp",
   },
-  {
-    id: "salient-gemai-v3-reforecast",
-    label: "Salient GemAI v3 reforecast",
-    provider: "Salient",
-    category: "forecast",
-    description: "Global 0.25° 50-member extended-range reforecasts from 2000–2025.",
-    sources: sharedSource({
-      id: "salient-gemai-v3-reforecast",
-      kind: "zarr",
-      url: "https://gemv3-reforecast.salient-open-data.com/forecast",
-      zarrVersion: 3,
-      spatialDimensions: { lat: "lat", lon: "lon" },
-      bounds: [-180, -90, 180, 90],
-      crs: "EPSG:4326",
-      latIsAscending: true,
-    }),
-    support: "experimental",
-    supportNote: "Uses sharded PCodec chunks spanning seven leads and all 50 members.",
-    defaultVariable: "mean_total_precipitation_rate",
-  },
 ];
 
 const DATASET_ALIASES: Record<string, string> = {
   "ecmwf-aifs-single-forecast-virtual": "ecmwf-aifs-single-forecast",
   "noaa-hrrr-forecast-48-hour-virtual": "noaa-hrrr-forecast-48-hour",
   "earthmover-era5-single-spatial": "earthmover-era5",
+  "weatherzarr-ecmwf-ifs": "google-weathernext-2",
+  "salient-gemai-v3-reforecast": "google-weathernext-2",
 };
 
 export const DEFAULT_DATASET_ID =
-  import.meta.env?.VITE_DATASET_ID || "weatherzarr-ecmwf-ifs";
+  import.meta.env?.VITE_DATASET_ID || "google-weathernext-2";
 
 export const DATASET_CATEGORY_GROUPS = [
   { id: "forecast", label: "Forecast" },
@@ -502,7 +508,9 @@ export function datasetOptionLabel(dataset: DatasetConfig) {
 
 export function getDataset(id: string) {
   const resolvedId = DATASET_ALIASES[id] ?? id;
-  return DATASETS.find((dataset) => dataset.id === resolvedId) ?? DATASETS[0];
+  return DATASETS.find((dataset) => dataset.id === resolvedId)
+    ?? DATASETS.find((dataset) => dataset.id === DEFAULT_DATASET_ID)
+    ?? DATASETS[0];
 }
 
 export function getDatasetSource(

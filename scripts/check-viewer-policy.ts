@@ -85,16 +85,6 @@ assert.match(
 assert.equal(formatUtcTick(timezoneTestDate, true), "Jul 30 1205Z");
 assert.equal(formatUtcTick(timezoneTestDate, false), "Jul 30");
 assert.equal(
-  getDataset("weatherzarr-ecmwf-ifs").sources.map
-    ?.precipitationAccumulation,
-  "cumulative",
-);
-assert.equal(
-  getDataset("weatherzarr-ecmwf-ifs").sources.series
-    ?.precipitationAccumulation,
-  "cumulative",
-);
-assert.equal(
   getDataset("noaa-hrrr-forecast-48-hour").sources.map
     ?.requiresCrossOriginIsolation,
   true,
@@ -334,19 +324,6 @@ assert.deepEqual(
     "noaa-hrrr-forecast-48-hour",
   ],
 );
-assert.deepEqual(
-  meteogramComparisonDatasets(
-    DATASETS,
-    -71.06,
-    42.36,
-    "weatherzarr-ecmwf-ifs",
-  ).map((candidate) => candidate.id),
-  [
-    "weatherzarr-ecmwf-ifs",
-    "noaa-hrrr-forecast-48-hour",
-    "ecmwf-ifs-ens-forecast-15-day-0-25-degree",
-  ],
-);
 assert.equal(
   preferredRegionalMeteogramDataset(DATASETS, -71.06, 42.36)?.id,
   "noaa-hrrr-forecast-48-hour",
@@ -404,11 +381,6 @@ assert.equal(
 assert.equal(
   getDataset("ecmwf-ifs-ens-forecast-15-day-0-25-degree")
     .sources.series?.meteogram?.firstLeadHour,
-  3,
-);
-assert.equal(
-  getDataset("weatherzarr-ecmwf-ifs")
-    .sources.map?.meteogram?.firstLeadHour,
   3,
 );
 const trimmedForecast = trimMeteogramSeries({
@@ -600,7 +572,7 @@ assert.deepEqual(
 const preloadTargetDate = new Date("2026-07-20T12:00:00Z");
 const activePreloadTargetDate = new Date("2026-07-20T00:00:00Z");
 const preloadRequests = datasetPreloadRequests(DATASETS, {
-  activeDatasetId: "weatherzarr-ecmwf-ifs",
+  activeDatasetId: "noaa-gfs-forecast",
   targetDate: preloadTargetDate,
   activeDatasetTargetDate: activePreloadTargetDate,
 });
@@ -608,7 +580,7 @@ assert.equal(preloadRequests[0]?.role, "series");
 assert.equal(
   preloadRequests.find(
     (request) =>
-      request.datasetId === "weatherzarr-ecmwf-ifs"
+      request.datasetId === "noaa-gfs-forecast"
       && request.role === "series",
   )?.targetDate,
   activePreloadTargetDate,
@@ -616,7 +588,7 @@ assert.equal(
 assert.equal(
   preloadRequests.some(
     (request) =>
-      request.datasetId === "weatherzarr-ecmwf-ifs"
+      request.datasetId === "noaa-gfs-forecast"
       && request.role === "map",
   ),
   false,
@@ -629,7 +601,7 @@ assert.equal(
 );
 assert.equal(
   datasetPreloadRequests(DATASETS, {
-    activeDatasetId: "weatherzarr-ecmwf-ifs",
+    activeDatasetId: "noaa-gfs-forecast",
     includeAuthenticated: true,
   }).some(
     (request) => getDataset(request.datasetId).sources[request.role]?.auth,
@@ -637,7 +609,7 @@ assert.equal(
   true,
 );
 const ecmwfAuthenticatedPreloads = datasetPreloadRequests(DATASETS, {
-  activeDatasetId: "weatherzarr-ecmwf-ifs",
+  activeDatasetId: "noaa-gfs-forecast",
   availableAuth: ["cds-api-key"],
 });
 assert.equal(
@@ -650,7 +622,7 @@ assert.equal(
   ecmwfAuthenticatedPreloads.some(
     (request) => request.datasetId === "google-weathernext-2",
   ),
-  false,
+  true,
 );
 
 let activePreloads = 0;

@@ -12,7 +12,6 @@ assert.match(index, new RegExp(`(?:src|href)=["']${escapedBase}assets/`));
 assert.ok(scripts.length > 0, "Static build did not emit an application script");
 await access(new URL("coastline.geojson", output));
 await access(new URL("asos-stations.geojson", output));
-await access(new URL("google-auth.html", output));
 const serviceWorker = await readFile(
   new URL("coi-serviceworker.min.js", output),
   "utf8",
@@ -22,16 +21,6 @@ assert.match(
   index,
   new RegExp(`src=["']${escapedBase}coi-serviceworker\\.min\\.js["']`),
   "COOP/COEP service worker URL does not honor BASE_PATH",
-);
-assert.match(
-  serviceWorker,
-  /same-origin-allow-popups/,
-  "Google auth bridge does not enable popup-compatible COOP",
-);
-assert.match(
-  serviceWorker,
-  /google-auth\.html/,
-  "Static build does not preserve the non-isolated Google auth bridge",
 );
 assert.match(
   serviceWorker,

@@ -10,21 +10,12 @@ function crossOriginHeaders() {
     },
     next: () => void,
   ) => {
-    const url = new URL(request.url ?? "/", "http://localhost");
-    if (url.pathname.endsWith("/google-auth.html")) {
-      response.setHeader(
-        "Cross-Origin-Opener-Policy",
-        "same-origin-allow-popups",
-      );
-      response.removeHeader("Cross-Origin-Embedder-Policy");
-    } else {
-      response.setHeader("Cross-Origin-Opener-Policy", "same-origin");
-      response.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
-    }
+    response.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+    response.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
     next();
   };
   return {
-    name: "cross-origin-isolation-with-auth-bridge",
+    name: "cross-origin-isolation",
     configureServer(server: {
       middlewares: { use: (handler: typeof applyHeaders) => void };
     }) {

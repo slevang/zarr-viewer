@@ -1,6 +1,7 @@
 import { commonVariableMatches } from "../app/common-variables";
 import {
   DATASETS,
+  DEFAULT_DATASET_ID,
   datasetChunkingLabel,
   getDataset,
 } from "../app/catalog";
@@ -85,44 +86,31 @@ assertMatches("Earthmover ERA5", [
   "v10:v10",
 ]);
 
-assertMatches("Salient GemAI v3", [
-  variable("2m_temperature", "2 metre temperature"),
-  variable(
-    "mean_2m_dewpoint_temperature",
-    "Mean 2 metre dewpoint temperature",
-  ),
-  variable(
-    "mean_total_precipitation_rate",
-    "Mean total precipitation rate",
-    "precipitation_flux",
-  ),
-  variable(
-    "mean_surface_downward_short_wave_radiation_flux",
-    "Mean surface downward short wave radiation flux",
-  ),
-  variable("mean_total_cloud_cover", "Mean total cloud cover"),
-], [
-  "t2m:2m_temperature",
-  "d2m:mean_2m_dewpoint_temperature",
-  "tp:mean_total_precipitation_rate",
-  "ssrd:mean_surface_downward_short_wave_radiation_flux",
-  "tcc:mean_total_cloud_cover",
-]);
-
 assertMatches("No false solar aggregate", [
   variable("downward_diffuse_short_wave_radiation_flux_surface"),
   variable("downward_direct_short_wave_radiation_flux_surface"),
 ], []);
 
 const expectedChunking = new Map([
-  ["weatherzarr-ecmwf-ifs", "Dual-chunked"],
+  ["noaa-gfs-analysis", "Dual-chunked"],
   ["noaa-hrrr-forecast-48-hour", "Dual-chunked"],
   ["ecmwf-aifs-single-forecast", "Dual-chunked"],
   ["earthmover-era5", "Dual-chunked"],
   ["google-arco-era5", "Spatially-chunked"],
   ["google-weathernext-2", "Spatially-chunked"],
-  ["noaa-gfs-forecast", "Timeseries-chunked"],
+  ["noaa-gfs-forecast", "Dual-chunked"],
 ]);
+if (DEFAULT_DATASET_ID !== "google-weathernext-2") {
+  throw new Error(`Unexpected default dataset ${DEFAULT_DATASET_ID}`);
+}
+for (const removedId of [
+  "weatherzarr-ecmwf-ifs",
+  "salient-gemai-v3-reforecast",
+]) {
+  if (getDataset(removedId).id !== DEFAULT_DATASET_ID) {
+    throw new Error(`${removedId} did not resolve to the new default dataset`);
+  }
+}
 for (const [datasetId, expected] of expectedChunking) {
   const actual = datasetChunkingLabel(getDataset(datasetId));
   if (actual !== expected) {
@@ -135,6 +123,12 @@ for (const dataset of DATASETS) {
   const match = defaultVariable
     ? commonVariableMatches([variable(defaultVariable)])[0]
     : undefined;
+  if (dataset.id === "google-weathernext-2") {
+    if (match?.key !== "t2m") {
+      throw new Error(`${dataset.id}: expected a temperature default`);
+    }
+    continue;
+  }
   if (match?.key !== "tp") {
     throw new Error(
       `${dataset.id}: expected a precipitation default; received ${defaultVariable ?? "none"}`,

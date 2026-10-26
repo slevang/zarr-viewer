@@ -6,6 +6,7 @@ import {
   isForecastSeries,
   regularSpatialCoordinateValues,
   sourcePointCoordinates,
+  storageIndex,
   timedeltaMilliseconds,
 } from "./axes";
 import {
@@ -217,11 +218,16 @@ export async function loadPointTimeSeries(
   const timeAxis = info.axes[timeDimension];
   const start = selections[timeDimension] ?? 0;
   const stop = Math.min(timeAxis.values.length, start + SERIES_LOOKAHEAD_HOURS);
+  const storageStart = storageIndex(timeAxis, start);
+  const storageStop = storageIndex(timeAxis, stop);
   const request = variable.dimensions.map((dimension) => {
-    if (dimension === timeDimension) return zarr.slice(start, stop);
+    if (dimension === timeDimension) return zarr.slice(storageStart, storageStop);
     if (dimension === latitudeDimension) return latitudeIndex;
     if (dimension === longitudeDimension) return longitudeIndex;
-    return selections[dimension] ?? 0;
+    const axis = info.axes[dimension];
+    return axis
+      ? storageIndex(axis, selections[dimension] ?? 0)
+      : selections[dimension] ?? 0;
   });
   const result = await zarr.get(dataArray, request, zarrReadOptions(options));
   const values = Array.from(result.data as ArrayLike<number | bigint>, Number);
@@ -453,7 +459,10 @@ async function loadRawPointForecast(
     if (dimension === memberDimension) return zarr.slice(0, memberCount);
     if (dimension === latitudeDimension) return latitudeIndex;
     if (dimension === longitudeDimension) return longitudeIndex;
-    return selections[dimension] ?? 0;
+    const axis = info.axes[dimension];
+    return axis
+      ? storageIndex(axis, selections[dimension] ?? 0)
+      : selections[dimension] ?? 0;
   });
   const result = await zarr.get(dataArray, request, zarrReadOptions(options));
   const remainingDimensions = variable.dimensions.filter(

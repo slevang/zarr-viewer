@@ -1,25 +1,8 @@
-import { readFile } from "node:fs/promises";
+import assert from "node:assert/strict";
 import * as zarr from "zarrita";
-import { initializePcodec } from "../app/codecs/pcodec";
-import {
-  defaultSelections,
-  loadPointForecast,
-  loadStoreInfo,
-} from "../app/dataset";
+import { getDataset } from "../app/catalog";
+import { defaultSelections, loadStoreInfo } from "../app/dataset";
 import { isSpatialDimension } from "../app/data/dimensions";
-import {
-  variableLayerOptions,
-  variableLayerUnit,
-} from "../app/derived-store";
-
-await initializePcodec(
-  await readFile(
-    new URL(
-      "../packages/zarrita-pcodec/pkg/pcodec_wasm_bg.wasm",
-      import.meta.url,
-    ),
-  ),
-);
 
 function scalarValue(result: unknown) {
   const data = result && typeof result === "object" && "data" in result
@@ -30,198 +13,80 @@ function scalarValue(result: unknown) {
     : Number(data);
 }
 
-const weatherZarr = await loadStoreInfo("weatherzarr-ecmwf-ifs", "map");
-const weatherZarrTemperature = weatherZarr.variables.find(
-  (variable) => variable.id === "2t",
+const weatherNext = await loadStoreInfo("google-weathernext-2", "map");
+assert.equal(weatherNext.source.kind, "icechunk");
+assert.equal(weatherNext.source.requiresCrossOriginIsolation, false);
+assert.equal(weatherNext.source.auth, undefined);
+assert.ok(weatherNext.variables.some((variable) => variable.id === "temperature_2m"));
+for (const axis of ["init_time", "lead_time", "ensemble_member"]) {
+  assert.ok(weatherNext.axes[axis], `WeatherNext 2 is missing ${axis}`);
+}
+const weatherNextVariable = weatherNext.variables.find(
+  (variable) => variable.id === "temperature_2m",
+)!;
+const weatherNextDefaults = defaultSelections(weatherNext, weatherNextVariable);
+assert.equal(
+  weatherNextDefaults.init_time,
+  weatherNext.axes.init_time.values.length - 1,
 );
-if (!weatherZarrTemperature) {
-  throw new Error("WeatherZarr IFS did not report 2t");
-}
-if (
-  weatherZarr.axes.init_time?.kind !== "time"
-  || !weatherZarr.axes.init_time.requiresStoreReload
-  || weatherZarr.axes.init_time.values.length < 2
-) {
-  throw new Error("WeatherZarr IFS did not report its rolling initialization archive");
-}
-if (
-  weatherZarr.axes.valid_time?.kind !== "timedelta"
-  || weatherZarr.axes.valid_time.label !== "Lead time"
-  || !Number.isFinite(Number(weatherZarr.axes.valid_time.values[0]))
-  || Number(weatherZarr.axes.valid_time.values[0]) < 0
-) {
-  throw new Error("WeatherZarr IFS did not normalize valid_time to forecast lead");
-}
-const weatherZarrArray = await zarr.open(
-  zarr.root(weatherZarr.store!).resolve("2t"),
+const weatherNextArray = await zarr.open(
+  zarr.root(weatherNext.store!).resolve(weatherNextVariable.id),
   { kind: "array" },
 );
-const weatherZarrValue = await zarr.get(weatherZarrArray, [0, 360, 720]);
-const weatherZarrLatitude = await zarr.open(
-  zarr.root(weatherZarr.store!).resolve("latitude"),
-  { kind: "array" },
+const weatherNextSelection = weatherNextVariable.dimensions.map((dimension, index) =>
+  isSpatialDimension(dimension, weatherNext.source)
+    ? Math.floor((weatherNextVariable.shape?.[index] ?? 1) / 2)
+    : weatherNextDefaults[dimension] ?? 0,
 );
-const weatherZarrLatitudeValues = await zarr.get(weatherZarrLatitude);
-const weatherZarrPrecipitation = weatherZarr.variables.find(
-  (variable) => variable.id === "tp",
+const weatherNextValue = scalarValue(
+  await zarr.get(weatherNextArray, weatherNextSelection),
 );
-if (!weatherZarrPrecipitation?.shape) {
-  throw new Error("WeatherZarr IFS did not report total precipitation");
-}
-const precipitationLeadDimension = weatherZarrPrecipitation.dimensions.findIndex(
-  (dimension) => weatherZarr.axes[dimension]?.kind === "timedelta",
-);
-if (precipitationLeadDimension < 0) {
-  throw new Error("WeatherZarr precipitation did not report a lead-time axis");
-}
-const precipitationCurrentSelection = weatherZarrPrecipitation.dimensions.map(
-  (dimension, index) => {
-    if (index === precipitationLeadDimension) return 1;
-    return isSpatialDimension(dimension, weatherZarr.source)
-      ? Math.floor((weatherZarrPrecipitation.shape?.[index] ?? 1) / 2)
-      : 0;
-  },
-);
-const precipitationPreviousSelection = [...precipitationCurrentSelection];
-precipitationPreviousSelection[precipitationLeadDimension] = 0;
-const weatherZarrPrecipitationArray = await zarr.open(
-  zarr.root(weatherZarr.store!).resolve(weatherZarrPrecipitation.id),
-  { kind: "array" },
-);
-const [rawPreviousPrecipitation, rawCurrentPrecipitation] = await Promise.all([
-  zarr.get(weatherZarrPrecipitationArray, precipitationPreviousSelection),
-  zarr.get(weatherZarrPrecipitationArray, precipitationCurrentSelection),
-]);
-const precipitationLayerOptions = await variableLayerOptions(
-  weatherZarr,
-  weatherZarrPrecipitation,
-);
-const ratePrecipitationArray = await zarr.open(
-  zarr.root(precipitationLayerOptions.store!).resolve(
-    weatherZarrPrecipitation.id,
-  ),
-  { kind: "array" },
-);
-const ratePrecipitation = await zarr.get(
-  ratePrecipitationArray,
-  precipitationCurrentSelection,
-);
-const rawPreviousPrecipitationValue = scalarValue(rawPreviousPrecipitation);
-const rawCurrentPrecipitationValue = scalarValue(rawCurrentPrecipitation);
-const ratePrecipitationValue = scalarValue(ratePrecipitation);
-const previousLead = Number(weatherZarr.axes.valid_time.values[0]);
-const currentLead = Number(weatherZarr.axes.valid_time.values[1]);
-const expectedRatePrecipitation = Math.max(
-  0,
-  rawCurrentPrecipitationValue - rawPreviousPrecipitationValue,
-) * 1000 / (currentLead - previousLead);
-if (
-  !Number.isFinite(rawPreviousPrecipitationValue)
-  || !Number.isFinite(rawCurrentPrecipitationValue)
-  || !Number.isFinite(ratePrecipitationValue)
-  || variableLayerUnit(weatherZarr, weatherZarrPrecipitation) !== "mm/h"
-  || Math.abs(ratePrecipitationValue - expectedRatePrecipitation) > 1e-7
-) {
-  throw new Error(
-    "WeatherZarr precipitation was not converted to a finite hourly rate:"
-    + ` ${rawPreviousPrecipitationValue} → ${rawCurrentPrecipitationValue}`
-    + ` produced ${ratePrecipitationValue}`,
+assert.ok(Number.isFinite(weatherNextValue));
+
+const virtualMaps = [
+  "noaa-gfs-forecast",
+  "noaa-gefs-analysis",
+  "noaa-hrrr-analysis",
+];
+const resolved = [];
+for (const datasetId of virtualMaps) {
+  const dataset = getDataset(datasetId);
+  const source = dataset.sources.map;
+  assert.ok(source?.id.endsWith("-virtual"), `${datasetId} map is not virtual`);
+  const info = await loadStoreInfo(datasetId, "map");
+  assert.equal(info.source.kind, "icechunk");
+  assert.ok(info.variables.length > 0, `${datasetId} reported no variables`);
+  const variable = info.variables.find((candidate) => candidate.id === "temperature_2m")
+    ?? info.variables.find((candidate) => candidate.shape?.length);
+  assert.ok(variable, `${datasetId} reported no readable array variable`);
+  const array = await zarr.open(
+    zarr.root(info.store!).resolve(variable.id),
+    { kind: "array" },
   );
-}
-
-const weatherZarrSeriesInfo = await loadStoreInfo(
-  "weatherzarr-ecmwf-ifs",
-  "series",
-);
-const weatherZarrSeriesVariable = weatherZarrSeriesInfo.variables.find(
-  (variable) => variable.id === "2t",
-);
-if (!weatherZarrSeriesVariable) {
-  throw new Error("WeatherZarr IFS point layout did not report 2t");
-}
-const weatherZarrSeries = await loadPointForecast(
-  weatherZarrSeriesInfo,
-  weatherZarrSeriesVariable,
-  defaultSelections(weatherZarrSeriesInfo, weatherZarrSeriesVariable),
-  -71.06,
-  42.36,
-);
-if (!weatherZarrSeries?.quantiles.length) {
-  throw new Error("WeatherZarr IFS did not return a point series");
-}
-
-const gem = await loadStoreInfo("salient-gemai-v3-reforecast", "series");
-const gemTemperature = gem.variables.find(
-  (variable) => variable.id === "2m_temperature",
-);
-if (!gemTemperature) {
-  throw new Error("GemAI v3 did not report 2m_temperature");
-}
-const gemLatitude = await zarr.open(
-  zarr.root(gem.store!).resolve("lat"),
-  { kind: "array" },
-);
-const gemLatitudeValues = await zarr.get(gemLatitude);
-const gemSelections = defaultSelections(gem, gemTemperature);
-gemSelections.forecast_date = gem.axes.forecast_date.values.length - 1;
-const gemSeries = await loadPointForecast(
-  gem,
-  gemTemperature,
-  gemSelections,
-  -71.06,
-  42.36,
-);
-if (!gemSeries?.quantiles.length || gemSeries.memberCount !== 50) {
-  throw new Error("GemAI v3 did not return its 50-member point forecast");
+  const selection = variable.dimensions.map((dimension, index) =>
+    isSpatialDimension(dimension, info.source)
+      ? Math.floor((variable.shape?.[index] ?? 1) / 2)
+      : 0,
+  );
+  const value = scalarValue(await zarr.get(array, selection));
+  assert.ok(Number.isFinite(value), `${datasetId} returned a non-finite map value`);
+  resolved.push({
+    datasetId,
+    sourceId: info.source.id,
+    resolvedUrl: info.source.url,
+    variableCount: info.variables.length,
+    variable: variable.id,
+    value,
+  });
 }
 
 console.log({
-  weatherZarr: {
-    variables: weatherZarr.variables.map((variable) => variable.id),
+  weatherNext2: {
+    source: weatherNext.source.id,
+    value: weatherNextValue,
     axes: Object.fromEntries(
-      Object.entries(weatherZarr.axes).map(([id, axis]) => [
-        id,
-        {
-          kind: axis.kind,
-          unit: axis.unit,
-          count: axis.values.length,
-          first: String(axis.values[0]),
-          last: String(axis.values.at(-1)),
-        },
-      ]),
+      Object.entries(weatherNext.axes).map(([id, axis]) => [id, axis.values.length]),
     ),
-    mapValue: weatherZarrValue,
-    precipitationAccumulation: [
-      rawPreviousPrecipitationValue,
-      rawCurrentPrecipitationValue,
-    ],
-    ratePrecipitation: ratePrecipitationValue,
-    latitude: [
-      Number(weatherZarrLatitudeValues.data[0]),
-      Number(weatherZarrLatitudeValues.data[weatherZarrLatitudeValues.data.length - 1]),
-    ],
-    seriesCount: weatherZarrSeries.quantiles.length,
   },
-  gem: {
-    variables: gem.variables.map((variable) => variable.id),
-    axes: Object.fromEntries(
-      Object.entries(gem.axes).map(([id, axis]) => [
-        id,
-        {
-          kind: axis.kind,
-          unit: axis.unit,
-          count: axis.values.length,
-          first: String(axis.values[0]),
-          last: String(axis.values.at(-1)),
-        },
-      ]),
-    ),
-    seriesCount: gemSeries.quantiles.length,
-    members: gemSeries.memberCount,
-    firstMedian: gemSeries.quantiles[0]?.q50,
-    latitude: [
-      Number(gemLatitudeValues.data[0]),
-      Number(gemLatitudeValues.data[gemLatitudeValues.data.length - 1]),
-    ],
-  },
+  virtualMaps: resolved,
 });

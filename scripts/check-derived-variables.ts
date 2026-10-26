@@ -247,21 +247,21 @@ close(hrrrPointRates.values[2], 0.072);
 close(hrrrPointRates.amounts[1], 0.108);
 close(hrrrPointRates.amounts[2], 0.432);
 
-const weatherZarrPointRates = pointPrecipitationRates(
+const cumulativePointRates = pointPrecipitationRates(
   [0.01, 0.02, 0.0103, 0.0206, 0.0109, 0.0218],
   precipitationDates,
   2,
   nativeVariable("tp", "m", "Total precipitation"),
   "cumulative",
 );
-if (!weatherZarrPointRates) {
-  throw new Error("WeatherZarr point precipitation was not normalized");
+if (!cumulativePointRates) {
+  throw new Error("Cumulative point precipitation was not normalized");
 }
-if (!Number.isNaN(weatherZarrPointRates.values[0])) {
+if (!Number.isNaN(cumulativePointRates.values[0])) {
   throw new Error("A cumulative series without its prior lead invented a first step");
 }
-[0.1, 0.2, 0.1, 0.2].forEach(
-  (expected, index) => close(weatherZarrPointRates.values[index + 2], expected),
+  [0.1, 0.2, 0.1, 0.2].forEach(
+  (expected, index) => close(cumulativePointRates.values[index + 2], expected),
 );
 const nativeStepRates = pointPrecipitationRates(
   [0.003, 0.003, 0.012],
@@ -457,10 +457,11 @@ const sourceStore: Readable = {
     return Promise.resolve(sourceChunks.get(path));
   },
 };
-const dataset = getDataset("weatherzarr-ecmwf-ifs");
+const dataset = getDataset("earthmover-era5");
 const source = {
   ...dataset.sources.map!,
   spatialCoordinates: undefined,
+  precipitationAccumulation: "cumulative" as const,
 };
 const info: StoreInfo = {
   dataset,

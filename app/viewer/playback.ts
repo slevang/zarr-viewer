@@ -1,5 +1,9 @@
 import type { DatasetConfig, DatasetSourceConfig } from "../catalog";
-import { axisValueAsDate, timedeltaMilliseconds } from "../data/axes";
+import {
+  axisValueAsDate,
+  storageIndex,
+  timedeltaMilliseconds,
+} from "../data/axes";
 import { isSpatialDimension } from "../data/dimensions";
 import type { AxisConfig, AxisSelection, VariableConfig } from "../data/types";
 
@@ -144,6 +148,7 @@ export function playbackPrefetchProfile(
 export function playbackChunkKey(
   variable: VariableConfig,
   selections: AxisSelection,
+  axes: Record<string, AxisConfig> = {},
 ): `/${string}` | undefined {
   const { shape, chunkShape } = variable;
   if (
@@ -158,7 +163,16 @@ export function playbackChunkKey(
       return 0;
     }
     return Math.floor(
-      (selections[dimension] ?? 0) / Math.max(1, chunkShape[index] ?? 1),
+      storageIndex(
+        axes[dimension] ?? {
+          id: dimension,
+          label: dimension,
+          unit: "",
+          kind: "number",
+          values: [],
+        },
+        selections[dimension] ?? 0,
+      ) / Math.max(1, chunkShape[index] ?? 1),
     );
   });
   if (chunkCoordinates.some((value) => !Number.isFinite(value))) return undefined;

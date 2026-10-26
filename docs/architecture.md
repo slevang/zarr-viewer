@@ -24,9 +24,9 @@ Spatial overrides, initialization aliases, valid-time names, and ensemble
 aliases belong there rather than in loader or UI conditionals.
 
 `app/data/axes.ts` owns all pure coordinate and temporal-selection behavior:
-defaults, reconciliation, valid-time calculations, formatting, and map
-coordinate normalization. It may depend on the catalog and shared types, but
-must not fetch data or initialize codecs.
+defaults, reconciliation, valid-time calculations, formatting, map coordinate
+normalization, and logical-to-storage index translation. It may depend on the
+catalog and shared types, but must not fetch data or initialize codecs.
 
 `app/data/point-series.ts` owns spatial index lookup plus native and derived
 history/forecast reads. `app/dataset.ts` discovers stores and metadata. It
@@ -57,10 +57,12 @@ reading store-backend implementations.
 Catalog entries describe logical datasets with independent `map` and `series`
 sources. `loadStoreInfo` dispatches to the adapter for the configured source
 kind, decorates native variables with derived-variable matches, and caches the
-result by dataset, source, and target initialization date. Role-specific
-`StoreInfo` views share the same physical open when map and series roles point
-to the same source. Failed opens are removed from the cache so a foreground
-request can retry them.
+result by dataset, source, and role for the lifetime of the page. Dynamical.org
+sources resolve their STAC `icechunk-https` asset before opening, with the
+catalogued HTTPS URL as a browser-safe fallback when the STAC endpoint is not
+CORS-enabled. Role-specific `StoreInfo` views share the same physical open when
+map and series roles point to the same source. Failed opens are removed from
+the cache so a foreground request can retry them.
 
 After the first dataset frame is ready, the viewer opens the remaining stores
 through a single-worker background queue. Series sources are prioritized and
@@ -79,6 +81,11 @@ model. Native and derived history and forecast paths converge on
 reaching React. Coordinate arrays are cached once per `StoreInfo`, so derived
 variables and model comparisons do not repeatedly fetch and decode identical
 latitude/longitude chunks.
+
+Some stores expose a compact logical availability axis over a longer physical
+coordinate array. `AxisConfig.storageIndexOffset` keeps selections, map
+selectors, point-history slices, and direct playback chunk keys in physical
+array coordinates without leaking that storage detail into viewer state.
 
 ## Verification
 

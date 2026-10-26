@@ -156,13 +156,6 @@ import {
   type UnitOption,
 } from "./units";
 import {
-  disconnectGoogle,
-  googleAuthSnapshot,
-  hasGoogleAccessToken,
-  requestGoogleAuthorization,
-  subscribeGoogleAuth,
-} from "./google-auth";
-import {
   disconnectEcmwf,
   ecmwfAuthSnapshot,
   hasCdsApiKey,
@@ -291,7 +284,7 @@ export function ZarrViewer() {
   const playbackPrefetchGenerationRef = useRef(0);
   const playbackViewportMovingRef = useRef(false);
   const rememberedValidDateRef = useRef<Date | undefined>(undefined);
-  const weatherNextStoreGenerationRef = useRef(0);
+  const storeReloadGenerationRef = useRef(0);
   const useDatasetDefaultsRef = useRef(false);
   const publicDatasetPreloadStartedRef = useRef(false);
   const datasetPreloadAuthKeysRef = useRef(new Set<string>());
@@ -317,7 +310,6 @@ export function ZarrViewer() {
   );
   const [mapInstallRevision, setMapInstallRevision] = useState(0);
   const [unavailableMapDate, setUnavailableMapDate] = useState<Date | null>(null);
-  const [googleAuth, setGoogleAuth] = useState(googleAuthSnapshot);
   const [ecmwfAuth, setEcmwfAuth] = useState(ecmwfAuthSnapshot);
   const [cdsKeyDraft, setCdsKeyDraft] = useState("");
   const [info, setInfo] = useState<StoreInfo | null>(null);
@@ -398,9 +390,6 @@ export function ZarrViewer() {
   viewModeRef.current = viewMode;
   opacityRef.current = opacity;
   projectionRef.current = projection;
-  const googleAuthRequired = dataset.sources.map?.auth === "google";
-  const googleConnected = googleAuth.phase === "connected"
-    && hasGoogleAccessToken();
   const ecmwfAuthRequired = dataset.sources.map?.auth === "cds-api-key";
   const ecmwfConnected = hasCdsApiKey();
   const activeVariableUnit = info && variable
@@ -495,7 +484,6 @@ export function ZarrViewer() {
     [colormap],
   );
 
-  useEffect(() => subscribeGoogleAuth(setGoogleAuth), []);
   useEffect(() => subscribeEcmwfAuth(setEcmwfAuth), []);
   useEffect(() => {
     storeUnitPreferences(unitPreferences);
@@ -684,7 +672,7 @@ export function ZarrViewer() {
         );
         const center = map.getCenter();
         const chunkKey = queue.directChunkReads
-          ? playbackChunkKey(currentVariable, nextSelections)
+          ? playbackChunkKey(currentVariable, nextSelections, currentInfo.axes)
           : undefined;
         const prefetchStore = currentInfo.layerOptions.store;
         let retry = false;
@@ -702,7 +690,7 @@ export function ZarrViewer() {
                 center.lat,
               ),
             },
-            selectorFor(currentVariable, nextSelections),
+            selectorFor(currentVariable, nextSelections, currentInfo.axes),
             {
               signal: queue.controller.signal,
               includeSpatialCoordinates: false,
@@ -1416,7 +1404,7 @@ export function ZarrViewer() {
           type: "Point",
           coordinates: toDataCoordinates(currentInfo.dataset, point.lng, point.lat),
         },
-        selectorFor(nextVariable, nextSelections),
+        selectorFor(nextVariable, nextSelections, currentInfo.axes),
         { includeSpatialCoordinates: false },
       );
       const value = firstFinite(result[nextVariable.id]);
@@ -1453,7 +1441,9 @@ export function ZarrViewer() {
     const generation = ++requestGeneration.current;
     setLoadState(loadingState());
     try {
-      await layer.setSelector(selectorFor(nextVariable, nextSelections));
+      await layer.setSelector(
+        selectorFor(nextVariable, nextSelections, infoRef.current?.axes ?? {}),
+      );
       if (generation === requestGeneration.current) {
         setLoadState(READY_STATE);
         const point = inspectionPointRef.current;
@@ -1471,7 +1461,11 @@ export function ZarrViewer() {
     if (!layer || !currentInfo || !currentVariable) return;
     const generation = ++rangeGeneration.current;
     const currentSelections = { ...selectionsRef.current };
-    const currentSelector = selectorFor(currentVariable, currentSelections);
+    const currentSelector = selectorFor(
+      currentVariable,
+      currentSelections,
+      currentInfo.axes,
+    );
     try {
       const sample = createFiniteValueSample();
       for (const geometry of FULL_IMAGE_GEOMETRIES) {
@@ -1517,8 +1511,7 @@ export function ZarrViewer() {
 
   useEffect(() => {
     if (
-      (googleAuthRequired && !googleConnected)
-      || (ecmwfAuthRequired && !ecmwfConnected)
+      (ecmwfAuthRequired && !ecmwfConnected)
       || (
         dataset.sources.map?.requiresCrossOriginIsolation
         && !window.crossOriginIsolated
@@ -1536,8 +1529,6 @@ export function ZarrViewer() {
     dataset.sources.map?.requiresCrossOriginIsolation,
     ecmwfAuthRequired,
     ecmwfConnected,
-    googleAuthRequired,
-    googleConnected,
     initialDatasetTargetDate,
   ]);
 
@@ -1825,7 +1816,6 @@ export function ZarrViewer() {
       const previousInfo = useDatasetDefaults ? null : infoRef.current;
       const previousSelections = { ...selectionsRef.current };
       useDatasetDefaultsRef.current = false;
-      weatherNextStoreGenerationRef.current += 1;
       setPlayingAxis(null);
       resetPlaybackPrefetchRef.current();
       seriesRequestControllerRef.current?.abort();
@@ -1840,16 +1830,6 @@ export function ZarrViewer() {
       ) {
         setLoadState(loadingState("Preparing HRRR decoder…"));
         await navigateToIsolatedDataset(datasetId);
-        return;
-      }
-      if (googleAuthRequired && !hasGoogleAccessToken()) {
-        const map = mapRef.current;
-        if (map?.getLayer(ZARR_LAYER_ID)) map.removeLayer(ZARR_LAYER_ID);
-        layerRef.current = null;
-        setLoadState({
-          phase: "ready",
-          message: "WeatherNext credentials required",
-        });
         return;
       }
       if (ecmwfAuthRequired && !hasCdsApiKey()) {
@@ -2023,7 +2003,7 @@ export function ZarrViewer() {
       const zarrLayer = new ZarrLayer({
         id: ZARR_LAYER_ID,
         variable: nextVariable.id,
-        selector: selectorFor(nextVariable, nextSelections),
+        selector: selectorFor(nextVariable, nextSelections, nextInfo.axes),
         colormap: [...nextColormap.colors],
         clim: nextDisplayRange,
         opacity: opacityRef.current,
@@ -2098,8 +2078,6 @@ export function ZarrViewer() {
     dataset.sources.map?.requiresCrossOriginIsolation,
     ecmwfAuthRequired,
     ecmwfConnected,
-    googleAuthRequired,
-    googleConnected,
     initialLocation.axisValues,
     initialLocation.colormapId,
     initialLocation.displayRange,
@@ -2113,7 +2091,6 @@ export function ZarrViewer() {
   useEffect(() => {
     if (!firstDatasetFrameReady || !info) return;
     const availableAuth = [
-      ...(googleConnected ? ["google" as const] : []),
       ...(ecmwfConnected ? ["cds-api-key" as const] : []),
     ];
     const authKey = availableAuth.join(",") || "public";
@@ -2174,7 +2151,6 @@ export function ZarrViewer() {
   }, [
     firstDatasetFrameReady,
     ecmwfConnected,
-    googleConnected,
     info,
     selections,
   ]);
@@ -2345,7 +2321,7 @@ export function ZarrViewer() {
         const nextLayer = new ZarrLayer({
           id: ZARR_LAYER_ID,
           variable: nextVariable.id,
-          selector: selectorFor(nextVariable, nextSelections),
+          selector: selectorFor(nextVariable, nextSelections, info.axes),
           colormap: [...nextColormap.colors],
           clim: nextDisplayRange,
           opacity: opacityRef.current,
@@ -2394,12 +2370,12 @@ export function ZarrViewer() {
     }
   };
 
-  const changeWeatherNextInitialization = async (
+  const changeInitialization = async (
     initializationDate: Date,
     desiredSelections: AxisSelection,
   ) => {
     if (!info || !variable) return;
-    const generation = ++weatherNextStoreGenerationRef.current;
+    const generation = ++storeReloadGenerationRef.current;
     setLoadState(loadingState());
     try {
       const nextInfo = await loadStoreInfo(
@@ -2407,7 +2383,7 @@ export function ZarrViewer() {
         "map",
         initializationDate,
       );
-      if (generation !== weatherNextStoreGenerationRef.current) return;
+      if (generation !== storeReloadGenerationRef.current) return;
       const nextVariable = availableVariables(nextInfo).find(
         (candidate) => candidate.id === variable.id,
       ) ?? nextInfo.variables.find(
@@ -2438,18 +2414,18 @@ export function ZarrViewer() {
         nextInfo,
         nextVariable,
       );
-      if (generation !== weatherNextStoreGenerationRef.current) return;
+      if (generation !== storeReloadGenerationRef.current) return;
       const nextLayer = new ZarrLayer({
         id: ZARR_LAYER_ID,
         variable: nextVariable.id,
-        selector: selectorFor(nextVariable, nextSelections),
+        selector: selectorFor(nextVariable, nextSelections, nextInfo.axes),
         colormap: [...colormap.colors],
         clim: activeDisplayRange,
         opacity: opacityRef.current,
         ...nextLayerOptions,
         ...variableRenderingOptions(nextVariable, nextLayerUnit),
         onLoadingStateChange: (loading) => {
-          if (generation !== weatherNextStoreGenerationRef.current) return;
+          if (generation !== storeReloadGenerationRef.current) return;
           if (loading.error) setLoadState(errorState(loading.error));
           else if (loading.loading) setLoadState(loadingState());
           else setLoadState(READY_STATE);
@@ -2485,7 +2461,7 @@ export function ZarrViewer() {
         if (station) startAsosComparisonRef.current(station);
       }
     } catch (error) {
-      if (generation === weatherNextStoreGenerationRef.current) {
+      if (generation === storeReloadGenerationRef.current) {
         setLoadState(errorState(error));
       }
     }
@@ -2521,7 +2497,7 @@ export function ZarrViewer() {
       return;
     }
     if (axis.requiresStoreReload) {
-      void changeWeatherNextInitialization(
+      void changeInitialization(
         axisValueAsDate(info.dataset, axis, clamped),
         next,
       );
@@ -2572,22 +2548,9 @@ export function ZarrViewer() {
         selectionsRef.current,
       ) ?? rememberedValidDateRef.current;
     }
-    weatherNextStoreGenerationRef.current += 1;
+    storeReloadGenerationRef.current += 1;
     const nextDataset = getDataset(nextDatasetId);
     setDatasetId(nextDataset.id);
-  };
-
-  const toggleGoogleAuthorization = async () => {
-    if (googleAuth.phase === "connected") {
-      disconnectGoogle();
-      return;
-    }
-    try {
-      await requestGoogleAuthorization();
-    } catch {
-      // The auth control displays popup and consent errors without replacing
-      // the map's independent loading state.
-    }
   };
 
   const submitCdsApiKey = (event: React.FormEvent<HTMLFormElement>) => {
@@ -3174,28 +3137,6 @@ export function ZarrViewer() {
                 </optgroup>
               ))}
             </select>
-            {googleAuthRequired ? (
-              <div className={`google-auth-control ${googleAuth.phase}`}>
-                <button
-                  type="button"
-                  disabled={googleAuth.phase === "connecting"}
-                  onClick={() => void toggleGoogleAuthorization()}
-                  title={googleAuth.phase === "connected"
-                    ? "Forget the saved WeatherNext credentials"
-                    : googleAuth.message}
-                >
-                  <i aria-hidden="true" />
-                  {googleAuth.phase === "connected"
-                    ? "WeatherNext Authenticated"
-                    : googleAuth.phase === "connecting"
-                      ? "Authenticating…"
-                      : "WeatherNext Credentials"}
-                </button>
-                {googleAuth.phase === "error" ? (
-                  <small>{googleAuth.message}</small>
-                ) : null}
-              </div>
-            ) : null}
             {ecmwfAuthRequired ? (
               <form
                 className={`cds-auth-control ${ecmwfAuth.phase}`}

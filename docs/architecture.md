@@ -20,8 +20,9 @@ selections, and point-series results. Type-only consumers should import it
 directly so they do not accidentally depend on store initialization.
 
 `app/data/dimensions.ts` is the canonical interpretation of dimension names.
-Spatial overrides, initialization aliases, valid-time names, and ensemble
-aliases belong there rather than in loader or UI conditionals.
+Spatial overrides, initialization aliases, valid-time names, ensemble aliases,
+and quantile/statistic aliases belong there rather than in loader or UI
+conditionals.
 
 `app/data/axes.ts` owns all pure coordinate and temporal-selection behavior:
 defaults, reconciliation, valid-time calculations, formatting, map coordinate

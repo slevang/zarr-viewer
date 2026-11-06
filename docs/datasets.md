@@ -13,6 +13,22 @@ load time.
 Icechunk store. It is spatially chunked, exposes initialization, lead, and
 ensemble axes, and requires no Google account or credential input.
 
+## WeatherNext 3 gridded and station-head forecasts
+
+`google-weathernext-3` opens Dynamical's public 0.1°
+[`google-weathernext3-forecast-15-day-0-1-degree-virtual`](https://dynamical.org/catalog/google-weathernext3-forecast-15-day-0-1-degree-virtual/)
+Icechunk store. It contains the full gridded surface field set as Google's
+precomputed ensemble statistics.
+
+`google-weathernext-3-station-head` opens the corresponding 0.05°
+[`google-weathernext3-forecast-15-day-0-05-degree-virtual`](https://dynamical.org/catalog/google-weathernext3-forecast-15-day-0-05-degree-virtual/)
+station-head store, which is limited to 2 metre temperature and dew point and
+has known station-head limitations. Both products expose `mean`, `p10`, `p25`,
+`p50`, `p75`, and `p90` on the `statistic` axis; the viewer presents that axis
+as a Quantile control. Neither product includes individual ensemble members or
+requires credentials. The old `google-weathernext-3-statistics` ID aliases to
+the station-head entry for saved links.
+
 ## Dynamical.org role pairs
 
 The catalog uses virtual spatial stores for map reads and materialized stores

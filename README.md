@@ -5,10 +5,10 @@ A browser-only viewer for multidimensional Zarr and Icechunk data. It uses
 and direct object-store reads without an application server.
 
 The default is the public, map-optimized Dynamical.org WeatherNext 2 virtual
-Icechunk store. The catalog also includes Google ARCO ERA5, Earthmover ERA5,
-and role-optimized Dynamical.org GFS, GEFS, HRRR, AIFS, IFS ENS, and ICON
-stores. See [`docs/datasets.md`](docs/datasets.md) for the catalog and source
-roles.
+Icechunk store. The catalog also includes credential-free WeatherNext 3
+gridded and station-head statistics archives, Google ARCO ERA5, Earthmover ERA5, and role-optimized
+Dynamical.org GFS, GEFS, HRRR, AIFS, IFS ENS, and ICON stores. See
+[`docs/datasets.md`](docs/datasets.md) for the catalog and source roles.
 
 ## Features
 

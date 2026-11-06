@@ -1,5 +1,6 @@
 import proj4 from "proj4";
 import type { Selector } from "@carbonplan/zarr-layer";
+import { commonVariableMatches } from "../common-variables";
 import {
   getDatasetSource,
   type DatasetConfig,
@@ -8,7 +9,9 @@ import {
 import {
   isLatitudeDimension,
   isLongitudeDimension,
+  isEnsembleDimension,
   isInitializationDimension,
+  isQuantileDimension,
   isValidTimeDimension,
 } from "./dimensions";
 import type {
@@ -20,7 +23,23 @@ import type {
 
 const HOUR_MS = 60 * 60 * 1000;
 const SERIES_LOOKAHEAD_HOURS = 15 * 24;
-const DEFAULT_FORECAST_LEAD_INDEX = 1;
+const DEFAULT_FORECAST_LEAD_INDEX = 0;
+const CUMULATIVE_PRECIPITATION_LEAD_INDEX = 1;
+
+function isPrecipitationVariable(variable: VariableConfig) {
+  return commonVariableMatches([variable]).some((match) => match.key === "tp");
+}
+
+function preferredForecastLeadIndex(
+  info: StoreInfo,
+  variable: VariableConfig,
+) {
+  if (!isPrecipitationVariable(variable)) return DEFAULT_FORECAST_LEAD_INDEX;
+  return info.source.precipitationDefaultLeadIndex
+    ?? (info.source.precipitationAccumulation === "cumulative"
+      ? CUMULATIVE_PRECIPITATION_LEAD_INDEX
+      : DEFAULT_FORECAST_LEAD_INDEX);
+}
 
 export function regularSpatialCoordinateValues(
   source: DatasetSourceConfig,
@@ -99,7 +118,10 @@ export function defaultSelections(info: StoreInfo, variable: VariableConfig): Ax
         axis.values.length - (historicalSeries ? SERIES_LOOKAHEAD_HOURS : 1),
       )
       : axis.kind === "timedelta" && info.dataset.category === "forecast"
-        ? Math.min(DEFAULT_FORECAST_LEAD_INDEX, axis.values.length - 1)
+        ? Math.min(
+          preferredForecastLeadIndex(info, variable),
+          axis.values.length - 1,
+        )
         : 0;
   }
   for (const axis of Object.values(info.axes)) {
@@ -127,6 +149,13 @@ export function reconcileSelections(
     const selected = current[dimension];
     if (!axis || selected === undefined) continue;
     next[dimension] = Math.max(0, Math.min(axis.values.length - 1, selected));
+  }
+  const lead = temporalDimensions(info, variable).lead;
+  if (lead && next[lead] !== undefined) {
+    next[lead] = Math.max(
+      Math.min(preferredForecastLeadIndex(info, variable), info.axes[lead].values.length - 1),
+      next[lead],
+    );
   }
   return next;
 }
@@ -170,7 +199,10 @@ export function preserveForecastLeadSelection(
   return {
     ...nextSelections,
     [nextLead]: Math.max(
-      0,
+      Math.min(
+        preferredForecastLeadIndex(nextInfo, nextVariable),
+        nextAxis.values.length - 1,
+      ),
       Math.min(nextAxis.values.length - 1, previousIndex),
     ),
   };
@@ -285,9 +317,15 @@ function matchLeadToValidDate(
   );
   return {
     ...selections,
-    [lead]: nearestTimedeltaIndex(
-      info.axes[lead],
-      validDate.getTime() - initializationDate.getTime(),
+    [lead]: Math.max(
+      Math.min(
+        preferredForecastLeadIndex(info, variable),
+        info.axes[lead].values.length - 1,
+      ),
+      nearestTimedeltaIndex(
+        info.axes[lead],
+        validDate.getTime() - initializationDate.getTime(),
+      ),
     ),
   };
 }
@@ -474,6 +512,25 @@ export function formatAxisValue(
         : numeric;
     const hours = seconds / 3600;
     return Number.isInteger(hours) ? `+${hours} h` : `+${hours.toFixed(1)} h`;
+  }
+  if (isEnsembleDimension(axis.id)) return String(value);
+  if (isQuantileDimension(axis.id)) {
+    const normalized = String(value).trim().toLowerCase();
+    const labels: Record<string, string> = {
+      mean: "Mean",
+      p10: "10th percentile",
+      p25: "25th percentile",
+      p50: "50th percentile",
+      p75: "75th percentile",
+      p90: "90th percentile",
+      q10: "10th percentile",
+      q25: "25th percentile",
+      q50: "50th percentile",
+      q75: "75th percentile",
+      q90: "90th percentile",
+    };
+    const label = labels[normalized];
+    if (label) return label;
   }
   return `${value}${axis.unit ? ` ${axis.unit}` : ""}`;
 }

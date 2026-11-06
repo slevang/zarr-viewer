@@ -98,6 +98,8 @@ const expectedChunking = new Map([
   ["earthmover-era5", "Dual-chunked"],
   ["google-arco-era5", "Spatially-chunked"],
   ["google-weathernext-2", "Spatially-chunked"],
+  ["google-weathernext-3", "Spatially-chunked"],
+  ["google-weathernext-3-station-head", "Spatially-chunked"],
   ["noaa-gfs-forecast", "Dual-chunked"],
 ]);
 if (DEFAULT_DATASET_ID !== "google-weathernext-2") {
@@ -123,7 +125,11 @@ for (const dataset of DATASETS) {
   const match = defaultVariable
     ? commonVariableMatches([variable(defaultVariable)])[0]
     : undefined;
-  if (dataset.id === "google-weathernext-2") {
+  if ([
+    "google-weathernext-2",
+    "google-weathernext-3",
+    "google-weathernext-3-station-head",
+  ].includes(dataset.id)) {
     if (match?.key !== "t2m") {
       throw new Error(`${dataset.id}: expected a temperature default`);
     }

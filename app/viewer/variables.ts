@@ -7,6 +7,7 @@ import {
 import {
   isEnsembleDimension,
   isInitializationDimension,
+  isQuantileDimension,
   isSpatialDimension,
 } from "../data/dimensions";
 import { commonVariableMatches } from "../common-variables";
@@ -99,7 +100,8 @@ export function matchingVariable(info: StoreInfo, source: VariableConfig) {
       return kind !== "time"
         && kind !== "timedelta"
         && !isSpatialDimension(dimension, info.source)
-        && !isEnsembleDimension(dimension);
+        && !isEnsembleDimension(dimension)
+        && !isQuantileDimension(dimension);
     }).length * 2;
     return { candidate, score };
   }).sort((a, b) => b.score - a.score);

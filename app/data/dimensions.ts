@@ -16,6 +16,12 @@ const ENSEMBLE_NAMES = new Set([
   "sample",
   "number",
 ]);
+const QUANTILE_NAMES = new Set([
+  "statistic",
+  "quantile",
+  "ensemble_statistic",
+  "percentile",
+]);
 
 function normalized(name: string) {
   return name.toLowerCase();
@@ -76,4 +82,8 @@ export function isValidTimeDimension(name: string) {
 
 export function isEnsembleDimension(name: string) {
   return ENSEMBLE_NAMES.has(normalized(name));
+}
+
+export function isQuantileDimension(name: string) {
+  return QUANTILE_NAMES.has(normalized(name));
 }

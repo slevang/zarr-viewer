@@ -5,7 +5,9 @@ import {
   axisIndexForDate,
   axisValueAsDate,
   defaultSelections,
+  formatAxisValue,
   preserveForecastLeadSelection,
+  reconcileSelections,
   selectionsAfterAxisChange,
   selectionsForValidDate,
   selectorFor,
@@ -20,6 +22,7 @@ import {
   hasSpatialDimensions,
   isEnsembleDimension,
   isInitializationDimension,
+  isQuantileDimension,
 } from "../app/data/dimensions";
 import type {
   AxisConfig,
@@ -36,6 +39,35 @@ assert.equal(
 );
 assert.equal(isInitializationDimension("Forecast_Date"), true);
 assert.equal(isEnsembleDimension("number"), true);
+assert.equal(isQuantileDimension("statistic"), true);
+assert.equal(
+  formatAxisValue(
+    getDataset("google-weathernext-2"),
+    {
+      id: "ensemble_member",
+      label: "Ensemble member",
+      unit: "1",
+      kind: "number",
+      values: [0, 1],
+    },
+    0,
+  ),
+  "0",
+);
+assert.equal(
+  formatAxisValue(
+    getDataset("google-weathernext-3"),
+    {
+      id: "statistic",
+      label: "Quantile",
+      unit: "1",
+      kind: "category",
+      values: ["mean", "p10", "p50"],
+    },
+    2,
+  ),
+  "50th percentile",
+);
 
 assert.deepEqual(
   toDataCoordinates(getDataset("google-arco-era5"), -98, 38.5),
@@ -230,7 +262,69 @@ assert.deepEqual(
     ...forecastInfo,
     dataset: { ...forecastInfo.dataset, category: "forecast" },
   }, forecastVariable),
+  { init_time: 2, lead_time: 0 },
+);
+assert.deepEqual(
+  defaultSelections({
+    ...forecastInfo,
+    source: {
+      ...forecastInfo.source,
+      precipitationAccumulation: "cumulative",
+    },
+    dataset: { ...forecastInfo.dataset, category: "forecast" },
+  }, {
+    ...forecastVariable,
+    id: "precipitation_surface",
+    label: "Precipitation rate",
+    standardName: "precipitation_flux",
+  }),
   { init_time: 2, lead_time: 1 },
+);
+assert.deepEqual(
+  defaultSelections({
+    ...forecastInfo,
+    source: {
+      ...forecastInfo.source,
+      precipitationDefaultLeadIndex: 2,
+    },
+    dataset: { ...forecastInfo.dataset, category: "forecast" },
+  }, {
+    ...forecastVariable,
+    id: "precipitation_surface",
+    label: "Precipitation rate",
+    standardName: "precipitation_flux",
+  }),
+  { init_time: 2, lead_time: 2 },
+);
+const gfsLikeForecastInfo = {
+  ...forecastInfo,
+  source: {
+    ...forecastInfo.source,
+    precipitationDefaultLeadIndex: 1,
+  },
+  dataset: { ...forecastInfo.dataset, category: "forecast" },
+};
+const precipitationVariable = {
+  ...forecastVariable,
+  id: "total_precipitation_surface",
+  label: "Total precipitation",
+  standardName: "precipitation_amount",
+};
+assert.deepEqual(
+  reconcileSelections(
+    gfsLikeForecastInfo,
+    precipitationVariable,
+    { init_time: 2, lead_time: 0 },
+  ),
+  { init_time: 2, lead_time: 1 },
+);
+assert.deepEqual(
+  selectionsForValidDate(
+    gfsLikeForecastInfo,
+    precipitationVariable,
+    new Date("2021-02-07T00:00:00Z"),
+  ),
+  { init_time: 0, lead_time: 1 },
 );
 const nextForecastInfo = {
   ...forecastInfo,

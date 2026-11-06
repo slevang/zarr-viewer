@@ -25,6 +25,11 @@ export type DatasetSourceConfig = {
   spatialCoordinates?: "regular-global";
   requiresCrossOriginIsolation?: boolean;
   precipitationAccumulation?: "cumulative";
+  /**
+   * Default forecast lead for precipitation variables whose first stored
+   * frame is intentionally empty or otherwise not renderable.
+   */
+  precipitationDefaultLeadIndex?: number;
   geographicBounds?: [west: number, south: number, east: number, north: number];
   meteogram?: {
     kind: "regional" | "global-ensemble" | "global-control";
@@ -113,6 +118,7 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
         zarrVersion: 3,
         layout: "spatial",
         requiresCrossOriginIsolation: true,
+        precipitationDefaultLeadIndex: 1,
       },
       series: {
         id: "noaa-gfs-forecast",
@@ -120,6 +126,7 @@ const DYNAMICAL_DATASETS: DatasetConfig[] = [
         url: "https://dynamical-noaa-gfs.s3.us-west-2.amazonaws.com/noaa-gfs-forecast/v0.2.7.icechunk",
         s3Url: "s3://dynamical-noaa-gfs/noaa-gfs-forecast/v0.2.7.icechunk/",
         zarrVersion: 3,
+        precipitationDefaultLeadIndex: 1,
       },
     },
     support: "ready",
@@ -388,6 +395,58 @@ export const DATASETS: DatasetConfig[] = [
     defaultVariable: "temperature_2m",
   },
   {
+    id: "google-weathernext-3",
+    label: "WeatherNext3 forecast",
+    provider: "dynamical.org / Google",
+    category: "forecast",
+    description: "Global 0.1° hourly gridded ensemble-statistics forecast through 15 days.",
+    sources: {
+      map: {
+        id: "google-weathernext3-forecast-15-day-0-1-degree-virtual",
+        kind: "icechunk",
+        url: "https://google-weathernext3.r2.dynamical.org/google-weathernext3-forecast-15-day-0-1-degree-virtual/v0.1.0.icechunk",
+        zarrVersion: 3,
+        layout: "spatial",
+        requiresCrossOriginIsolation: false,
+        spatialDimensions: { lat: "y", lon: "x" },
+        bounds: [0, -90, 360, 90],
+        crs: "EPSG:4326",
+        latIsAscending: true,
+        stacCollectionId: "google-weathernext3-forecast-15-day-0-1-degree-virtual",
+        stacAsset: "icechunk-https",
+      },
+    },
+    support: "ready",
+    supportNote: "Public full-field statistics archive; choose mean or a supplied ensemble percentile from the Quantile control.",
+    defaultVariable: "temperature_2m",
+  },
+  {
+    id: "google-weathernext-3-station-head",
+    label: "WeatherNext3 station head",
+    provider: "dynamical.org / Google",
+    category: "forecast",
+    description: "Global 0.05° hourly station-head temperature and dew-point statistics through 15 days.",
+    sources: {
+      map: {
+        id: "google-weathernext3-forecast-15-day-0-05-degree-virtual",
+        kind: "icechunk",
+        url: "https://google-weathernext3.r2.dynamical.org/google-weathernext3-forecast-15-day-0-05-degree-virtual/v0.1.0.icechunk",
+        zarrVersion: 3,
+        layout: "spatial",
+        requiresCrossOriginIsolation: false,
+        spatialDimensions: { lat: "y", lon: "x" },
+        bounds: [0, -90, 360, 90],
+        crs: "EPSG:4326",
+        latIsAscending: true,
+        stacCollectionId: "google-weathernext3-forecast-15-day-0-05-degree-virtual",
+        stacAsset: "icechunk-https",
+      },
+    },
+    support: "experimental",
+    supportNote: "Public station-trained 0.05° statistics archive; it contains only 2 metre temperature and dew point and has known station-head limitations.",
+    defaultVariable: "temperature_2m",
+  },
+  {
     id: "google-arco-era5",
     label: "ECMWF ERA5 reanalysis",
     provider: "Google",
@@ -482,6 +541,7 @@ const DATASET_ALIASES: Record<string, string> = {
   "earthmover-era5-single-spatial": "earthmover-era5",
   "weatherzarr-ecmwf-ifs": "google-weathernext-2",
   "salient-gemai-v3-reforecast": "google-weathernext-2",
+  "google-weathernext-3-statistics": "google-weathernext-3-station-head",
 };
 
 export const DEFAULT_DATASET_ID =

@@ -543,7 +543,7 @@ assert.deepEqual(
     ...temperature,
     dimensions: ["init_time", "lead_time", "latitude", "longitude"],
   }, new Date("2026-07-20T06:00:00Z")),
-  { init_time: 1, lead_time: 1 },
+  { init_time: 1, lead_time: 0 },
 );
 assert.deepEqual(
   meteogramStartSelections({

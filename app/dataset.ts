@@ -22,6 +22,7 @@ import type {
 import {
   hasSpatialDimensions,
   isInitializationDimension,
+  isQuantileDimension,
   isSpatialDimension,
   isValidTimeDimension,
 } from "./data/dimensions";
@@ -141,6 +142,7 @@ function axisKind(name: string, attrs: Record<string, unknown>, dataType = ""): 
 
 function axisLabel(name: string, attrs: Record<string, unknown>) {
   if (name.toLowerCase() === "sample") return "Ensemble member";
+  if (isQuantileDimension(name)) return "Quantile";
   const longName = typeof attrs.long_name === "string" ? attrs.long_name.trim() : "";
   return longName || name.replaceAll("_", " ");
 }
